@@ -15,18 +15,25 @@ import { DialogueRunner, portraitSprite } from './dialogue';
 // Stage host. At the M3 milestone this runs the full stage 1 timeline with a
 // movable player stub (no collision yet) so ECL patterns can be verified.
 
-// Item sprites live in etama entry1 (etama2.png); global sprite ids 64+.
+// Item sprites live in etama.anm entry 1 (the etama2.png sheet), addressed
+// here by their entry-embedded ids; add entries[1].spriteBase (168 — entry 0
+// embeds ids 0..167) for the global id. The 16x16 boxed items sit in a row at
+// texture y=64 (crop-verified: red P, blue 点, big red P, green B, yellow F,
+// magenta 1up, grey star, pink petal box), matching the original item order.
 const ITEM_SPRITES: Record<ItemType, number> = {
-  power: 68,
-  point: 69,
-  bigPower: 70,
-  bomb: 71,
-  fullPower: 72,
-  life: 73,
-  cherry: 76, // pink petal
-  bigCherry: 76,
-  pointBullet: 77 // cancel-item triangle
+  power: 4,
+  point: 5,
+  bigPower: 6,
+  bomb: 7,
+  fullPower: 8,
+  life: 9,
+  pointBullet: 10, // grey star box (bullet-cancel item)
+  cherry: 11, // boxed pink petal
+  bigCherry: 11 // TH07-TODO: distinct big-cherry art unconfirmed; shares the box
 };
+// Per-type offscreen indicator arrows sit 10 embedded ids after their item
+// (emb14-21, same order) — drawn while an item is still above the top edge.
+const ITEM_ARROW_OFFSET = 10;
 
 // Per-frame damage cap for a single enemy, from the TH06 engine family; the
 // ECL op 142 parameter appears related but is not yet confirmed (TH07-TODO).
@@ -119,6 +126,10 @@ export class StageScene implements GameHost {
   bossLifeCount = 0;
   spellName = '';
 
+  // Global sprite id of etama entry 1's embedded sprite 0 (the etama2.png
+  // item sheet); see ITEM_SPRITES above.
+  private readonly etamaItemBase: number;
+
   constructor(private assets: GameAssets, private audio: AudioBus, difficulty = 1, character: CharacterId = 'reimuA') {
     this.difficulty = difficulty;
     this.runtime = new StageRuntime(TH07_DATA.stages[1], {
@@ -126,6 +137,7 @@ export class StageScene implements GameHost {
       enemy: assets.anms.stg1enm,
       effect: assets.anms.eff01
     });
+    this.etamaItemBase = assets.anms.etama.entries[1].spriteBase;
     this.playerObj = new Player(character, assets.anms);
     this.player = this.playerObj;
   }
@@ -817,12 +829,15 @@ export class StageScene implements GameHost {
         });
       }
       for (const it of this.items) {
-        const sprite = this.assets.anms.etama.sprites.get(ITEM_SPRITES[it.type]);
+        // Items falling above the top edge peek in as their per-type arrow
+        // sprite (original UX; etama2 emb14-21, +10 from the item id).
+        const above = it.y < 0;
+        const emb = ITEM_SPRITES[it.type] + (above ? ITEM_ARROW_OFFSET : 0);
+        const sprite = this.assets.anms.etama.sprites.get(this.etamaItemBase + emb);
         if (sprite) {
-          // Items falling above the top edge peek in as arrows (original UX).
           const drawY = Math.max(8, it.y);
           r.drawSprite(sprite.imageKey, sprite.x, sprite.y, sprite.w, sprite.h, ox + it.x, oy + drawY, {
-            alpha: it.y < 0 ? 0.55 : 1
+            alpha: above ? 0.85 : 1
           });
         }
       }

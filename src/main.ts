@@ -40,6 +40,7 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
     enemies: scene.enemies.length,
     bullets: scene.enemyBullets.length,
     items: scene.items.length,
+    itemDump: scene.items.slice(0, 12).map((it) => ({ type: it.type, x: Math.round(it.x), y: Math.round(it.y) })),
     timelines: scene.runtime.timelineCursors.map((c) => ({ ...c })),
     bossActive: !!scene.bossActive,
     bossHp: scene.bossActive?.hp ?? null,
