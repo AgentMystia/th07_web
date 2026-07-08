@@ -1,0 +1,13 @@
+node_modules/
+dist/
+reference/
+
+playwright-report/
+test-results/
+.nyc_output/
+coverage/
+
+*.log
+.DS_Store
+Thumbs.db
+tests/.build/
