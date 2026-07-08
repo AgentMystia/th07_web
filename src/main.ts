@@ -48,6 +48,7 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
     gameOver: scene.gameOver,
     continueActive: !!scene.continueScreen,
     spellName: scene.spellName,
+    spell: scene.spellcard ? { id: scene.spellcard.id, capturing: scene.spellcard.capturing, declAge: scene.spellcard.declAge } : null,
     rngSeed: scene.rng.seed,
     player: { x: scene.playerObj.x, y: scene.playerObj.y, lives: scene.playerObj.lives, bombs: scene.playerObj.bombs, power: scene.playerObj.power },
     bomb: { timer: scene.playerObj.bombTimer },

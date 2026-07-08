@@ -120,12 +120,21 @@ export class StageScene implements GameHost {
   stageFrame = 0;
   stageClear = false;
   private clearTimer = 0;
-  spellcard: { name: string; id: number; capturing: boolean; bonus: number } | null = null;
+  spellcard: { name: string; id: number; capturing: boolean; bonus: number; declAge: number; portraitSprite: number } | null = null;
   private spellBanner = 0;
   private bonusPopup: { text: string; timer: number } | null = null;
   bossActive: Enemy | null = null;
   bossLifeCount = 0;
   spellName = '';
+  // Session-scoped per-spell attempt/capture tally for the "History n/m"
+  // line of the declaration banner. The original persists this in
+  // score.dat across runs — out of scope here (AGENTS.md §7).
+  private spellHistory = new Map<number, { seen: number; got: number }>();
+  // Latched when the pre-boss dialogue starts: stage 1's ename.png rows are
+  // 0 = Cirno (midboss, no dialogue) and 1 = Letty (after the dialogue) —
+  // stage-1 heuristic, TH07-TODO a data-driven boss->nameplate mapping.
+  private dialogueSeen = false;
+  private eff01Pattern: CanvasPattern | null = null;
 
   // Global sprite id of etama entry 1's embedded sprite 0 (the etama2.png
   // item sheet); see ITEM_SPRITES above.
@@ -231,10 +240,19 @@ export class StageScene implements GameHost {
 
   startBossSpell(spellId: number, arg0: number, name: string): void {
     this.spellName = name;
+    // Stage-1 spell ownership decoded from ecldata1 op 90: ids 0-1 are the
+    // Cirno midboss cards (霜符「フロストコラムス」), 2-9 Letty's — picks
+    // the face_01_00 cutin portrait (sprite 3 = Cirno, 0 = Letty).
+    const portraitSprite = spellId <= 1 ? 3 : 0;
     // TH07-TODO: exact per-spell capture bonus values.
-    this.spellcard = { name, id: spellId, capturing: true, bonus: 100000 + spellId * 10000 };
+    this.spellcard = { name, id: spellId, capturing: true, bonus: 100000 + spellId * 10000, declAge: 0, portraitSprite };
     this.spellBanner = 150;
+    const tally = this.spellHistory.get(spellId) ?? { seen: 0, got: 0 };
+    tally.seen++;
+    this.spellHistory.set(spellId, tally);
     this.playSfx(12);
+    // Declaration charge burst at the boss (se_cat00 above is the charge SE).
+    if (this.bossActive) this.spawnEffectParticles(3, this.bossActive.x, this.bossActive.y, 24, 0xffffffff);
   }
 
   endBossSpell(): void {
@@ -242,6 +260,8 @@ export class StageScene implements GameHost {
       const bonus = this.spellcard.bonus;
       this.addScore(bonus);
       this.cherry.onSpellCapture();
+      const tally = this.spellHistory.get(this.spellcard.id);
+      if (tally) tally.got++;
       this.bonusPopup = { text: `Spell Card Bonus! ${bonus.toLocaleString('en-US')}`, timer: 180 };
       this.playSfx(28);
     } else if (this.spellcard) {
@@ -330,6 +350,7 @@ export class StageScene implements GameHost {
     }
     this.stageFrame++;
     if (this.dialogue) {
+      this.dialogueSeen = true;
       this.dialogue.update(input.pressed.has('shoot') || input.held.has('skip'));
       if (this.dialogue.resumeTicket) {
         this.dialogue.resumeTicket = false;
@@ -338,6 +359,7 @@ export class StageScene implements GameHost {
       if (this.dialogue.done) this.dialogue = null;
     }
     if (this.spellBanner > 0) this.spellBanner--;
+    if (this.spellcard) this.spellcard.declAge++;
     if (this.bonusPopup && --this.bonusPopup.timer <= 0) this.bonusPopup = null;
     if (!this.stageClear && this.runtime.isTimelineComplete() && !this.bossActive && this.enemies.length <= 1) {
       this.clearTimer++;
@@ -938,6 +960,7 @@ export class StageScene implements GameHost {
       const ox = PLAYFIELD.x;
       const oy = PLAYFIELD.y;
       this.drawBackground(r, ox, oy);
+      this.drawSpellBackground(r);
       for (const p of this.particles) {
         const alpha = 1 - p.age / p.life;
         r.ctx.globalAlpha = alpha * 0.8;
@@ -1013,6 +1036,7 @@ export class StageScene implements GameHost {
         }
       }
       if (this.cherry.borderActive) this.drawBorder(r, ox, oy);
+      this.drawSpellDeclaration(r, ox, oy);
     });
     this.drawFrame(r);
     this.drawSidebar(r);
@@ -1274,13 +1298,104 @@ export class StageScene implements GameHost {
     }
   }
 
+  // Spellcard background: the scrolling eff01 sheet over the 3D scene while
+  // a card is active. Open-coded from eff01.anm script 0 — cornerRel quad at
+  // (32,16) sized 384x448 (a tiled view of the 256x256 texture), alpha
+  // 0->255 over 60 frames, then a per-frame loop shifting u +0.004167 and
+  // v -0.008333. Not run through AnmRunner: the script's op-4 frame-reset
+  // loop would pin the frame-keyed fade interpolation near zero.
+  private drawSpellBackground(r: Renderer): void {
+    const sc = this.spellcard;
+    if (!sc) return;
+    const img = r.image('eff01');
+    if (!img) return;
+    if (!this.eff01Pattern) this.eff01Pattern = r.ctx.createPattern(img, 'repeat');
+    if (!this.eff01Pattern) return;
+    const ctx = r.ctx;
+    const u = 0.004167 * 256 * sc.declAge;
+    const v = -0.008333 * 256 * sc.declAge;
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, sc.declAge / 60);
+    ctx.translate(PLAYFIELD.x - u, PLAYFIELD.y - v);
+    ctx.fillStyle = this.eff01Pattern;
+    ctx.fillRect(u, v, PLAYFIELD.width, PLAYFIELD.height);
+    ctx.restore();
+  }
+
+  // Declaration-time effects drawn over the playfield entities: the teal
+  // flash (capture.anm scr0: full-playfield quad, color 0x10c0e0, 30-frame
+  // fade in/out — its runtime '@' texture is not extractable, so a flat
+  // tint approximates it) and the boss portrait cutin sweep (face_01_00,
+  // the dialogue portrait art; path/timing approximated — AGENTS.md §7).
+  private drawSpellDeclaration(r: Renderer, ox: number, oy: number): void {
+    const sc = this.spellcard;
+    if (!sc) return;
+    const t = sc.declAge;
+    const ctx = r.ctx;
+    if (t < 60) {
+      const flash = (t < 30 ? t / 30 : 1 - (t - 30) / 30) * 0.5;
+      ctx.save();
+      ctx.globalAlpha = flash;
+      ctx.fillStyle = 'rgb(16,192,224)';
+      ctx.fillRect(ox, oy, PLAYFIELD.width, PLAYFIELD.height);
+      ctx.restore();
+    }
+    if (t < 110) {
+      const sprite = this.assets.anms.face_01_00.sprites.get(sc.portraitSprite);
+      const img = r.image('face_01_00');
+      if (sprite && img) {
+        const p = t / 110;
+        const scale = 0.85;
+        const w = sprite.w * scale;
+        const h = sprite.h * scale;
+        const x = ox + PLAYFIELD.width * 0.62 - w / 2;
+        // Ease-out vertical sweep, fading in and back out at the ends.
+        const ease = 1 - (1 - p) * (1 - p);
+        const y = oy + PLAYFIELD.height / 2 - h / 2 + 140 - ease * 280;
+        const alpha = Math.min(1, Math.min(p, 1 - p) * 5) * 0.55;
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.drawImage(img, sprite.x, sprite.y, sprite.w, sprite.h, x, y, w, h);
+        ctx.restore();
+      }
+    }
+  }
+
   private drawSpellOverlay(r: Renderer): void {
     if (!this.spellName) return;
-    const slide = Math.max(0, this.spellBanner - 90) / 60;
-    const x = PLAYFIELD.x + PLAYFIELD.width - 12 - slide * 200;
-    r.text(this.spellName, x, PLAYFIELD.y + 22, { size: 13, color: '#fdd', align: 'right' });
-    if (this.spellcard) {
-      r.text(`Bonus ${this.spellcard.capturing ? this.spellcard.bonus.toLocaleString('en-US') : 'failed'}`, PLAYFIELD.x + PLAYFIELD.width - 12, PLAYFIELD.y + 40, { size: 11, color: this.spellcard.capturing ? '#adf' : '#977', align: 'right' });
+    const sc = this.spellcard;
+    const declAge = sc?.declAge ?? 999;
+    const ctx = r.ctx;
+    // Declaration window: the name rides a red ribbon banner in the lower
+    // third, with Bonus / History beneath (text.anm's pre-rendered banner
+    // textures are not extractable — r.text over a gradient approximates
+    // the original look); afterwards it rests top-right under the HP bar.
+    const declPhase = Math.min(1, Math.max(0, (declAge - 120) / 30));
+    const slideIn = Math.min(1, declAge / 20);
+    const bannerY = PLAYFIELD.y + 300;
+    const restY = PLAYFIELD.y + 22;
+    const y = bannerY + (restY - bannerY) * declPhase;
+    const xRest = PLAYFIELD.x + PLAYFIELD.width - 12;
+    const xBanner = PLAYFIELD.x + PLAYFIELD.width - 16 + (1 - slideIn) * 120;
+    const x = xBanner + (xRest - xBanner) * declPhase;
+    if (declPhase < 1) {
+      const bannerAlpha = (1 - declPhase) * slideIn;
+      const grad = ctx.createLinearGradient(PLAYFIELD.x, 0, PLAYFIELD.x + PLAYFIELD.width, 0);
+      grad.addColorStop(0, 'rgba(160,16,16,0)');
+      grad.addColorStop(0.55, 'rgba(190,24,24,0.75)');
+      grad.addColorStop(1, 'rgba(120,8,8,0.9)');
+      ctx.save();
+      ctx.globalAlpha = bannerAlpha;
+      ctx.fillStyle = grad;
+      ctx.fillRect(PLAYFIELD.x, y - 13, PLAYFIELD.width, 18);
+      ctx.restore();
+    }
+    r.text(this.spellName, x, y, { size: 13, color: '#fee', align: 'right' });
+    if (sc) {
+      const tally = this.spellHistory.get(sc.id);
+      const history = tally ? `  history ${tally.got}/${tally.seen}` : '';
+      const bonusText = sc.capturing ? `Bonus ${sc.bonus.toLocaleString('en-US')}${history}` : `Bonus failed${history}`;
+      r.text(bonusText, x, y + 18, { size: 11, color: sc.capturing ? '#adf' : '#977', align: 'right' });
     }
   }
 
@@ -1413,6 +1528,12 @@ export class StageScene implements GameHost {
       }
       const seconds = Math.max(0, Math.trunc((this.timerThreshold() - this.bossActive.ecl.bossTimer) / 60));
       this.drawNumber(r, seconds, PLAYFIELD.x + PLAYFIELD.width - 20, PLAYFIELD.y + 4, 2);
+      // Boss nameplate: ename.png 16px rows composited at (32,26) (AGENTS.md
+      // §6). Row selection is the stage-1 heuristic from dialogueSeen (0 =
+      // Cirno midboss, 1 = Letty after the pre-boss dialogue).
+      if (!this.dialogue) {
+        this.blit(r, 'ename', [0, this.dialogueSeen ? 16 : 0, 128, 16], 32, 26);
+      }
       // Enemy position marker on the bottom edge (PCB feature).
       const bx = PLAYFIELD.x + Math.max(0, Math.min(PLAYFIELD.width, this.bossActive.x));
       ctx.fillStyle = '#f8bcd0';
