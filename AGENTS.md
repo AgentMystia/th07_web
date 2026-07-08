@@ -254,8 +254,11 @@ comparisons against real play).
 - Frame tiling positions (exact-fit math, engine placement not literal).
 - HUD star icon x positions; spell-timer and fps exact placement.
 - Cherry+ banner interrupt→state mapping (dim=charging, bright=border).
-- Bombs are functionally accurate first-pass; per-type visuals and exact
-  damage/cancel cadence not yet exe-verified.
+- Bomb mechanics are functionally accurate first-pass; damage/cancel cadence
+  not yet exe-verified. Bomb visuals run the characters' own playerXX.anm
+  bomb scripts (Reimu scr133–143, Marisa scr71–78/98–104, Sakuya scr5–14 —
+  decoded from the embedded data), but the spawn cadence/anchor offsets in
+  `StageScene#spawnBombEffects` approximate the exe's placement routine.
 - ECL per-frame damage cap 70 inherited from the TH06 family (op 142
   parameter suspected related, unconfirmed).
 - `ins_30/31` render flags unknown (no-op everywhere, matches PyTouhou).

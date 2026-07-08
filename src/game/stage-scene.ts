@@ -9,6 +9,7 @@ import { AnmRunner, type AnmFrame } from '../formats/anm';
 import { TH07_DATA } from '../data/th07-data';
 import type { AudioBus } from '../audio/audio';
 import { CHARACTERS, Player, type CharacterId, type PlayerBullet } from './player';
+import { PlayerEffects } from './player-effects';
 import { CherrySystem, BORDER_DURATION, CHERRY_PLUS_MAX } from './cherry';
 import { DialogueRunner, portraitSprite } from './dialogue';
 
@@ -129,6 +130,9 @@ export class StageScene implements GameHost {
   // Global sprite id of etama entry 1's embedded sprite 0 (the etama2.png
   // item sheet); see ITEM_SPRITES above.
   private readonly etamaItemBase: number;
+  // Script-driven bomb visuals (see spawnBombEffects).
+  private readonly playerEffects: PlayerEffects;
+  private prevBombTimer = 0;
 
   constructor(private assets: GameAssets, private audio: AudioBus, difficulty = 1, character: CharacterId = 'reimuA') {
     this.difficulty = difficulty;
@@ -139,6 +143,7 @@ export class StageScene implements GameHost {
     });
     this.etamaItemBase = assets.anms.etama.entries[1].spriteBase;
     this.playerObj = new Player(character, assets.anms);
+    this.playerEffects = new PlayerEffects(this.playerObj.anm);
     this.player = this.playerObj;
   }
 
@@ -351,12 +356,93 @@ export class StageScene implements GameHost {
     this.updateItems();
     this.updateParticles();
     if (p.bombTimer > 0) this.applyBombEffects();
+    // Bomb over: release the interrupt-gated bomb visuals (label 1 is the
+    // fade-out path in the player bomb scripts).
+    if (this.prevBombTimer > 0 && p.bombTimer === 0) this.playerEffects.interruptAll(1);
+    this.prevBombTimer = p.bombTimer;
+    this.playerEffects.update();
     if (this.score > this.hiScore) this.hiScore = this.score;
   }
 
   private onBombUsed(): void {
     this.playSfx(12);
     this.spawnEffectParticles(3, this.playerObj.x, this.playerObj.y, 24, 0xffffffff);
+    this.spawnBombEffects();
+  }
+
+  // Bomb visuals, per shot type, from the character's own playerXX.anm bomb
+  // scripts (decoded from the embedded data; script ids and their behavior
+  // are the original's, the spawn cadence/anchor offsets below are flagged
+  // approximations — the exe routine that places them is not reimplemented;
+  // AGENTS.md §7).
+  private spawnBombEffects(): void {
+    const p = this.playerObj;
+    const fx = this.playerEffects;
+    const dur = p.bombTimer;
+    switch (p.character) {
+      case 'reimuA': {
+        // 夢想封印: colored orbs (player00.anm scr133-136, offset-mode wander
+        // + interrupt-1 fade) drifting outward in two waves.
+        for (let wave = 0; wave < 2; wave++) {
+          for (let i = 0; i < 4; i++) {
+            const angle = -Math.PI / 2 + (i - 1.5) * 0.55 + (wave ? 0.27 : 0);
+            fx.spawn({
+              scriptId: 133 + i,
+              x: p.x, y: p.y,
+              vx: Math.cos(angle) * 1.1,
+              vy: Math.sin(angle) * 1.1,
+              delay: wave * 40
+            });
+          }
+        }
+        break;
+      }
+      case 'reimuB':
+        // 封魔陣: the big seal circles (scr141-143) plus the four cross
+        // beams sweeping out from the cast point (scr137-140).
+        for (const id of [141, 142, 143, 137, 138, 139, 140]) fx.spawn({ scriptId: id, x: p.x, y: p.y });
+        break;
+      case 'marisaA':
+        // スターダストレヴァリエ: magic circle (scr71) at the cast point;
+        // star bursts (scr98-104) respawn per-frame in applyBombEffects.
+        fx.spawn({ scriptId: 71, x: p.x, y: p.y, ttl: dur });
+        break;
+      case 'marisaB':
+        // マスタースパーク: magic circle (scr72) + the star-column beam
+        // layers (scr73-78, interrupt-1 releases their fade) tiled up the
+        // playfield from the muzzle; bursts along the beam come from
+        // applyBombEffects.
+        fx.spawn({ scriptId: 72, x: p.x, y: p.y, ttl: dur });
+        for (let tier = 0; tier < 3; tier++) {
+          const y = p.y - 56 - tier * 94;
+          fx.spawn({ scriptId: 73 + tier, x: p.x, y });
+          fx.spawn({ scriptId: 76 + tier, x: p.x, y });
+        }
+        break;
+      case 'sakuyaA': {
+        // 殺人ドール: a ring of knives (scr5/6 trails) thrown outward, with
+        // the red/blue "world" squares (scr9/10) flashing at the cast point.
+        fx.spawn({ scriptId: 9, x: p.x, y: p.y });
+        fx.spawn({ scriptId: 10, x: p.x, y: p.y });
+        for (let i = 0; i < 16; i++) {
+          const angle = (i / 16) * Math.PI * 2;
+          fx.spawn({
+            scriptId: 5 + (i & 1),
+            x: p.x, y: p.y,
+            vx: Math.cos(angle) * 3.2,
+            vy: Math.sin(angle) * 3.2,
+            rotation: angle + Math.PI / 2
+          });
+        }
+        break;
+      }
+      case 'sakuyaB':
+        // プライベートスクウェア: the staggered grow/shrink world squares
+        // (scr9-12) under the two slow-rotating additive overlays (scr13/14,
+        // ~300f — the time-stop tint for the whole bomb).
+        for (const id of [9, 10, 11, 12, 13, 14]) fx.spawn({ scriptId: id, x: p.x, y: p.y - 96 });
+        break;
+    }
   }
 
   private applyBombEffects(): void {
@@ -368,6 +454,23 @@ export class StageScene implements GameHost {
         this.spawnItem('pointBullet', b.x, b.y, { state: 1 });
         b.dead = true;
       }
+    }
+    // Marisa's bombs continuously pop star bursts (player01.anm scr98-104)
+    // — around the player for A, along the spark beam for B (cadence
+    // approximated, AGENTS.md §7).
+    const p = this.playerObj;
+    if (p.character === 'marisaA' && this.frame % 4 === 0) {
+      this.playerEffects.spawn({
+        scriptId: 98 + this.rng.u32InRange(7),
+        x: p.x + this.rng.range(192) - 96,
+        y: p.y - this.rng.range(224)
+      });
+    } else if (p.character === 'marisaB' && this.frame % 3 === 0) {
+      this.playerEffects.spawn({
+        scriptId: 98 + this.rng.u32InRange(7),
+        x: p.x + this.rng.range(48) - 24,
+        y: p.y - 40 - this.rng.range(280)
+      });
     }
   }
 
@@ -381,6 +484,7 @@ export class StageScene implements GameHost {
       this.spawnItem('power', p.x + this.rng.range(64) - 32, p.y - this.rng.range(32));
     }
     for (const b of this.enemyBullets) b.dead = true;
+    this.playerEffects.clear();
     p.die();
     if (p.lives < 0) {
       this.gameOver = true;
@@ -881,6 +985,7 @@ export class StageScene implements GameHost {
           scaleMultiplier: b.state === 'collided' ? 1 + b.hitAge / 10 : 1
         });
       }
+      this.playerEffects.draw(r, ox, oy);
       // Option orbs (yin-yang, local sprite 128).
       if (p.alive && p.power >= 8) {
         const orbSprite = p.anm.sprites.get(128) ?? p.anm.sprites.get(66);

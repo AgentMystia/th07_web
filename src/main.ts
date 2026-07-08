@@ -50,6 +50,7 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
     spellName: scene.spellName,
     rngSeed: scene.rng.seed,
     player: { x: scene.playerObj.x, y: scene.playerObj.y, lives: scene.playerObj.lives, bombs: scene.playerObj.bombs, power: scene.playerObj.power },
+    bomb: { timer: scene.playerObj.bombTimer },
     graze: scene.graze,
     playerBullets: scene.playerBullets.length,
     playerBulletDump: scene.playerBullets.slice(0, 8).map((b) => ({
