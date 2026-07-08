@@ -318,6 +318,7 @@ export class StageScene implements GameHost {
     if (death === 'died') this.onPlayerDeath();
     if (!this.gameOver) {
       for (const b of p.fire()) {
+        if (b.behaviorFunc === 4) this.aimBulletAtSpawn(b);
         this.playerBullets.push(b);
       }
       if (p.shooting && this.frame % 8 === 0) this.playSfx(0);
@@ -447,7 +448,12 @@ export class StageScene implements GameHost {
     for (const b of this.playerBullets) {
       b.age++;
       if (b.state === 'fired') {
-        if (b.shotType === 1) this.steerHomingBullet(b);
+        // shotType 1 = ReimuA homing amulets; 2 = her focused variant (SHT
+        // spawns those at speed 2 — the exe routine both steers and
+        // accelerates them; rates shared with type 1/3 are a flagged
+        // approximation, AGENTS.md §7).
+        if (b.shotType === 2 && b.age > 8) b.speed = Math.min(12, b.speed + 0.4);
+        if (b.shotType === 1 || b.shotType === 2) this.steerHomingBullet(b);
         else if (b.shotType === 3 && b.age > 8) {
           // Accelerating shots (MarisaA missiles).
           b.speed = Math.min(14, b.speed + 0.4);
@@ -468,8 +474,10 @@ export class StageScene implements GameHost {
         if (Math.abs(b.x - e.x) <= hw && Math.abs(b.y - e.y) <= hh) {
           this.damageEnemy(e, b.damage);
           this.cherry.onShotHit(this.focusHeld);
-          if (b.shotType === 4) {
-            // Piercing shots (MarisaB laser) pass through.
+          if (b.shotType === 4 || b.shotType === 5) {
+            // Piercing shots pass through (MarisaB lasers; type 5 is her
+            // focused laser — SHT funcs[2] = 1, the suspected pierce flag.
+            // TH07-TODO: exe confirmation).
             b.damage = Math.max(1, Math.trunc(b.damage / 2));
           } else {
             b.state = 'collided';
@@ -487,17 +495,24 @@ export class StageScene implements GameHost {
     this.playerBullets.length = w;
   }
 
-  private steerHomingBullet(b: PlayerBullet): void {
+  // Nearest damageable enemy to (x, y); shared by the homing steer and the
+  // SakuyaA focused spawn-aim.
+  private findAimTarget(x: number, y: number): Enemy | null {
     let best: Enemy | null = null;
     let bestDist = 1e9;
     for (const e of this.enemies) {
       if (!e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.canTakeDamage) continue;
-      const d = (e.x - b.x) ** 2 + (e.y - b.y) ** 2;
+      const d = (e.x - x) ** 2 + (e.y - y) ** 2;
       if (d < bestDist) {
         bestDist = d;
         best = e;
       }
     }
+    return best;
+  }
+
+  private steerHomingBullet(b: PlayerBullet): void {
+    const best = this.findAimTarget(b.x, b.y);
     if (!best) return;
     const target = Math.atan2(best.y - b.y, best.x - b.x);
     let diff = target - b.angle;
@@ -505,6 +520,22 @@ export class StageScene implements GameHost {
     while (diff < -Math.PI) diff += Math.PI * 2;
     const turn = 0.18;
     b.angle += Math.max(-turn, Math.min(turn, diff));
+    b.vx = Math.cos(b.angle) * b.speed;
+    b.vy = Math.sin(b.angle) * b.speed;
+  }
+
+  // SHT behavior func 0 == 4 (every ply02as shooter): the knife aims at an
+  // enemy the moment it spawns, keeping its small per-shooter spread relative
+  // to the aim direction — SakuyaA's focused shot converges on one target.
+  // Snap-aim (vs a continuous steer) is a flagged approximation of the exe
+  // routine the index selects (AGENTS.md §7); with no target it flies by its
+  // table angle. behaviorFunc 5 (SakuyaB) is intentionally not handled —
+  // semantics unknown, knives fly straight per the table (AGENTS.md §7).
+  private aimBulletAtSpawn(b: PlayerBullet): void {
+    const target = this.findAimTarget(b.x, b.y);
+    if (!target) return;
+    const spread = b.angle - -Math.PI / 2; // table angle relative to straight up
+    b.angle = Math.atan2(target.y - b.y, target.x - b.x) + spread;
     b.vx = Math.cos(b.angle) * b.speed;
     b.vy = Math.sin(b.angle) * b.speed;
   }

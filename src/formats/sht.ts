@@ -29,10 +29,20 @@ import { BinaryView } from './bin';
 // piercing lasers (4/5), matching src/game/stage-scene.ts's shotType
 // handling - kept under that name for that reason), i16 sprite ("anm"),
 // i16 sfxId ("sfx_id"; -1 = no sound), then 4×i32 hardcoded behavior
-// function indices (func_on_init/tick/draw/hit - not parsed here: nothing
-// in this codebase implements the custom laser/homing engine routines they
-// select, so the shots that rely on them fall back to the shotType
-// heuristic above instead). Shooter records run until an interval/delay
+// function indices (func_on_init/tick/draw/hit per sht-webedit), parsed
+// into `funcs`. Full decode of all 12 files (funcs[1] always mirrors the
+// shotType byte; funcs[0] is the spawn-time behavior selector):
+//   ply00a  orbs st1 [0,1,0,0]  homing amulets
+//   ply00as orbs st2 [0,2,0,0]  slow (speed 2) homing amulets
+//   ply01a  orbs st3 [0,3,0,1]  accelerating missiles
+//   ply01as orbs st3 [1,3,0,1]  missiles spawned at speed -2
+//   ply01b  orbs st4 [2,4,0,2]  accelerating laser shots
+//   ply01bs      st5 [3,5,1,2]  focused laser (funcs[2]=1: pierce)
+//   ply02as all  st0 [4,0,0,0]  aim at an enemy at spawn (SakuyaA focus)
+//   ply02b/bs    st0 [5,0,0,0]  unknown SakuyaB variant (flies straight)
+// The engine routines the indices select live in Th07.exe and are not
+// reimplemented 1:1; stage-scene.ts keys approximations off funcs[0] and
+// shotType (see AGENTS.md §7). Shooter records run until an interval/delay
 // sentinel of 0xffff/0xffff (4 bytes of 0xff).
 
 export interface ShtShot {
@@ -49,6 +59,7 @@ export interface ShtShot {
   shotType: number;
   sprite: number; // ANM script id in the character's playerXX.anm
   sfxId: number; // sound effect id to play on fire, -1 = none (not yet wired to playback)
+  funcs: [number, number, number, number]; // behavior function indices (see header comment)
 }
 
 export interface ShtLevel {
@@ -107,7 +118,8 @@ export class Sht {
           orb: v.u8(o + 30),
           shotType: v.u8(o + 31),
           sprite: v.i16(o + 32),
-          sfxId: v.i16(o + 34)
+          sfxId: v.i16(o + 34),
+          funcs: [v.i32(o + 36), v.i32(o + 40), v.i32(o + 44), v.i32(o + 48)]
         });
         o += 52;
       }
