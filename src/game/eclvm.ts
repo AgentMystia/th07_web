@@ -915,9 +915,34 @@ export class StageRuntime {
     };
   }
 
+  // Bullet type scripts live in etama.anm entry 0 (on-disk ids 0-24, the
+  // etama.png sheet). Entries 1-3 (etama2-4) reuse overlapping on-disk script
+  // ids (0-37 / 0 / 0) for item/big-bullet animations, so the flat scriptRef
+  // map resolves every bullet id to the wrong sheet (last entry wins) — the
+  // multi-entry id-collision rule of AGENTS.md §6. TH07-TODO: later stages
+  // fire big-bullet types whose scripts live in etama2/3/4; those need a
+  // type→entry mapping here instead of the fixed entry 0.
+  private badBulletWarned = new Set<string>();
+
   bulletRect(sprite: number, offset: number): { x: number; y: number; w: number; h: number; imageKey: string } {
-    const ref = this.bulletAnm.scriptRef(sprite);
-    const runner = new AnmRunner(this.bulletAnm, sprite, { spriteIndexOffset: offset });
+    try {
+      return this.bulletRectInEntry0(sprite, offset);
+    } catch (err) {
+      // Degrade to the plain pellet instead of throwing: an uncaught throw
+      // here escapes StageRuntime.update and halts the rAF loop (frozen
+      // game). Warn once per combo so bad data stays visible in dev.
+      const key = `${sprite}:${offset}`;
+      if (!this.badBulletWarned.has(key)) {
+        this.badBulletWarned.add(key);
+        console.warn(`bulletRect: fallback for script ${sprite} offset ${offset}: ${err}`);
+      }
+      return this.bulletRectInEntry0(0, 0);
+    }
+  }
+
+  private bulletRectInEntry0(sprite: number, offset: number): { x: number; y: number; w: number; h: number; imageKey: string } {
+    const ref = this.bulletAnm.scriptRefInEntry(0, sprite);
+    const runner = new AnmRunner(this.bulletAnm, sprite, { spriteIndexOffset: offset, entryIndex: 0 });
     const frame = runner.spriteFrame();
     if (!frame) throw new Error(`missing bullet ANM frame for script ${sprite} offset ${offset}`);
     return { x: frame.x, y: frame.y, w: frame.w, h: frame.h, imageKey: frame.imageKey || ref.imageKey || 'etama' };
