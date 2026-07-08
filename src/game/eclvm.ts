@@ -1065,6 +1065,10 @@ export class StageRuntime {
       return false;
     }
     if (s.deathCallbackSub >= 0) {
+      // Boss phase / spell end: the big explosion SE. TH07-TODO: the exact
+      // per-phase sound is not exe-verified; se_enep01 matches the audible
+      // original boss-phase boom.
+      game.playSfx(15);
       game.spawnEnemyDeathEffect?.(e);
       e.hp = 1;
       // Damage off the instant the death callback starts, or shots landing
@@ -1087,6 +1091,10 @@ export class StageRuntime {
     game.addScore(e.score || 0);
     if (s.isBoss && s.bossSlot != null && this.bossSlots[s.bossSlot] === e) this.bossSlots[s.bossSlot] = null;
     if (s.isBoss) game.setBossPresent?.(false, null);
+    // Enemy destruction SE: the op-105 value when the script set one (stage-1
+    // values 5/7/16/18/25; op semantics still TH07-TODO), else the common
+    // se_enep00 pop every non-scripted kill plays in the original.
+    game.playSfx(s.deathSound >= 0 ? s.deathSound : 1);
     game.spawnEnemyDeathEffect?.(e);
     for (const drop of this.dropTypes(s.itemDrop)) {
       game.spawnItem(drop, e.x, e.y);
