@@ -92,6 +92,10 @@ export class StageScene implements GameHost {
   graze = 0;
   pointItems = 0;
   private frameDamage = new Map<number, number>();
+  // Th07.exe FUN_00446970: the 5-slot SE queue drops a request whose id is
+  // already queued this service cycle — net effect, any SE id plays at most
+  // once per frame no matter how many requests (bug 2: se_damage00 spam).
+  private sfxPlayedThisFrame = new Set<number>();
   // One cached AnmRunner per stg1bg script id, stepped forward to the
   // current STD frame; shared by every quad instance that references it
   // (see drawBackground / bgAnmFrame).
@@ -201,6 +205,12 @@ export class StageScene implements GameHost {
   }
 
   playSfx(id: number): void {
+    // Th07.exe FUN_00446970 @ 0x446970: the 5-slot SE queue drops a request
+    // whose id is already queued this service cycle — net effect, any SE id
+    // plays at most once per frame no matter how many requests (bug 2: the
+    // per-bullet se_damage00 spam).
+    if (this.sfxPlayedThisFrame.has(id)) return;
+    this.sfxPlayedThisFrame.add(id);
     // Original SE index mapping (TH07-TODO: verify full table). Index into
     // the se_* files by the original sound ids used in ECL data.
     const SFX_BY_INDEX = [
@@ -335,6 +345,7 @@ export class StageScene implements GameHost {
     }
     const p = this.playerObj;
     this.frameDamage.clear();
+    this.sfxPlayedThisFrame.clear();
     // Bombing is allowed in normal play AND during the deathbomb window
     // (p.deathTimer >= 0) -- that window is precisely the few frames after a
     // hit in which a bomb still rescues you (tryBomb clears deathTimer). It
