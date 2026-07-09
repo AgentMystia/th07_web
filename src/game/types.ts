@@ -165,7 +165,6 @@ export interface EclState {
   collisionEnabled: boolean;
   interactable: boolean;
   hitSound: number;
-  deathSound: number;
   deathMode: number;
   deathCallbackSub: number;
   lifeThresholds: { threshold: number; sub: number }[];
@@ -206,8 +205,21 @@ export interface EclState {
   shouldClamp: boolean;
   spellName: string;
   seen: boolean;
-  flag136: number;
-  flag137: number;
+  // Op 136 (exe case 0x87 @ 0x413.. -> `+0x2e29` bit5, arg&1): enables the
+  // enemy body's periodic re-graze (exe-collision.md §6, ~every 6 frames
+  // while touching) and gates op94/killNonBossEnemies' cherry drop on
+  // sweep (exe-ecl-boss.md op94 section) -- same bit, both consumers.
+  // Default false: no confirmed default-on case in stage 1's own data.
+  bodyRegrazeFlag: boolean;
+  // Op 137 (exe case 0x88 @ 0x413.. -> `+0x2e2a` bit7, arg&1): exempts the
+  // enemy from the off-screen auto-cull (exe-misc-ecl-ops.md §4). Default
+  // false -- ordinary enemies get culled once seen-then-offscreen.
+  offscreenCullExempt: boolean;
+  // Op 142 (exe case 0x8d @ 0x413.. -> `+0x4f40/+0x4f3c/+0x4f38`): PROBABLE
+  // boss-phase damage-reduction/grace timer (dmg/9 if boss else 0 while
+  // active) per exe-misc-ecl-ops.md §5; stored only, not decremented or
+  // consumed -- the exe's own decrement/countdown mechanism was not
+  // located (UNRESOLVED), so wiring the gate itself would be invented.
   param142: number;
 }
 

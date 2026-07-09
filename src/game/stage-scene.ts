@@ -348,43 +348,58 @@ export class StageScene implements GameHost {
     const p = this.playerObj;
     this.frameDamage.clear();
     this.sfxPlayedThisFrame.clear();
-    // Bombing is allowed in normal play AND during the deathbomb window
-    // (p.deathTimer >= 0) -- that window is precisely the few frames after a
-    // hit in which a bomb still rescues you (tryBomb clears deathTimer). It
-    // stays blocked during the death squish / materialize (controllable false,
-    // deathTimer < 0 there).
-    if (input.pressed.has('bomb') && (p.controllable || p.deathTimer >= 0) && !this.gameOver) {
-      if (p.tryBomb()) {
-        this.cherry.onBomb();
-        this.voidSpellCapture();
-        this.onBombUsed();
-      }
-    }
-    p.update(input);
-    this.focusHeld = p.focusHeld;
-    const death = p.tickDeath();
-    if (death === 'effects') this.onPlayerDeath();
-    else if (death === 'respawn') this.onPlayerRespawn();
-    if (!this.gameOver) {
-      const volley = this.playerObj.fire();
-      if (volley.some((b) => b.sfxId >= 0)) this.playSfx(0);
-      // Th07.exe FUN_00438b70: the shot SE fires per spawn event of the one
-      // shooter with sfxId>=0 (always SE 0), not on a free-running 8f clock.
-      for (const b of volley) {
-        if (b.behaviorFunc === 4) this.aimBulletAtSpawn(b);
-        else if (b.behaviorFunc === 5) {
-          // Th07.exe FUN_00439160 (SakuyaB): bullets fly at orbitAngle + the
-          // shot's own deviation from straight-up — the whole fan banks with
-          // strafe. At rest (orbit = -π/2) this is exactly the table angle.
-          const spread = b.angle - -Math.PI / 2;
-          b.angle = this.playerObj.orbitAngle + spread;
-          b.vx = Math.cos(b.angle) * b.speed;
-          b.vy = Math.sin(b.angle) * b.speed;
+    // Th07.exe DAT_0061c25c (dialogue-freeze global, read-confirmed at 5
+    // sites, exe-misc-ecl-ops.md §2): while a dialogue box is up the whole
+    // simulation freezes for the frame -- Player::Update never runs at all
+    // (FUN_0043eef0 @ 0x43eef7: no movement/shot/bomb/hitbox handling),
+    // enemy-bullet movement is skipped wholesale (FUN_004241c0 @ 0x4241e4),
+    // and the stage frame counter/per-frame subsystems don't tick
+    // (FUN_00426656 @ 0x42665d). Captured once at the top of the frame (the
+    // dialogue box's own advance below can clear `this.dialogue` mid-frame,
+    // which should take effect starting next frame, matching the exe
+    // checking the flag before running its per-frame subsystems). Dialogue
+    // advance/input and UI-only timers (spell banner, bonus popup, cherry
+    // border) are not among the confirmed gates and keep running.
+    const frozen = this.isDialogueBlocking();
+    if (!frozen) {
+      // Bombing is allowed in normal play AND during the deathbomb window
+      // (p.deathTimer >= 0) -- that window is precisely the few frames after a
+      // hit in which a bomb still rescues you (tryBomb clears deathTimer). It
+      // stays blocked during the death squish / materialize (controllable false,
+      // deathTimer < 0 there).
+      if (input.pressed.has('bomb') && (p.controllable || p.deathTimer >= 0) && !this.gameOver) {
+        if (p.tryBomb()) {
+          this.cherry.onBomb();
+          this.voidSpellCapture();
+          this.onBombUsed();
         }
-        this.playerBullets.push(b);
       }
+      p.update(input);
+      this.focusHeld = p.focusHeld;
+      const death = p.tickDeath();
+      if (death === 'effects') this.onPlayerDeath();
+      else if (death === 'respawn') this.onPlayerRespawn();
+      if (!this.gameOver) {
+        const volley = this.playerObj.fire();
+        if (volley.some((b) => b.sfxId >= 0)) this.playSfx(0);
+        // Th07.exe FUN_00438b70: the shot SE fires per spawn event of the one
+        // shooter with sfxId>=0 (always SE 0), not on a free-running 8f clock.
+        for (const b of volley) {
+          if (b.behaviorFunc === 4) this.aimBulletAtSpawn(b);
+          else if (b.behaviorFunc === 5) {
+            // Th07.exe FUN_00439160 (SakuyaB): bullets fly at orbitAngle + the
+            // shot's own deviation from straight-up — the whole fan banks with
+            // strafe. At rest (orbit = -π/2) this is exactly the table angle.
+            const spread = b.angle - -Math.PI / 2;
+            b.angle = this.playerObj.orbitAngle + spread;
+            b.vx = Math.cos(b.angle) * b.speed;
+            b.vy = Math.sin(b.angle) * b.speed;
+          }
+          this.playerBullets.push(b);
+        }
+      }
+      this.stageFrame++;
     }
-    this.stageFrame++;
     if (this.dialogue) {
       this.dialogueSeen = true;
       this.dialogue.update(input.pressed.has('shoot') || input.held.has('skip'));
@@ -406,11 +421,13 @@ export class StageScene implements GameHost {
     }
     const borderBonus = this.cherry.tick();
     if (borderBonus > 0) this.addScore(borderBonus);
-    this.runtime.update(this);
-    this.updateEnemies();
-    this.updatePlayerBullets();
-    this.updateBullets();
-    this.checkPlayerCollision();
+    if (!frozen) {
+      this.runtime.update(this);
+      this.updateEnemies();
+      this.updatePlayerBullets();
+      this.updateBullets();
+      this.checkPlayerCollision();
+    }
     this.updateItems();
     this.updateParticles();
     if (p.bombTimer > 0) this.applyBombEffects();
@@ -789,9 +806,13 @@ export class StageScene implements GameHost {
         }
       }
       // Th07.exe FUN_0041ebc0: enemy bodies are grazable, region hitbox/1.4
-      // (= *(1/0.7)/2), re-attempted every 6 frames while touching.
+      // (= *(1/0.7)/2), re-attempted every 6 frames while touching -- but
+      // only when op136 armed the enemy's own `bodyRegrazeFlag`
+      // (`+0x2e29` bit5). This is the ONLY body-graze call site found in
+      // the exe (exe-collision.md §6); enemies that never call op136
+      // (the overwhelming majority) are never body-grazable at all.
       for (const e of this.enemies) {
-        if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead) continue;
+        if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.bodyRegrazeFlag) continue;
         const cd = this.bodyGrazeCooldown.get(e.id) ?? 0;
         if (cd > 0) { this.bodyGrazeCooldown.set(e.id, cd - 1); continue; }
         if (Math.abs(e.x - px) <= e.ecl.hitbox.x / 1.4 + p.grazeboxHalf + 20 &&
@@ -833,9 +854,11 @@ export class StageScene implements GameHost {
       }
     }
     // Th07.exe FUN_0041ebc0: enemy bodies are grazable, region hitbox/1.4
-    // (= *(1/0.7)/2), re-attempted every 6 frames while touching.
+    // (= *(1/0.7)/2), re-attempted every 6 frames while touching -- only
+    // when op136 armed `bodyRegrazeFlag` (`+0x2e29` bit5, see the
+    // borderActive branch above for the full citation).
     for (const e of this.enemies) {
-      if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead) continue;
+      if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.bodyRegrazeFlag) continue;
       const cd = this.bodyGrazeCooldown.get(e.id) ?? 0;
       if (cd > 0) { this.bodyGrazeCooldown.set(e.id, cd - 1); continue; }
       if (Math.abs(e.x - px) <= e.ecl.hitbox.x / 1.4 + p.grazeboxHalf + 20 &&
@@ -867,7 +890,11 @@ export class StageScene implements GameHost {
     for (const e of this.enemies) {
       if (e.dead) continue;
       const offscreen = e.x < -64 || e.x > 448 || e.y < -64 || e.y > 512;
-      if (offscreen && e.ecl.seen) e.dead = true;
+      // op137 (exe `+0x2e2a` bit7, exe-misc-ecl-ops.md §4): exempts an
+      // enemy from this cull even after it's been seen and gone offscreen
+      // -- e.g. a decorative particle emitter whose position legitimately
+      // wanders outside the visible rect.
+      if (offscreen && e.ecl.seen && !e.ecl.offscreenCullExempt) e.dead = true;
       if (!e.ecl.seen && !offscreen) e.ecl.seen = true;
       if (!e.dead && e.hp <= 0) {
         const keep = this.runtime.killEnemy(this, e);

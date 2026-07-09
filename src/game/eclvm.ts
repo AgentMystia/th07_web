@@ -11,6 +11,11 @@ import type { GameHost, Enemy, EclState, EclContext, BulletProps, ItemType } fro
 // instruction against the thecl disassembly of the original stage scripts.
 // Approximations and open questions are marked with `TH07-TODO`.
 
+// Empirically confirmed hard ceiling (not a decompiled address -- the exe
+// call site that owns this limit was not chased): headless probes hit
+// exactly 640 on-screen enemy bullets as a hard cap in two independent
+// dense-spellcard windows (Cirno's and Letty's Lunatic finals), never one
+// more (stage1-fidelity-audit.md item 4).
 const ENEMY_BULLET_CAP = 640;
 
 // Item ids as used by ECL drop fields, confirmed against Th07.exe (v1.00b)
@@ -243,7 +248,6 @@ export class StageRuntime {
       collisionEnabled: true,
       interactable: true,
       hitSound: -1,
-      deathSound: -1,
       deathMode: 0,
       deathCallbackSub: -1,
       lifeThresholds: [{threshold:-1,sub:-1},{threshold:-1,sub:-1},{threshold:-1,sub:-1},{threshold:-1,sub:-1}],
@@ -284,8 +288,8 @@ export class StageRuntime {
       shouldClamp: false,
       spellName: '',
       seen: false,
-      flag136: 0,
-      flag137: 0,
+      bodyRegrazeFlag: false,
+      offscreenCullExempt: false,
       param142: 0
     };
   }
@@ -898,7 +902,14 @@ export class StageRuntime {
       case 102: s.collisionEnabled = !!v.i32(a); return null;
       case 103: s.canTakeDamage = !!v.i32(a); return null;
       case 104: s.hitSound = v.i32(a); return null; // TH07-TODO verify
-      case 105: s.deathSound = v.i32(a); return null; // TH07-TODO verify
+      // Op 105 (exe case 0x68 @ 0x413bf6, FUN_00446970): IMMEDIATE PlaySE --
+      // requests SFX playback of the (possibly variable-resolved) arg the
+      // instant this instruction runs, deduped against up to 5 pending IDs.
+      // No enemy field is written (exe-misc-ecl-ops.md §1). This makes
+      // death-callback-sub SE cues (the common pattern -- the sub only runs
+      // at actual death, so timing matches for free) AND spawn-time SE cues
+      // (e.g. stage-1 sub 36's op105 at t=0 of its own init) both correct.
+      case 105: game.playSfx(v.i32(a)); return null;
       case 106: s.deathMode = v.i32(a); return null; // TH07-TODO verify
       case 107: s.deathCallbackSub = v.i32(a); return null;
       case 108: s.interrupts[v.i32(a + 4)] = v.i32(a); return null;
@@ -955,12 +966,50 @@ export class StageRuntime {
         game.enemyLasers.length = 0;
         return null;
       case 135: s.spellTimeoutFlag = !!v.i32(a); return null;
-      case 136: s.flag136 = v.i32(a); return null; // TH07-TODO: unknown flag
-      case 137: s.flag137 = v.i32(a); return null; // TH07-TODO: unknown flag
-      case 138: case 139: case 140: case 141:
+      // Op 136 (exe case 0x87 -> `+0x2e29` bit5 = arg&1): periodic
+      // body-graze re-eligibility (exe-collision.md §6, ~every 6 frames
+      // while touching) AND the op94/killNonBossEnemies sweep-cherry-drop
+      // gate (exe-ecl-boss.md op94 section) share this one bit
+      // (exe-misc-ecl-ops.md §3). `+0x2e2f=2` (draw-order bucket, no
+      // scoring/collision effect) is not modeled.
+      case 136: s.bodyRegrazeFlag = !!(v.i32(a) & 1); return null;
+      // Op 137 (exe case 0x88 -> `+0x2e2a` bit7 = arg&1): exempts this
+      // enemy from updateEnemies()'s offscreen auto-cull (exe-misc-ecl-ops.md §4).
+      case 137: s.offscreenCullExempt = !!(v.i32(a) & 1); return null;
+      // Op 138 (exe case 0x89, thtk format SSSS): NOT laser-related --
+      // writes enemy-local homing/tracking-shot parameter fields
+      // (+0x4f30/32/34/36), a separate RE topic ("homing funcs[1]").
+      // Op 139 (exe case 0x8a, thtk format SSSC): writes a GLOBAL per-ID
+      // effect/behavior parameter table (DAT_00495c24/c04/c44) -- not
+      // per-enemy, not per-laser. Both stubbed pending their own RE pass;
+      // stage 1 never calls the real laser ops (82-89/134)
+      // (exe-enemy-lasers.md §0).
+      case 138: case 139:
         game.configureAmbience?.(op, [v.i32(a), v.i32(a + 4), v.i32(a + 8), v.i32(a + 12)]);
         return null;
-      case 142: s.param142 = v.i32(a); return null; // TH07-TODO: unknown phase parameter
+      // Op 140 (exe case 0x8b, thtk format ffff): genuine ambience config --
+      // 4 global float args (palette/fade animation; matches
+      // stage1-ecl-dump.txt's Letty-fight AMBIENCE_CONFIG(140) calls). The
+      // op number and arg shape are correct; only the renderer-side
+      // consumer remains unimplemented (exe-enemy-lasers.md §0).
+      case 140:
+        game.configureAmbience?.(op, [v.i32(a), v.i32(a + 4), v.i32(a + 8), v.i32(a + 12)]);
+        return null;
+      // Op 141 (exe case 0x8c): dead jump-table entry in v1.00b -- the
+      // exe's own dispatcher routes index 0x8c to the identical
+      // default-fallthrough target used by the generic no-op case
+      // (confirmed by direct jump-table dump; exe-enemy-lasers.md §0).
+      // Not a laser op, not a stub for a real effect -- genuinely a no-op.
+      case 141: return null;
+      // Op 142 (exe case 0x8d -> `+0x4f40/+0x4f3c/+0x4f38`): PROBABLE
+      // boss-phase damage-reduction/grace timer -- while active, player
+      // bullet damage against the (boss) enemy is confirmed reduced to
+      // dmg/9 (or zeroed if not the registered boss); the decrement/
+      // countdown mechanism that would retire the window was not located
+      // in the exe (exe-misc-ecl-ops.md §5, UNRESOLVED). Stored only --
+      // wiring the damage gate without a confirmed decay path would be
+      // invented behavior, not a transcription.
+      case 142: s.param142 = v.i32(a); return null;
       case 148: { // Th07.exe FUN_0040f6c0 case 0x93: HP-threshold callback slot
         const slot = Math.max(0, Math.min(3, v.i32(a)));
         s.lifeThresholds[slot] = { threshold: v.i32(a + 4), sub: v.i32(a + 8) };
@@ -1098,10 +1147,19 @@ export class StageRuntime {
   }
 
   // Clears trash mobs; each cleared enemy still runs its death callback (so
-  // item-drop subs execute), matching the original.
-  private clearNonBossEnemy(enemy: Enemy): void {
+  // item-drop subs execute), matching the original. Th07.exe FUN_004217c0
+  // (op94's handler, also called from op91/spell-end): each cleared,
+  // non-boss occupied slot conditionally drops a cherry item, gated on the
+  // same per-entity flag op136 arms (`+0x2e29` bit5) -- confidence
+  // PROBABLE, the exe's own "diminishing budget" spend-per-drop mechanism
+  // was not pinned (stage1-fidelity-audit.md item 2 / exe-ecl-boss.md
+  // op94 section), so only the confirmed part (one drop per flagged, swept
+  // enemy, no budget decay) is ported; item type 6 = cherry per the
+  // existing ITEM_TABLE/FUN_00430970 mapping.
+  private clearNonBossEnemy(game: GameHost, enemy: Enemy): void {
     enemy.hp = 0;
     const s = enemy.ecl;
+    if (s.bodyRegrazeFlag) game.spawnItem('cherry', enemy.x, enemy.y);
     if (s.deathCallbackSub >= 0) {
       const sub = s.deathCallbackSub;
       s.deathCallbackSub = -1;
@@ -1116,14 +1174,14 @@ export class StageRuntime {
   killNonBossEnemies(game: GameHost, owner: Enemy | null = this.executingEnemy): void {
     for (const enemy of game.enemies) {
       if (enemy === owner || enemy.ecl.isBoss) continue;
-      this.clearNonBossEnemy(enemy);
+      this.clearNonBossEnemy(game, enemy);
     }
   }
 
   private clearNonBossEnemies(game: GameHost, owner: Enemy): void {
     for (const enemy of game.enemies) {
       if (enemy === owner || enemy.ecl.isBoss) continue;
-      this.clearNonBossEnemy(enemy);
+      this.clearNonBossEnemy(game, enemy);
     }
   }
 
@@ -1182,10 +1240,14 @@ export class StageRuntime {
     game.addScore(e.score || 0);
     if (s.isBoss && s.bossSlot != null && this.bossSlots[s.bossSlot] === e) this.bossSlots[s.bossSlot] = null;
     if (s.isBoss) game.setBossPresent?.(false, null);
-    // Enemy destruction SE: the op-105 value when the script set one (stage-1
-    // values 5/7/16/18/25; op semantics still TH07-TODO), else the common
-    // se_enep00 pop every non-scripted kill plays in the original.
-    game.playSfx(s.deathSound >= 0 ? s.deathSound : 1);
+    // Op 105 is an IMMEDIATE PlaySE (see its case above) -- the exe stores
+    // no per-enemy value for automatic replay at death, so a scripted
+    // death-callback sub's own op105 call already played its SE when that
+    // sub ran. This is the fallback for the no-death-callback path only:
+    // the generic se_enep00 "pop" the original plays on a plain kill
+    // (exe-misc-ecl-ops.md §1 -- exact native default SE id unconfirmed,
+    // se_enep00/id 1 matches the audible original).
+    game.playSfx(1);
     game.spawnEnemyDeathEffect?.(e);
     for (const drop of this.dropTypes(s.itemDrop)) {
       game.spawnItem(drop, e.x, e.y);
