@@ -71,7 +71,10 @@ export class Ecl {
       const arg0 = v.i16(off + 2);
       const op = v.u16(off + 4);
       const size = v.i16(off + 6);
-      if (time === -1 && arg0 === 4) break;
+      // Th07.exe FUN_0041de20: a timeline ends on the FIRST negative-time entry
+      // (any arg0/op), not on a specific (time=-1,arg0=4) marker. The old test
+      // over-read one sentinel as a spawn (skipped at runtime, but fragile).
+      if (time < 0) break;
       if (size < 8) break;
       const evt: TimelineEvent = { time, arg0, op, size };
       if (size >= 32 && (op === 0 || op === 2 || op === 4 || op === 6)) {

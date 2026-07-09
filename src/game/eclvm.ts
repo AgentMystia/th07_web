@@ -11,12 +11,10 @@ import type { GameHost, Enemy, EclState, EclContext, BulletProps, ItemType } fro
 // instruction against the thecl disassembly of the original stage scripts.
 // Approximations and open questions are marked with `TH07-TODO`.
 
-// Empirically confirmed hard ceiling (not a decompiled address -- the exe
-// call site that owns this limit was not chased): headless probes hit
-// exactly 640 on-screen enemy bullets as a hard cap in two independent
-// dense-spellcard windows (Cirno's and Letty's Lunatic finals), never one
-// more (stage1-fidelity-audit.md item 4).
-const ENEMY_BULLET_CAP = 640;
+// Th07.exe bullet pool is 0x400 = 1024 slots (FUN_00421e90 / FUN_00423480 both
+// gate on `< 0x400`; audit-bullet-motion.md D4). Was 640 (an empirical probe
+// ceiling), which starved the densest Lunatic patterns ~384 bullets early.
+const ENEMY_BULLET_CAP = 1024;
 
 // Item ids as used by ECL drop fields, confirmed against Th07.exe (v1.00b)
 // collection switch FUN_00430c10 @ 0x430c10 (case 0..7 award behavior): the
@@ -46,8 +44,9 @@ const RANDOM_ITEMS: ItemType[] = [
 const BULLET_HITBOX_BY_SPRITE = [4, 6, 4, 4, 4, 4, 4, 10, 5, 8, 24];
 
 // Special variable ids (reads resolved from game state). Writable general
-// variables live in EclState.vars. Locals (10000..10007) are saved/restored
-// across sub calls, matching the TH06 call-frame behavior.
+// variables live in EclState.vars. Th07.exe: 10000-10015 are FIXED per-enemy
+// struct fields (shared across sub calls); 10029+ are window-relative params
+// (the +8 CALL shift aliases caller args with callee params). See varRead.
 const VAR_BASE = 10000;
 
 
@@ -277,6 +276,7 @@ export class StageRuntime {
       disableCallStack: false,
       invisible: false,
       spellTimeoutFlag: false,
+      spellCardActive: false,
       bulletRankSpeedLow: -0.5,
       bulletRankSpeedHigh: 0.5,
       bulletRankAmount1Low: 0,
@@ -326,11 +326,37 @@ export class StageRuntime {
       case 10022: return game.player.y;
       case 10023: return 0; // player z
       case 10024: return Math.atan2(e.y - game.player.y, e.x - game.player.x);
-      case 10025: return Math.hypot(game.player.x - e.x, game.player.y - e.y);
-      case 10026: return s.bossTimer;
+      // Th07.exe FUN_0040d750/FUN_0040df90: 10025 = bossTimer (+0x2bcc),
+      // 10026 = player-enemy 3D distance (FUN_00403d50). Previously swapped.
+      case 10025: return s.bossTimer;
+      case 10026: return Math.hypot(game.player.x - e.x, game.player.y - e.y, -e.z);
       case 10027: return e.hp;
+      // Th07.exe exposes the enemy's LIVE movement state through the var system
+      // (FUN_0040df90 value-resolver, audit-letty-phases.md §0). The engine
+      // keeps these in named fields, so alias the var ids to them — otherwise
+      // ECL that reads/writes them via vars (Letty 二非 sub41, 终符 sub57) hits a
+      // dead slot and the pattern degrades (orbs collapse to the boss, rings
+      // fire at a fixed angle instead of swirling with the orbit).
+      case 10045: return Math.atan2(s.frameVy, s.frameVx); // +0x2b54 heading = atan2 of this frame's move delta
+      case 10046: return s.angularVelocity;                // +0x2b58 mode-1
+      case 10047: return s.speed;                           // +0x2b64 mode-1
+      case 10048: return s.acceleration;                    // +0x2b68 mode-1
+      case 10049: return s.orbitSpeed;                      // +0x2b6c mode-3 orbit
+      case 10053: return s.orbitAngle;                      // +0x2b5c mode-3 orbit
+      case 10054: return s.orbitAngularVelocity;            // +0x2b60 mode-3 orbit
     }
-    const slot = s.ctx.windowBase + (id - VAR_BASE);
+    // Th07.exe: vars 10000-10015 are FIXED per-enemy struct fields
+    // (enemy+0x6fc..0x738) shared across every sub call on this enemy — NOT
+    // shifted by the call window. Only the param/arg range (10029+) is
+    // window-relative (the +8 CALL shift aliases a caller's var10037/10041
+    // with a callee's var10029/10033). Windowing the locals too broke
+    // cross-sub locals: e.g. the 终符 controller (sub 55) sets var10007
+    // (the per-snowflake angular-velocity increment) and the spawner (sub 56)
+    // reads it — with windowing sub 56 read a fresh per-call slot (0) instead,
+    // so all snowflakes shared one angular velocity and clumped into a single
+    // point instead of fanning into the spell's flower.
+    const rel = id - VAR_BASE;
+    const slot = rel <= 15 ? rel : s.ctx.windowBase + rel;
     if (slot >= 0 && slot < s.vars.length) return s.vars[slot];
     return id;
   }
@@ -338,14 +364,21 @@ export class StageRuntime {
   private varWrite(game: GameHost, e: Enemy, id: number, value: number): void {
     const s = e.ecl;
     switch (id) {
-      // Match the read mapping above: enemy own position is 10018/19/20.
-      case 10018: e.x = value; return;
-      case 10019: e.y = value; return;
-      case 10020: e.z = value; return;
-      case 10026: s.bossTimer = value; return;
+      // Th07.exe FUN_0040dda0: position (10018-10020) and distance (10026) are
+      // read-only through the var system; bossTimer write is 10025, hp is 10027.
+      case 10025: s.bossTimer = value; return;
       case 10027: e.hp = value; return;
+      // Movement-state vars (see varRead): writable ones alias to the named
+      // movement fields so ECL writes reach the integrator.
+      case 10046: s.angularVelocity = value; return;
+      case 10047: s.speed = value; return;
+      case 10048: s.acceleration = value; return;
+      case 10049: s.orbitSpeed = value; return;
+      case 10053: s.orbitAngle = value; return;
+      case 10054: s.orbitAngularVelocity = value; return;
     }
-    const slot = s.ctx.windowBase + (id - VAR_BASE);
+    const rel = id - VAR_BASE;
+    const slot = rel <= 15 ? rel : s.ctx.windowBase + rel;
     if (slot >= 0 && slot < s.vars.length) {
       s.vars[slot] = value;
       return;
@@ -683,8 +716,9 @@ export class StageRuntime {
       }
       case 45: // SetActiveTimer(nFrames): exe +0x76c, case 0x2c -- see updateEnemy's
         // `active` gate / spec §2. Two stage-1 uses (Letty's snowflake-orb
-        // helpers, Sub35/36), arg = a random int in [100,120).
-        s.activeTimer = v.i32(a);
+        // helpers, Sub35/36), arg = the int var10029 (a random int in [100,120)).
+        // Resolve the var like op154 does, not the raw id (audit-letty-phases.md D4).
+        s.activeTimer = Math.trunc(this.varRead(game, e, v.i32(a)));
         return null;
       case 46: e.x = gf(0); e.y = gf(4); e.z = gf(8); return null;
       case 47: { // velocity by angle/speed (+ z speed)
@@ -826,12 +860,14 @@ export class StageRuntime {
         const decoded = new Uint8Array(end - start);
         for (let i = 0; i < decoded.length; i++) decoded[i] = bytes[start + i] ^ 0xaa;
         s.spellName = new TextDecoder('shift_jis').decode(decoded);
+        s.spellCardActive = true; // Th07.exe DAT_012f40a8 = 1 (all.c:6520)
         game.startBossSpell?.(spellId, v.i16(a), s.spellName);
         this.turnBulletsIntoPointItems(game);
         return null;
       }
       case 91:
         s.spellName = '';
+        s.spellCardActive = false; // Th07.exe DAT_012f40a8 = 0 (all.c:6692)
         game.endBossSpell?.();
         this.turnBulletsIntoPointItems(game);
         // Ending a spell also shatters the spell's helper enemies (Letty's
@@ -1044,11 +1080,33 @@ export class StageRuntime {
 
   private readBulletProps(game: GameHost, e: Enemy, aimMode: number, a: number): BulletProps {
     const s = e.ecl;
+    const speed1 = this.getFloat(game, e, a + 12);
+    const speed2 = this.getFloat(game, e, a + 16);
+    // Th07.exe FUN_0040f6c0 fire body (all.c:8503): the whole rank/count/speed
+    // scaling + min-1-count + 0.3-speed floors are gated behind
+    // `if (DAT_012f40a8 == 0)` — i.e. SKIPPED while a boss spell card is active.
+    // During a spell the raw ECL count/speed args are used verbatim
+    // (audit-fire-aimmode.md D1).
+    if (s.spellCardActive) {
+      return {
+        sprite: this.getShort(game, e, a),
+        offset: this.getShort(game, e, a + 2),
+        count1: this.getInt(game, e, a + 4),
+        count2: this.getInt(game, e, a + 8),
+        speed1,
+        speed2,
+        angle1: normalizeAngle(this.getFloat(game, e, a + 20)),
+        angle2: this.getFloat(game, e, a + 24),
+        flags: this.ecl.view.i32(a + 28) | (s.bulletSfx >= 0 ? 0x200 : 0),
+        sfx: s.bulletSfx,
+        exInts: [...s.bulletExInts],
+        exFloats: [...s.bulletExFloats],
+        aimMode
+      };
+    }
     const rankSpeed = game.rank * (s.bulletRankSpeedHigh - s.bulletRankSpeedLow) / 32 + s.bulletRankSpeedLow;
     const add1 = Math.trunc(game.rank * (s.bulletRankAmount1High - s.bulletRankAmount1Low) / 32 + s.bulletRankAmount1Low);
     const add2 = Math.trunc(game.rank * (s.bulletRankAmount2High - s.bulletRankAmount2Low) / 32 + s.bulletRankAmount2Low);
-    const speed1 = this.getFloat(game, e, a + 12);
-    const speed2 = this.getFloat(game, e, a + 16);
     return {
       sprite: this.getShort(game, e, a),
       offset: this.getShort(game, e, a + 2),
