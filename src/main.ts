@@ -10,6 +10,7 @@ import type { CharacterId } from './game/player';
 interface TestHook {
   ready: boolean;
   advance(n: number): void;
+  setLives(n: number): void;
   snapshot(): Record<string, unknown>;
   pixelAt(x: number, y: number): number[];
   setPlayer(x: number, y: number): void;
@@ -199,6 +200,11 @@ async function boot(): Promise<void> {
         if (!stage) return;
         stage.cherry.debugAddCherry(n);
       },
+      // Test-only: force the life count so probes can reach and observe
+      // late-stage content (boss spells, the Supernatural Border) that a
+      // no-dodge headless run would otherwise die before reaching. Same
+      // spirit as setPower/addCherry above.
+      setLives: (n: number) => { if (stage) stage.playerObj.lives = n; },
       bgm: () => ({ active: audio.active, decoded: audio.decodedTracks })
     };
   }
