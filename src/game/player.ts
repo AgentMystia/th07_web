@@ -24,6 +24,19 @@ export const CHARACTERS: Record<CharacterId, { family: 0 | 1 | 2; name: string; 
   sakuyaB: { family: 2, name: 'Sakuya B', shtBase: 'ply02b', anmKey: 'player02' }
 };
 
+// Th07.exe per-character bomb functions (exe-bombs.md §2, addresses
+// 0x407840-0x40cbf0): [duration, invulnTotal, speedMult] keyed by
+// character and focus-state AT CAST. invulnTotal = the exe's invuln
+// seed (already includes the grace beyond the bomb's own duration).
+const BOMB_PARAMS: Record<CharacterId, { unfocused: [number, number, number]; focused: [number, number, number] }> = {
+  reimuA:  { unfocused: [140, 200, 1.0], focused: [300, 360, 0.6] },
+  reimuB:  { unfocused: [140, 200, 1.0], focused: [190, 250, 0.4] },
+  marisaA: { unfocused: [200, 250, 1.0], focused: [260, 310, 0.4] },
+  marisaB: { unfocused: [300, 300, 0.2], focused: [340, 390, 0.2] },
+  sakuyaA: { unfocused: [160, 210, 1.0], focused: [250, 290, 0.3] },
+  sakuyaB: { unfocused: [160, 260, 2.0], focused: [300, 420, 1.5] }
+};
+
 // The game assigns the player ANM a sprite-id base of 1024; SHT sprite
 // fields are global ids (1088+ = local sprite 64+).
 export const PLAYER_SPRITE_BASE = 1024;
@@ -146,6 +159,9 @@ export class Player {
   materializeFrame = -1;
   bombTimer = 0;
   bombInvuln = 0;
+  // Latched from BOMB_PARAMS at cast; multiplies move speed while bombTimer>0.
+  // SakuyaB legitimately exceeds 1.0. Reset to 1.0 when the bomb ends.
+  bombSpeedMult = 1.0;
   runner: AnmRunner;
   private poseState: 'idle' | 'left' | 'right' = 'idle';
 
@@ -219,7 +235,10 @@ export class Player {
     }
     if (this.invulnFrames > 0) this.invulnFrames--;
     if (this.bombInvuln > 0) this.bombInvuln--;
-    if (this.bombTimer > 0) this.bombTimer--;
+    if (this.bombTimer > 0) {
+      this.bombTimer--;
+      if (this.bombTimer === 0) this.bombSpeedMult = 1.0;
+    }
     if (this.materializeFrame >= 0) {
       // Respawn materialize (fcn.0043e170): ramp scale/alpha IN PLACE over 30
       // frames, then enter the 240-frame invuln window. No movement/firing.
@@ -257,9 +276,12 @@ export class Player {
     if (input.held.has('up')) dy -= 1;
     if (input.held.has('down')) dy += 1;
     const diagonal = dx !== 0 && dy !== 0;
-    const speed = diagonal
+    const baseSpeed = diagonal
       ? (this.focusHeld ? sht.diagFocusedSpeed : sht.diagSpeed)
       : (this.focusHeld ? sht.focusedSpeed : sht.speed);
+    // Bombs latch a per-character speed multiplier (BOMB_PARAMS); SakuyaB
+    // legitimately exceeds 1.0 — NOT clamped (exe-bombs.md §2).
+    const speed = baseSpeed * (this.bombTimer > 0 ? this.bombSpeedMult : 1);
     // Th07.exe (v1.00b) Player::Update clamp @ 0x43c3cc / 0x43c430: field-local
     // x∈[0,384], y∈[0,448] (full playfield). Mins DAT_00625854/858 = 0; ranges
     // DAT_0062585c/860 = 384/448 (confirmed via FUN_0041de20 @ 0x41dfeb/0x41e016).
@@ -373,11 +395,11 @@ export class Player {
     if (this.bombs <= 0 || this.bombTimer > 0) return false;
     this.bombs--;
     this.deathTimer = -1; // deathbomb rescue
-    // Functional first pass: family-appropriate duration and invulnerability.
-    const family = CHARACTERS[this.character].family;
-    const duration = family === 1 ? 300 : 250;
+    // Th07.exe per-character bomb params selected by (character, focus-state) at cast.
+    const [duration, invulnTotal, speedMult] = BOMB_PARAMS[this.character][this.focusHeld ? 'focused' : 'unfocused'];
     this.bombTimer = duration;
-    this.bombInvuln = duration + 60;
+    this.bombInvuln = invulnTotal;
+    this.bombSpeedMult = speedMult;
     return true;
   }
 

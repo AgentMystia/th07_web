@@ -425,6 +425,9 @@ export class StageScene implements GameHost {
   private onBombUsed(): void {
     this.playSfx(12);
     this.spawnEffectParticles(3, this.playerObj.x, this.playerObj.y, 24, 0xffffffff);
+    // Th07.exe FUN_00431d10: bombing flags every live item for collection
+    // (same state=1 autocollect the border uses in updateItems).
+    for (const it of this.items) if (!it.dead) it.state = 1;
     this.spawnBombEffects();
   }
 
@@ -504,11 +507,18 @@ export class StageScene implements GameHost {
   }
 
   private applyBombEffects(): void {
+    const p = this.playerObj;
+    // Approximation of Th07.exe's per-orb localized hitboxes (radii 24-256,
+    // per-tick damage 1-23, exe-bombs.md §3): a single player-centered 128px
+    // region at 8 dmg/frame. Full 24-state-machine fidelity out of scope;
+    // flagged per AGENTS.md §7. No full-screen sweep exists in the exe.
     for (const e of this.enemies) {
-      if (e.ecl.canTakeDamage && e.ecl.interactable) this.damageEnemy(e, 6);
+      if (!e.ecl.canTakeDamage || !e.ecl.interactable) continue;
+      if (Math.abs(e.x - p.x) <= 128 && Math.abs(e.y - p.y) <= 128) this.damageEnemy(e, 8);
     }
-    if (this.frame % 4 === 0) {
-      for (const b of this.enemyBullets) {
+    for (const b of this.enemyBullets) {
+      if (b.dead) continue;
+      if (Math.abs(b.x - p.x) <= 128 && Math.abs(b.y - p.y) <= 128) {
         this.spawnItem('pointBullet', b.x, b.y, { state: 1 });
         b.dead = true;
       }
@@ -516,7 +526,6 @@ export class StageScene implements GameHost {
     // Marisa's bombs continuously pop star bursts (player01.anm scr98-104)
     // — around the player for A, along the spark beam for B (cadence
     // approximated, AGENTS.md §7).
-    const p = this.playerObj;
     if (p.character === 'marisaA' && this.frame % 4 === 0) {
       this.playerEffects.spawn({
         scriptId: 98 + this.rng.u32InRange(7),
