@@ -221,6 +221,14 @@ export class StageRuntime {
       moveMode: 0,
       interpKind: 0,
       interp: null,
+      orbitAngle: 0,
+      orbitAngularVelocity: 0,
+      orbitSpeed: 0,
+      orbitAcceleration: 0,
+      orbitTarget: { x: 0, y: 0, z: 0 },
+      orbitDuration: 0,
+      orbitLeft: 0,
+      activeTimer: Infinity,
       bulletProps: null,
       bulletSfx: -1,
       bulletExInts: [0, 0, 0, 0, 0],
@@ -358,11 +366,18 @@ export class StageRuntime {
     const s = e.ecl;
     const prevX = e.x;
     const prevY = e.y;
-    this.applyMovement(e);
+    // op 45 SetActiveTimer (exe +0x76c, FUN_00436a06): while active, both the
+    // ECL timeline's own time-cursor advance and movement modes 1/2/3 run;
+    // mode 0's axisSpeed lives outside that gate (spec §2). The decrement is
+    // the gated block's own first statement, so it uses the pre-decrement
+    // value for this frame's gate.
+    const active = s.activeTimer > 0;
+    if (active) s.activeTimer--;
+    this.applyMovement(e, active);
     s.frameVx = e.x - prevX;
     s.frameVy = e.y - prevY;
     this.checkCallbacks(game, e);
-    this.runEcl(game, e);
+    if (active) this.runEcl(game, e);
     this.updateAutoShoot(game, e);
     if (s.isBoss && !game.timeStopped) s.bossTimer++;
     this.updateAnmPose(e);
@@ -370,8 +385,22 @@ export class StageRuntime {
     for (const slot of s.anmSlots) slot?.runner?.update();
   }
 
-  private applyMovement(e: Enemy): void {
+  private applyMovement(e: Enemy, active = true): void {
     const s = e.ecl;
+    if (!active) {
+      // op45's timer ran out: modes 1/2/3 freeze in place; mode 0's axisSpeed
+      // integration is outside the exe's `if (0<+0x76c)` gate and keeps running.
+      if (s.moveMode === 0) {
+        e.x += s.mirrored ? -s.axisSpeed.x : s.axisSpeed.x;
+        e.y += s.axisSpeed.y;
+        e.z += s.axisSpeed.z;
+      }
+      if (s.shouldClamp) {
+        e.x = clamp(e.x, s.lowerMoveLimit.x, s.upperMoveLimit.x);
+        e.y = clamp(e.y, s.lowerMoveLimit.y, s.upperMoveLimit.y);
+      }
+      return;
+    }
     if (s.moveMode === 2 && s.interp) {
       const m = s.interp;
       const elapsed = m.duration - m.left;
@@ -391,6 +420,18 @@ export class StageRuntime {
         s.moveMode = 0;
         s.interp = null;
       }
+    } else if (s.moveMode === 3) {
+      // orbit around a (possibly moving) target: exe FUN_0040f6c0 case bVar8==3
+      // computes a polar offset in a scratch temp, then derives this frame's
+      // velocity as (temp+target)-pos so FUN_0041d050's unconditional integrator
+      // lands exactly on target+polar(angle,speed) — see spec §3 Group B / §5.3.
+      s.orbitAngle = normalizeAngle(s.orbitAngle + s.orbitAngularVelocity);
+      s.orbitSpeed += s.orbitAcceleration;
+      const vx = (Math.cos(s.orbitAngle) * s.orbitSpeed + s.orbitTarget.x) - e.x;
+      const vy = (Math.sin(s.orbitAngle) * s.orbitSpeed + s.orbitTarget.y) - e.y;
+      e.x += s.mirrored ? -vx : vx;
+      e.y += vy;
+      if (s.orbitDuration > 0 && --s.orbitLeft < 1) s.moveMode = 0;
     } else if (s.moveMode === 1) {
       const vx = Math.cos(s.angle) * s.speed;
       const vy = Math.sin(s.angle) * s.speed;
@@ -626,8 +667,10 @@ export class StageRuntime {
         if (ret) s.ctx = ret;
         return 'flow';
       }
-      case 45: // TH07-TODO: unknown (2 uses); observed with int var argument
-        warnOnce('op45', 'op 45 stubbed');
+      case 45: // SetActiveTimer(nFrames): exe +0x76c, case 0x2c -- see updateEnemy's
+        // `active` gate / spec §2. Two stage-1 uses (Letty's snowflake-orb
+        // helpers, Sub35/36), arg = a random int in [100,120).
+        s.activeTimer = v.i32(a);
         return null;
       case 46: e.x = gf(0); e.y = gf(4); e.z = gf(8); return null;
       case 47: { // velocity by angle/speed (+ z speed)
@@ -693,18 +736,31 @@ export class StageRuntime {
         }
         return null;
       }
-      case 56: { // TH07-TODO: 8-arg timed move; approximated as linear move-to
-        const duration = Math.max(1, v.i32(a));
-        s.interp = {
-          start: { x: e.x, y: e.y, z: e.z },
-          delta: { x: gf(4) - e.x, y: gf(8) - e.y, z: gf(12) - e.z },
-          duration,
-          left: duration
-        };
-        s.interpKind = 0;
-        s.moveMode = 2;
+      case 56: { // orbit activator: configure+start mode-3 orbit (exe case 0x37,
+        // FUN_0040f6c0 @0x4159a2-0x4159d8); duration=arg0 (0=never auto-stop),
+        // target=(arg1,arg2,arg3), angle/angvel=arg4/5, speed/accel=arg6/7 --
+        // see spec §3 Group B / §5.2. Previously approximated as a linear
+        // move-to-target, which stranded snow helpers whose literal speed=0.
+        s.orbitDuration = v.i32(a);
+        s.orbitLeft = s.orbitDuration;
+        s.orbitTarget = { x: gf(4), y: gf(8), z: gf(12) };
+        s.orbitAngle = gf(16);
+        s.orbitAngularVelocity = gf(20);
+        s.orbitSpeed = gf(24);
+        s.orbitAcceleration = gf(28);
+        s.moveMode = 3;
         return null;
       }
+      case 57: // adjust orbit speed/accel of an already-running mode-3 orbit
+        // (exe case 0x38, +0x2b6c/+0x2b70) without resetting target/angle/duration.
+        s.orbitSpeed = gf(0);
+        s.orbitAcceleration = gf(4);
+        return null;
+      case 58: // adjust orbit angle/angvel of an already-running mode-3 orbit
+        // (exe case 0x39, +0x2b5c/+0x2b60).
+        s.orbitAngle = gf(0);
+        s.orbitAngularVelocity = gf(4);
+        return null;
       case 62: {
         s.lowerMoveLimit = { x: gf(0), y: gf(4) };
         s.upperMoveLimit = { x: gf(8), y: gf(12) };

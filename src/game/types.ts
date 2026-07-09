@@ -137,6 +137,20 @@ export interface EclState {
   moveMode: number;
   interpKind: number;
   interp: { start: { x: number; y: number; z: number }; delta: { x: number; y: number; z: number }; duration: number; left: number } | null;
+  // mode-3 orbit group (exe +0x2b5c/60/6c/70/8c-94/a0/a4), see
+  // reference/re-specs/exe-enemy-move-fields.md §3 Group B / §5.1.
+  orbitAngle: number;
+  orbitAngularVelocity: number;
+  orbitSpeed: number;
+  orbitAcceleration: number;
+  orbitTarget: { x: number; y: number; z: number };
+  orbitDuration: number; // 0 = never auto-stop (exe +0x2ba4)
+  orbitLeft: number; // countdown (exe +0x2ba0)
+  // "active" countdown (exe +0x76c, op 45 SetActiveTimer): while > 0, gates
+  // ECL timeline advance + movement modes 1/2/3 (not mode 0's axisSpeed) --
+  // see spec §2 / §5.4. Defaults to Infinity so enemies that never call op45
+  // (the overwhelming majority) are unaffected.
+  activeTimer: number;
   bulletProps: BulletProps | null;
   bulletSfx: number;
   bulletExInts: number[];
