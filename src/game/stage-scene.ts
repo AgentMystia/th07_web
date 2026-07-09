@@ -96,6 +96,8 @@ export class StageScene implements GameHost {
   // already queued this service cycle — net effect, any SE id plays at most
   // once per frame no matter how many requests (bug 2: se_damage00 spam).
   private sfxPlayedThisFrame = new Set<number>();
+  // Th07.exe FUN_0041ebc0: enemy-body graze re-arms every 6 frames while touched.
+  private bodyGrazeCooldown = new Map<number, number>();
   // One cached AnmRunner per stg1bg script id, stepped forward to the
   // current STD frame; shared by every quad instance that references it
   // (see drawBackground / bgAnmFrame).
@@ -701,35 +703,57 @@ export class StageScene implements GameHost {
 
   private checkPlayerCollision(): void {
     const p = this.playerObj;
-    if (this.gameOver || !p.alive || p.invulnFrames > 0 || p.bombInvuln > 0) return;
+    // Th07.exe: graze runs during invuln/bomb (states 3/4); only materialize/dying block it. player.hit() already no-ops while invulnerable.
+    if (this.gameOver || !p.alive) return;
+    const px = p.x;
+    const py = p.y;
+    const hit = p.hitboxHalf;
     if (this.cherry.borderActive) {
       // Grazes still register during the border (they feed CherryMax).
       for (const b of this.enemyBullets) {
-        if (b.dead || b.age < b.spawnDuration || b.grazed) continue;
-        if (Math.abs(b.x - p.x) <= b.grazeW + 16 && Math.abs(b.y - p.y) <= b.grazeH + 16) {
+        if (b.dead || b.grazed) continue;
+        // exe: 16-frame minimum age before graze eligibility
+        if (b.age <= 15) continue;
+        // Th07.exe FUN_0043b350: bulletFull/2 + sht.grazebox/2 + flat 20.0 pad.
+        if (Math.abs(b.x - px) <= b.grazeW / 2 + p.grazeboxHalf + 20 && Math.abs(b.y - py) <= b.grazeH / 2 + p.grazeboxHalf + 20) {
           b.grazed = true;
           this.graze++;
-          this.addScore(500);
+          this.addScore(200); // Th07.exe FUN_0043bb30: +200 per graze
+          this.cherry.onGraze(this.focusHeld);
+          this.playSfx(24);
+        }
+      }
+      // Th07.exe FUN_0041ebc0: enemy bodies are grazable, region hitbox/1.4
+      // (= *(1/0.7)/2), re-attempted every 6 frames while touching.
+      for (const e of this.enemies) {
+        if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead) continue;
+        const cd = this.bodyGrazeCooldown.get(e.id) ?? 0;
+        if (cd > 0) { this.bodyGrazeCooldown.set(e.id, cd - 1); continue; }
+        if (Math.abs(e.x - px) <= e.ecl.hitbox.x / 1.4 + p.grazeboxHalf + 20 &&
+            Math.abs(e.y - py) <= e.ecl.hitbox.y / 1.4 + p.grazeboxHalf + 20) {
+          this.bodyGrazeCooldown.set(e.id, 6);
+          this.graze++;
+          this.addScore(200);
           this.cherry.onGraze(this.focusHeld);
           this.playSfx(24);
         }
       }
       return;
     }
-    const px = p.x;
-    const py = p.y;
-    const hit = p.hitboxHalf;
     for (const b of this.enemyBullets) {
-      if (b.dead || b.age < b.spawnDuration) continue;
+      if (b.dead) continue;
       const dx = Math.abs(b.x - px);
       const dy = Math.abs(b.y - py);
-      if (!b.grazed && dx <= b.grazeW + 16 && dy <= b.grazeH + 16) {
+      // Th07.exe FUN_0043b350: bulletFull/2 + sht.grazebox/2 + flat 20.0 pad.
+      if (!b.grazed && b.age > 15 && dx <= b.grazeW / 2 + p.grazeboxHalf + 20 && dy <= b.grazeH / 2 + p.grazeboxHalf + 20) {
+        // exe: 16-frame minimum age before graze eligibility
         b.grazed = true;
         this.graze++;
-        this.addScore(500);
+        this.addScore(200); // Th07.exe FUN_0043bb30: +200 per graze
         this.cherry.onGraze(this.focusHeld);
         this.playSfx(24);
       }
+      // exe FUN_004241c0: kill test runs from spawn; only graze has a min age (outer gate +0xbf0 unresolved)
       if (dx <= b.grazeW / 2 + hit && dy <= b.grazeH / 2 + hit) {
         this.onPlayerHit();
         return;
@@ -737,9 +761,25 @@ export class StageScene implements GameHost {
     }
     for (const e of this.enemies) {
       if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead) continue;
-      if (Math.abs(e.x - px) <= e.ecl.hitbox.x / 2 + hit && Math.abs(e.y - py) <= e.ecl.hitbox.y / 2 + hit) {
+      // Th07.exe FUN_0041ebc0: body kill uses hitbox*(1/1.5)/2 = /3
+      if (Math.abs(e.x - px) <= e.ecl.hitbox.x / 3 + hit && Math.abs(e.y - py) <= e.ecl.hitbox.y / 3 + hit) {
         this.onPlayerHit();
         return;
+      }
+    }
+    // Th07.exe FUN_0041ebc0: enemy bodies are grazable, region hitbox/1.4
+    // (= *(1/0.7)/2), re-attempted every 6 frames while touching.
+    for (const e of this.enemies) {
+      if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead) continue;
+      const cd = this.bodyGrazeCooldown.get(e.id) ?? 0;
+      if (cd > 0) { this.bodyGrazeCooldown.set(e.id, cd - 1); continue; }
+      if (Math.abs(e.x - px) <= e.ecl.hitbox.x / 1.4 + p.grazeboxHalf + 20 &&
+          Math.abs(e.y - py) <= e.ecl.hitbox.y / 1.4 + p.grazeboxHalf + 20) {
+        this.bodyGrazeCooldown.set(e.id, 6);
+        this.graze++;
+        this.addScore(200);
+        this.cherry.onGraze(this.focusHeld);
+        this.playSfx(24);
       }
     }
   }

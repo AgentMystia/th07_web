@@ -17,8 +17,9 @@ import { BinaryView } from './bin';
 // 52-byte header: i16 unknown, i16 levelCount, f32 bombsPerLife,
 // i32 deathbombWindow, then 8 floats: hitbox, grazebox, autocollectSpeed,
 // itemRadius, cherryLossOnDeath, pocLineY, speed, focusedSpeed, diagSpeed,
-// diagFocusedSpeed (hitbox/grazebox/speeds are half-widths and px/frame,
-// confirmed e.g. Reimu hitbox 1.65 == wiki's "3.3px wide" hitbox halved).
+// diagFocusedSpeed (hitbox/grazebox/speeds are FULL widths and px/frame;
+// 1.65 is Reimu's FULL hitbox — the exe halves it at point of use
+// (FUN_0043b200/FUN_0043b350 divide by 2.0), so 0.825 is the half-width).
 // Then levelCount × {u32 offset, u32 powerThreshold}, each pointing at a
 // 52-byte shooter record: u16 interval ("fire_rate"), u16 delay
 // ("start_delay"), 6×f32 (x, y, hitboxW, hitboxH, angle, speed), i16 damage,

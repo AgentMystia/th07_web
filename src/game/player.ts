@@ -172,11 +172,13 @@ export class Player {
   }
 
   get hitboxHalf(): number {
-    return this.sht.hitbox;
+    // sht hitbox/grazebox are FULL widths; the exe halves them at point of use
+    // (rdata 2.0 @ 0x48eac0). Reimu hitbox 1.65 full => 0.825 half.
+    return this.sht.hitbox / 2;
   }
 
   get grazeboxHalf(): number {
-    return this.sht.grazebox;
+    return this.sht.grazebox / 2;
   }
 
   get alive(): boolean {
