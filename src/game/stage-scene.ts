@@ -366,11 +366,14 @@ export class StageScene implements GameHost {
     if (death === 'effects') this.onPlayerDeath();
     else if (death === 'respawn') this.onPlayerRespawn();
     if (!this.gameOver) {
-      for (const b of p.fire()) {
+      const volley = this.playerObj.fire();
+      if (volley.some((b) => b.sfxId >= 0)) this.playSfx(0);
+      // Th07.exe FUN_00438b70: the shot SE fires per spawn event of the one
+      // shooter with sfxId>=0 (always SE 0), not on a free-running 8f clock.
+      for (const b of volley) {
         if (b.behaviorFunc === 4) this.aimBulletAtSpawn(b);
         this.playerBullets.push(b);
       }
-      if (p.shooting && this.frame % 8 === 0) this.playSfx(0);
     }
     this.stageFrame++;
     if (this.dialogue) {
@@ -633,19 +636,26 @@ export class StageScene implements GameHost {
         const hw = (e.ecl.hitbox.x + b.hitboxW) / 2;
         const hh = (e.ecl.hitbox.y + b.hitboxH) / 2;
         if (Math.abs(b.x - e.x) <= hw && Math.abs(b.y - e.y) <= hh) {
-          this.damageEnemy(e, b.damage);
-          this.cherry.onShotHit(this.focusHeld);
           if (b.shotType === 4 || b.shotType === 5) {
-            // Piercing shots pass through (MarisaB lasers; type 5 is her
-            // focused laser — SHT funcs[2] = 1, the suspected pierce flag.
-            // TH07-TODO: exe confirmation).
-            b.damage = Math.max(1, Math.trunc(b.damage / 2));
+            // Th07.exe FUN_0043a980: lasers deal FULL table damage on even values
+            // of their own age counter only, never enter 'collided', never spawn
+            // the hit effect/SE, and pierce indefinitely (no damage decay).
+            if ((b.age & 1) === 0) {
+              this.damageEnemy(e, b.damage);
+              this.cherry.onShotHit(this.focusHeld);
+            }
           } else {
+            this.damageEnemy(e, b.damage);
+            this.cherry.onShotHit(this.focusHeld);
             b.state = 'collided';
-            b.vx /= 8;
-            b.vy /= 8;
+            if (b.shotType !== 3) {
+              // Th07.exe: velocity/8 on hit — except shotType 3 (MarisaA missile)
+              // which keeps full velocity into its collided fade.
+              b.vx /= 8;
+              b.vy /= 8;
+            }
+            this.playSfx(17);
           }
-          this.playSfx(17);
           break;
         }
       }
@@ -697,6 +707,8 @@ export class StageScene implements GameHost {
     if (!target) return;
     const spread = b.angle - -Math.PI / 2; // table angle relative to straight up
     b.angle = Math.atan2(target.y - b.y, target.x - b.x) + spread;
+    // Th07.exe FUN_00439070: aimed shots get speed*1.5 (table 12 -> 18)
+    b.speed *= 1.5;
     b.vx = Math.cos(b.angle) * b.speed;
     b.vy = Math.sin(b.angle) * b.speed;
   }
