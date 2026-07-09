@@ -92,34 +92,36 @@ const GLIDE_FRAMES = 8;
 // within that cycle.
 const SHOT_CYCLE = 60;
 
-// Player spawn / entrance. The original Th07.exe (v1.00b) Player::Init
-// (fcn.0043f320 @ 0x43f320) places the player directly at the spawn point
-// -- x = fieldW/2 (DAT_0062584c/2.0 @ 0x43f376) -- and enters a 240-frame
-// (0xf0) invulnerability window (fcn.0043e2e0) with no entrance animation:
-// init preloads the materialize-state timer past its 0x1d threshold
-// (fcn.0043e170) so the spawn-in animation is skipped.
-//
-// APPROVED DEVIATION (user-requested stage intro): instead of appearing in
-// place, the player flies up from below the playfield over ENTRANCE_FRAMES
-// before play begins. Input and firing stay locked and the player is
-// invulnerable throughout the fly-in, then the exe-standard 240-frame spawn
-// invulnerability takes over. Respawn after death (die()) reuses this
-// object and does not replay the entrance -- it has its own respawnTimer
-// fly-in (see update()).
-export const ENTRANCE_FRAMES = 60;
-// Local playfield coords: start fully below the 448-tall playfield and ease
-// up to the resting y (432, this codebase's movement-range bottom; kept as
-// the resting position rather than the exe's fieldH-64=384 to match the
-// established player-zone verification baseline).
-const ENTRANCE_START_Y = 480;
-const ENTRANCE_REST_Y = 432;
-// fcn.0043e2e0: 240-frame spawn invulnerability after materializing.
+// Player spawn / lifecycle, decoded from Th07.exe (v1.00b). The exe drives
+// the player through a state byte at player+0x2408 (dispatcher fcn.0043eef0):
+//   0 normal       controllable, vulnerable.
+//   1 materialize  30-frame respawn-in (fcn.0043e170): scaleX 0->1, scaleY
+//                  3->1, alpha 0->255, input locked; exits to state 3.
+//   2 dying        deathbomb window + 30-frame death clock (fcn.0043dca0).
+//   3 invuln       countdown (fcn.0043e2e0); sprite dark-tinted 0x404040 on
+//                  frames where (timer & 7) < 2.
+// Player::Init (fcn.0043f320 @ 0x43f320) spawns directly at the spawn point
+// and preloads the materialize timer past its 0x1d threshold, so stage start
+// SKIPS the materialize and enters a 240-frame (0xf0) invulnerability window.
+// There is NO entrance fly-in in the original: the player is simply present,
+// invulnerable. Respawn after death (die()) DOES run the materialize in place.
+export const SPAWN_X = 192;
+// y = fieldH - 64 (Init: DAT_00625850 - 64.0 @ 0x43f38a, 64.0 = rdata
+// 0x48eb68); fieldH = 448 -> 384.
+export const SPAWN_Y = 384;
+// fcn.0043e170: materialize ramps over 30 frames (threshold 0x1d, divisor
+// 30.0 = rdata 0x48eb60); at frame 30 it hands off to a 240-frame (0xf0)
+// invuln window (fcn.0043e2e0).
+const MATERIALIZE_FRAMES = 30;
 const SPAWN_INVULN_FRAMES = 240;
+// fcn.0043dca0 (+0x23f8==0 branch): after the deathbomb window lapses, a
+// 30-frame in-place death squish (scaleX 1->0, scaleY 1->4) plays BEFORE the
+// respawn teleport + materialize.
+const DEATH_SQUISH_FRAMES = 30;
 
 export class Player {
-  x = 192;
-  // Stage start: begin below the playfield for the fly-in (see update()).
-  y = ENTRANCE_START_Y;
+  x = SPAWN_X;
+  y = SPAWN_Y;
   readonly character: CharacterId;
   readonly unfocused: Sht;
   readonly focused: Sht;
@@ -139,10 +141,12 @@ export class Player {
   power = 0;
   invulnFrames = 0;
   deathTimer = -1; // counts down the deathbomb window when hit
-  respawnTimer = 0;
-  // >0 during the stage-start fly-in; counts down in update(). Stays 0 on
-  // respawn (die() reuses this object and runs its own respawnTimer fly-in).
-  entranceTimer = ENTRANCE_FRAMES;
+  // -1 when idle; 0..DEATH_SQUISH_FRAMES during the post-death squish (exe
+  // state 2, fcn.0043dca0): scaleX=1-t, scaleY=1+3t, in place at the death loc.
+  dyingFrame = -1;
+  // -1 when idle; 0..MATERIALIZE_FRAMES during the respawn materialize (exe
+  // state 1, fcn.0043e170): scaleX=t, scaleY=3-2t, alpha=t, t=frame/30.
+  materializeFrame = -1;
   bombTimer = 0;
   bombInvuln = 0;
   runner: AnmRunner;
@@ -157,9 +161,10 @@ export class Player {
     this.anm = anms[spec.anmKey];
     this.bombs = Math.trunc(this.unfocused.bombs);
     this.runner = new AnmRunner(this.anm, 0);
-    // Begin the stage-start fly-in: invulnerable through the entrance and
-    // the 240-frame spawn grace that follows it (see update()/entranceTimer).
-    this.invulnFrames = ENTRANCE_FRAMES + SPAWN_INVULN_FRAMES;
+    // Stage start skips materialize (Init preloads its timer past threshold)
+    // and enters the 240-frame spawn invulnerability directly
+    // (fcn.0043f320 -> fcn.0043e2e0). The player is simply present, not flying in.
+    this.invulnFrames = SPAWN_INVULN_FRAMES;
   }
 
   get sht(): Sht {
@@ -175,13 +180,34 @@ export class Player {
   }
 
   get alive(): boolean {
-    return this.deathTimer < 0 && this.respawnTimer <= 0;
+    // Not hittable/firable during the deathbomb window, the death squish, or
+    // the respawn materialize (exe states 2/1); the invuln window (state 3) IS
+    // alive.
+    return this.deathTimer < 0 && this.dyingFrame < 0 && this.materializeFrame < 0;
   }
 
   get controllable(): boolean {
-    // Input is locked during the deathbomb window (deathTimer) and during
-    // the stage-start fly-in (entranceTimer).
-    return this.deathTimer < 0 && this.entranceTimer <= 0;
+    // Input is locked during the deathbomb window, the death squish, and the
+    // respawn materialize; the spawn/respawn invuln window itself is
+    // controllable.
+    return this.deathTimer < 0 && this.dyingFrame < 0 && this.materializeFrame < 0;
+  }
+
+  // Render transform for the death squish (exe state 2). null when not dying;
+  // otherwise scaleX=1-t, scaleY=1+3t (fcn.0043dca0), t=frame/30.
+  dyingTransform(): { scaleX: number; scaleY: number } | null {
+    if (this.dyingFrame < 0) return null;
+    const t = this.dyingFrame / DEATH_SQUISH_FRAMES;
+    return { scaleX: 1 - t, scaleY: 1 + 3 * t };
+  }
+
+  // Render transform for the respawn materialize (exe state 1). null when not
+  // materializing; otherwise the exe's ramps (fcn.0043e170: t=frame/30,
+  // scaleX=t, scaleY=3-2t, alpha=t).
+  materializeTransform(): { scaleX: number; scaleY: number; alpha: number } | null {
+    if (this.materializeFrame < 0) return null;
+    const t = this.materializeFrame / MATERIALIZE_FRAMES;
+    return { scaleX: t, scaleY: 3 - 2 * t, alpha: t };
   }
 
   update(input: InputFrame): void {
@@ -195,20 +221,15 @@ export class Player {
     if (this.invulnFrames > 0) this.invulnFrames--;
     if (this.bombInvuln > 0) this.bombInvuln--;
     if (this.bombTimer > 0) this.bombTimer--;
-    if (this.entranceTimer > 0) {
-      // Stage-start fly-in: ease-out from below the playfield to the rest
-      // point. e = 1-(1-t)^2 rises fast then settles.
-      this.entranceTimer--;
-      const t = 1 - this.entranceTimer / ENTRANCE_FRAMES;
-      const e = 1 - (1 - t) * (1 - t);
-      this.y = ENTRANCE_START_Y + (ENTRANCE_REST_Y - ENTRANCE_START_Y) * e;
-      if (this.entranceTimer === 0) this.y = ENTRANCE_REST_Y;
+    if (this.materializeFrame >= 0) {
+      // Respawn materialize (fcn.0043e170): ramp scale/alpha IN PLACE over 30
+      // frames, then enter the 240-frame invuln window. No movement/firing.
+      if (++this.materializeFrame >= MATERIALIZE_FRAMES) {
+        this.materializeFrame = -1;
+        this.invulnFrames = SPAWN_INVULN_FRAMES;
+      }
     }
-    if (this.respawnTimer > 0) {
-      this.respawnTimer--;
-      this.y = Math.min(ENTRANCE_REST_Y, this.y - 1.5); // fly in from the bottom
-    }
-    if (this.controllable && this.respawnTimer <= 0) this.move(input);
+    if (this.controllable) this.move(input);
     this.shooting = input.held.has('shoot') && this.controllable;
     if (this.shooting) {
       this.fireFrame = (this.fireFrame + 1) % SHOT_CYCLE;
@@ -231,8 +252,11 @@ export class Player {
     const speed = diagonal
       ? (this.focusHeld ? sht.diagFocusedSpeed : sht.diagSpeed)
       : (this.focusHeld ? sht.focusedSpeed : sht.speed);
-    this.x = clamp(this.x + dx * speed, 8, 376);
-    this.y = clamp(this.y + dy * speed, 16, 432);
+    // Th07.exe (v1.00b) Player::Update clamp @ 0x43c3cc / 0x43c430: field-local
+    // x∈[0,384], y∈[0,448] (full playfield). Mins DAT_00625854/858 = 0; ranges
+    // DAT_0062585c/860 = 384/448 (confirmed via FUN_0041de20 @ 0x41dfeb/0x41e016).
+    this.x = clamp(this.x + dx * speed, 0, 384);
+    this.y = clamp(this.y + dy * speed, 0, 448);
   }
 
   private updatePose(input: InputFrame): void {
@@ -293,12 +317,29 @@ export class Player {
     return 'deathbomb-window';
   }
 
-  // Returns 'died' when the deathbomb window expires without a bomb.
-  tickDeath(): 'died' | 'pending' | 'none' {
-    if (this.deathTimer < 0) return 'none';
-    this.deathTimer--;
-    if (this.deathTimer < 0) return 'died';
-    return 'pending';
+  // Death sequence (exe state 2, fcn.0043dca0). The deathbomb window counts
+  // down first ('pending'); when it lapses, returns 'effects' once and starts
+  // the 30-frame death squish; the squish then counts down ('pending'); when
+  // it finishes, returns 'respawn' once. 'none' when no death is in progress.
+  // Bombing during the deathbomb window (tryBomb) clears deathTimer and
+  // cancels the whole sequence.
+  tickDeath(): 'effects' | 'respawn' | 'pending' | 'none' {
+    if (this.deathTimer >= 0) {
+      this.deathTimer--;
+      if (this.deathTimer < 0) {
+        this.dyingFrame = 0; // begin the death squish
+        return 'effects';
+      }
+      return 'pending';
+    }
+    if (this.dyingFrame >= 0) {
+      if (++this.dyingFrame >= DEATH_SQUISH_FRAMES) {
+        this.dyingFrame = -1;
+        return 'respawn';
+      }
+      return 'pending';
+    }
+    return 'none';
   }
 
   tryBomb(): boolean {
@@ -318,10 +359,14 @@ export class Player {
     this.lives--;
     this.bombs = Math.trunc(this.unfocused.bombs);
     this.power = Math.max(0, this.power - 16);
-    this.invulnFrames = 240;
-    this.respawnTimer = 30;
-    this.x = 192;
-    this.y = 448 + 16;
+    // Respawn (fcn.0043dca0 at the death-clock lapse): teleport to the spawn
+    // point and enter the materialize state (fcn.0043e170) -- a 30-frame
+    // in-place scale/alpha ramp, NOT a fly-in -- followed by 240f invuln
+    // (set in update() when the materialize ends).
+    this.x = SPAWN_X;
+    this.y = SPAWN_Y;
+    this.materializeFrame = 0;
+    this.invulnFrames = 0;
     this.bullets.length = 0;
   }
 }

@@ -106,7 +106,7 @@ export interface GameHost {
   voidSpellCapture?(): void;
   setBossPresent?(present: boolean, enemy: Enemy | null): void;
   setBossLifeCount?(count: number): void;
-  dropCherryItems?(e: Enemy, count: number): void;
+  dropPointItems?(e: Enemy, count: number): void;
   awardSpellValue?(value: number): void;
   spawnEnemyDeathEffect?(e: Enemy): void;
   turnBulletsIntoPointItems(): void;

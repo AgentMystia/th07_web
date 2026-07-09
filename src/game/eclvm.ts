@@ -13,17 +13,24 @@ import type { GameHost, Enemy, EclState, EclContext, BulletProps, ItemType } fro
 
 const ENEMY_BULLET_CAP = 640;
 
-// Item ids as used by ECL drop fields. 0-5 match TH06; 6+ are PCB additions.
-// TH07-TODO: ids 6/7 assumed cherry / big cherry pending in-game verification.
+// Item ids as used by ECL drop fields, confirmed against Th07.exe (v1.00b)
+// collection switch FUN_00430c10 @ 0x430c10 (case 0..7 award behavior): the
+// ECL id is passed unchanged as the spawn type -- there is no lookup table.
+// 0 power, 1 point, 2 bigPower, 3 bomb, 4 fullPower, 5 life/1up, 6 cherry,
+// 7 bigCherry.
 const ITEM_TABLE: (ItemType | null)[] = [
   'power', 'point', 'bigPower', 'bomb', 'fullPower', 'life', 'cherry', 'bigCherry'
 ];
 
+// Th07.exe (v1.00b) @ 0x494f90 -- the default-drop random table (32 bytes),
+// fetched directly from the executable, not invented. Indexed by DAT_009545ba
+// (wraps mod 32) on every 3rd default-drop enemy (DAT_009545b8 % 3 == 0).
+// Values are item types: 0 power, 1 point, 2 bigPower, 7 bigCherry.
 const RANDOM_ITEMS: ItemType[] = [
-  'power', 'power', 'point', 'power', 'point', 'power', 'power', 'point',
-  'point', 'point', 'power', 'power', 'power', 'point', 'point', 'power',
+  'power', 'power', 'point', 'power', 'point', 'power', 'power', 'bigCherry',
+  'point', 'point', 'power', 'power', 'bigCherry', 'point', 'point', 'power',
   'point', 'power', 'point', 'power', 'point', 'power', 'point', 'power',
-  'point', 'power', 'power', 'point', 'point', 'point', 'power', 'bigPower'
+  'point', 'power', 'bigCherry', 'point', 'point', 'point', 'power', 'bigPower'
 ];
 
 // Special variable ids (reads resolved from game state). Writable general
@@ -881,7 +888,11 @@ export class StageRuntime {
         s.scheduledTimerSubs.push({ time: v.i32(a + 4), sub: v.i32(a + 8), fired: false });
         return null;
       }
-      case 154: game.dropCherryItems?.(e, Math.trunc(this.varRead(game, e, v.i32(a)))); return null;
+      case 154:
+        // op 154 drops N POINT items (Th07.exe ECL VM case 0x99 @ 0x4148f5:
+        // FUN_00430970(pos, 1, 0) -- type 1 = point, NOT cherry), scattered ±64.
+        game.dropPointItems?.(e, Math.trunc(this.varRead(game, e, v.i32(a))));
+        return null;
       case 160: game.awardSpellValue?.(v.i32(a)); return null; // TH07-TODO verify
       default:
         warnOnce(`op${op}`, `unhandled ECL op ${op} (sub ${ctx.subId})`);
@@ -1106,8 +1117,9 @@ export class StageRuntime {
   private dropPowerItems(game: GameHost, e: Enemy, count: number): void {
     const total = Math.max(0, count | 0);
     for (let i = 0; i < total; i++) {
-      const x = e.x + game.rng.range(144) - 72;
-      const y = e.y + game.rng.range(144) - 72;
+      // Th07.exe op 119 (ECL VM 0x76 @ 0x414630): scatter ±64 (rand·128 − 64).
+      const x = e.x + game.rng.range(128) - 64;
+      const y = e.y + game.rng.range(128) - 64;
       const type: ItemType = game.power < 128 ? (i === 0 ? 'bigPower' : 'power') : 'point';
       game.spawnItem(type, x, y);
     }

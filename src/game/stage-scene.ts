@@ -8,7 +8,7 @@ import type { GameAssets } from './assets';
 import { AnmRunner, type AnmFrame } from '../formats/anm';
 import { TH07_DATA } from '../data/th07-data';
 import type { AudioBus } from '../audio/audio';
-import { CHARACTERS, ENTRANCE_FRAMES, Player, type CharacterId, type PlayerBullet } from './player';
+import { CHARACTERS, Player, type CharacterId, type PlayerBullet } from './player';
 import { PlayerEffects } from './player-effects';
 import { CherrySystem, BORDER_DURATION, CHERRY_PLUS_MAX } from './cherry';
 import { DialogueRunner, portraitSprite } from './dialogue';
@@ -163,6 +163,10 @@ export class StageScene implements GameHost {
   }
 
   spawnItem(type: ItemType, x: number, y: number, options: { state?: number; vx?: number; vy?: number } = {}): void {
+    // Th07.exe (v1.00b) item spawn primitive FUN_00430970 @ 0x430970: at full
+    // power, power(0)/bigPower(2) drops convert to bigCherry(7) -- so max-power
+    // players get value items instead of wasted power.
+    if (this.playerObj.power >= 128 && (type === 'power' || type === 'bigPower')) type = 'bigCherry';
     this.items.push({
       id: this.id++,
       x, y,
@@ -283,11 +287,12 @@ export class StageScene implements GameHost {
     this.bossLifeCount = count;
   }
 
-  dropCherryItems(e: Enemy, count: number): void {
+  // op 154: drop N point items scattered ±64 (Th07.exe ECL VM 0x99 @ 0x4148f5).
+  dropPointItems(e: Enemy, count: number): void {
     for (let i = 0; i < Math.max(0, count | 0); i++) {
-      const x = e.x + this.rng.range(144) - 72;
-      const y = e.y + this.rng.range(144) - 72;
-      this.spawnItem('cherry', x, y);
+      const x = e.x + this.rng.range(128) - 64;
+      const y = e.y + this.rng.range(128) - 64;
+      this.spawnItem('point', x, y);
     }
   }
 
@@ -330,7 +335,12 @@ export class StageScene implements GameHost {
     }
     const p = this.playerObj;
     this.frameDamage.clear();
-    if (input.pressed.has('bomb') && p.controllable && !this.gameOver) {
+    // Bombing is allowed in normal play AND during the deathbomb window
+    // (p.deathTimer >= 0) -- that window is precisely the few frames after a
+    // hit in which a bomb still rescues you (tryBomb clears deathTimer). It
+    // stays blocked during the death squish / materialize (controllable false,
+    // deathTimer < 0 there).
+    if (input.pressed.has('bomb') && (p.controllable || p.deathTimer >= 0) && !this.gameOver) {
       if (p.tryBomb()) {
         this.cherry.onBomb(this.difficulty);
         this.voidSpellCapture();
@@ -340,7 +350,8 @@ export class StageScene implements GameHost {
     p.update(input);
     this.focusHeld = p.focusHeld;
     const death = p.tickDeath();
-    if (death === 'died') this.onPlayerDeath();
+    if (death === 'effects') this.onPlayerDeath();
+    else if (death === 'respawn') this.onPlayerRespawn();
     if (!this.gameOver) {
       for (const b of p.fire()) {
         if (b.behaviorFunc === 4) this.aimBulletAtSpawn(b);
@@ -496,6 +507,10 @@ export class StageScene implements GameHost {
     }
   }
 
+  // Fires once when the deathbomb window lapses (tickDeath 'effects'): the
+  // death explosion, power drops, bullet clear. The respawn itself (teleport +
+  // materialize) is deferred to onPlayerRespawn() after the 30-frame death
+  // squish, matching Th07.exe fcn.0043dca0.
   private onPlayerDeath(): void {
     const p = this.playerObj;
     this.cherry.onDeath(p.unfocused.cherryLossOnDeath);
@@ -507,6 +522,13 @@ export class StageScene implements GameHost {
     }
     for (const b of this.enemyBullets) b.dead = true;
     this.playerEffects.clear();
+  }
+
+  // Fires once when the death squish finishes (tickDeath 'respawn'): teleport
+  // to the spawn point and enter the materialize state. fcn.0043dca0 loses the
+  // life at this teleport, not at the hit.
+  private onPlayerRespawn(): void {
+    const p = this.playerObj;
     p.die();
     if (p.lives < 0) {
       this.gameOver = true;
@@ -1022,18 +1044,24 @@ export class StageScene implements GameHost {
           }
         }
       }
-      if (p.alive || p.respawnTimer > 0) {
+      if (p.alive || p.materializeFrame >= 0 || p.dyingFrame >= 0) {
         const pf = p.runner.spriteFrame();
-        if (p.entranceTimer > 0) {
-          // Stage-start fly-in: fade the sprite in over its first part; no
-          // invuln blink while entering.
-          const fade = Math.min(1, (ENTRANCE_FRAMES - p.entranceTimer) / 20);
-          r.drawAnmFrame(pf, ox + p.x, oy + p.y, { alpha: fade });
+        const dt = p.dyingTransform();
+        const mt = p.materializeTransform();
+        if (dt) {
+          // Death squish (exe state 2): in-place scaleX 1->0, scaleY 1->4.
+          r.drawAnmFrame(pf, ox + p.x, oy + p.y, dt);
+        } else if (mt) {
+          // Respawn materialize (exe state 1): in-place scale/alpha ramp.
+          r.drawAnmFrame(pf, ox + p.x, oy + p.y, mt);
         } else {
-          const blink = p.invulnFrames > 0 && (this.frame & 2) === 0;
-          if (!blink) r.drawAnmFrame(pf, ox + p.x, oy + p.y);
+          // Spawn/respawn invuln (exe state 3): dark-tint 0x404040 on frames
+          // where (timer & 7) < 2 (fcn.0043e2e0), instead of an invisibility
+          // blink -- the original dims the sprite, never hides it.
+          const dim = p.invulnFrames > 0 && (p.invulnFrames & 7) < 2;
+          r.drawAnmFrame(pf, ox + p.x, oy + p.y, dim ? { color: 0x404040 } : {});
         }
-        if (this.focusHeld && p.alive && p.entranceTimer <= 0) {
+        if (this.focusHeld && p.alive) {
           r.ctx.fillStyle = '#fff';
           r.ctx.beginPath();
           r.ctx.arc(ox + p.x, oy + p.y, p.hitboxHalf + 1.5, 0, Math.PI * 2);
