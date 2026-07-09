@@ -310,12 +310,21 @@ export class StageRuntime {
     const s = e.ecl;
     switch (id) {
       case 10016: return game.difficulty;
-      case 10018: return game.player.x;
-      case 10019: return game.player.y;
-      case 10020: return 0; // player z
-      case 10021: return e.x;
-      case 10022: return e.y;
-      case 10023: return e.z;
+      // Th07.exe var resolver FUN_0040d750/FUN_0040dda0 (disasm confirmed):
+      // 10018/19/20 = the ENEMY's OWN position (*(enemy+0x2b0c/0x2b10/0x2b14)),
+      // 10021/22/23 = the PLAYER position (DAT_004b43e8/ec/f0). These were
+      // previously swapped (10018/19/20 wrongly returned the player), which
+      // made Letty's Table-Turning snowflakes (sub 57: op56 orbit target =
+      // var10018/19/20) and the ring emitters in sub 30 (`cos*160 + var10018`)
+      // center on the player instead of on the boss/emitter — they stranded
+      // where the player stood. 10024 (aim-to-player) is a distinct computed
+      // case and is unaffected.
+      case 10018: return e.x;
+      case 10019: return e.y;
+      case 10020: return e.z;
+      case 10021: return game.player.x;
+      case 10022: return game.player.y;
+      case 10023: return 0; // player z
       case 10024: return Math.atan2(e.y - game.player.y, e.x - game.player.x);
       case 10025: return Math.hypot(game.player.x - e.x, game.player.y - e.y);
       case 10026: return s.bossTimer;
@@ -329,9 +338,10 @@ export class StageRuntime {
   private varWrite(game: GameHost, e: Enemy, id: number, value: number): void {
     const s = e.ecl;
     switch (id) {
-      case 10021: e.x = value; return;
-      case 10022: e.y = value; return;
-      case 10023: e.z = value; return;
+      // Match the read mapping above: enemy own position is 10018/19/20.
+      case 10018: e.x = value; return;
+      case 10019: e.y = value; return;
+      case 10020: e.z = value; return;
       case 10026: s.bossTimer = value; return;
       case 10027: e.hp = value; return;
     }
