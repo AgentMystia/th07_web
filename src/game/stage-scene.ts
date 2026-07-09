@@ -817,42 +817,15 @@ export class StageScene implements GameHost {
     const px = p.x;
     const py = p.y;
     const hit = p.hitboxHalf;
-    if (this.cherry.borderActive) {
-      // Grazes still register during the border (they feed CherryMax).
-      for (const b of this.enemyBullets) {
-        if (b.dead || b.grazed) continue;
-        // exe: 16-frame minimum age before graze eligibility
-        if (b.age <= 15) continue;
-        // Th07.exe FUN_0043b350: bulletFull/2 + sht.grazebox/2 + flat 20.0 pad.
-        if (Math.abs(b.x - px) <= b.grazeW / 2 + p.grazeboxHalf + 20 && Math.abs(b.y - py) <= b.grazeH / 2 + p.grazeboxHalf + 20) {
-          b.grazed = true;
-          this.graze++;
-          this.addScore(200); // Th07.exe FUN_0043bb30: +200 per graze
-          this.cherry.onGraze(this.focusHeld);
-          this.playSfx(24);
-        }
-      }
-      // Th07.exe FUN_0041ebc0: enemy bodies are grazable, region hitbox/1.4
-      // (= *(1/0.7)/2), re-attempted every 6 frames while touching -- but
-      // only when op136 armed the enemy's own `bodyRegrazeFlag`
-      // (`+0x2e29` bit5). This is the ONLY body-graze call site found in
-      // the exe (exe-collision.md §6); enemies that never call op136
-      // (the overwhelming majority) are never body-grazable at all.
-      for (const e of this.enemies) {
-        if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.bodyRegrazeFlag) continue;
-        const cd = this.bodyGrazeCooldown.get(e.id) ?? 0;
-        if (cd > 0) { this.bodyGrazeCooldown.set(e.id, cd - 1); continue; }
-        if (Math.abs(e.x - px) <= e.ecl.hitbox.x / 1.4 + p.grazeboxHalf + 20 &&
-            Math.abs(e.y - py) <= e.ecl.hitbox.y / 1.4 + p.grazeboxHalf + 20) {
-          this.bodyGrazeCooldown.set(e.id, 6);
-          this.graze++;
-          this.addScore(200);
-          this.cherry.onGraze(this.focusHeld);
-          this.playSfx(24);
-        }
-      }
-      return;
-    }
+    // The Supernatural Border does NOT make the player skip collision: a
+    // bullet (or body) reaching the kill hitbox BREAKS the border instead of
+    // killing -- onPlayerHit() calls cherry.breakBorder(), which absorbs the
+    // hit (brief invuln, no death) and forfeits the survive bonus. So the same
+    // graze+kill path below runs whether or not a border is up; only the
+    // outcome of a kill contact differs. (A prior version special-cased the
+    // border here with a graze-only early return, which made it fully
+    // invincible and always pay the survive bonus -- the breakBorder path was
+    // unreachable.)
     for (const b of this.enemyBullets) {
       if (b.dead) continue;
       const dx = Math.abs(b.x - px);
