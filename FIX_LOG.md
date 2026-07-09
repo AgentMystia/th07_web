@@ -72,5 +72,18 @@ clears the bit — `FUN_00423840` else branch).
    pinned). Stage 1 fires no bounce bullets, so untested in practice.
 3. **Cull grace** still uses the fat-margin approximation (audit D5), gated on the
    FIRE flags (`b.flags & 0xdc0`), not the live `exFlags`; unchanged this commit.
-4. **"Cirno spell too-low HP"** reported by the user is a separate, still-open item
-   (boss-life/spell-HP setup, not motion) — investigating next.
+4. **"Cirno spell too-low HP" — investigated, NOT a bug (no code change).** The
+   user reported Frost Columns felt too low-HP. Traced: Cirno Sub 20 does
+   `SET_HP=10000` (nonspell) + op 148 `slot0 {threshold:1200, sub:29}` +
+   `TIMER_CALLBACK 1680 -> sub 29`. The spell (Sub 29) has no SET_HP; its 1200 HP
+   comes from op 148's threshold (the life callback clamps HP to 1200 on entry, or
+   the timer callback clamps to the largest armed threshold = 1200). The ECL dump
+   mislabels op 148 as `SCHEDULE_TIMER_SUB atFrame=1200`, but disassembly settles
+   it: `case 0x93` stores arg1 at `+0x2ebc` and it is compared against the boss HP
+   `+0x2bb8` (all.c:13743-13744; the timer-clamp at 13809-13817 writes `+0x2bb8 =
+   max threshold`, matching eclvm checkCallbacks). So **1200 is exe-correct**; the
+   "too low HP" feel was a side effect of the broken nonspell (frozen bullets ->
+   trivially dodgeable -> Cirno damaged past 1200 in seconds). With the nonspell
+   fixed the fight is properly paced. Verified Frost Columns renders the blue/white
+   frost-column fan at sane speeds; Letty's first nonspell renders crystal arcs +
+   green aimed fans (max 4 px/frame), no supersonic.
