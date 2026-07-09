@@ -627,20 +627,30 @@ export class StageScene implements GameHost {
   }
 
   private updatePlayerBullets(): void {
+    // Th07.exe FUN_0043edc0/FUN_0041ed50 (exe-player-funcs1.md §2): the homing
+    // target is a single per-frame cache shared by every ReimuA amulet/orb —
+    // the eligible enemy minimizing |e.x - player.x| (Y ignored entirely).
+    // Reset+repopulated once per frame here, not per-bullet.
+    const px = this.playerObj.x;
+    let homingTarget: Enemy | null = null;
+    let homingBestDx = Infinity;
+    for (const e of this.enemies) {
+      if (!e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.canTakeDamage) continue;
+      const dx = Math.abs(e.x - px);
+      if (dx < homingBestDx) {
+        homingBestDx = dx;
+        homingTarget = e;
+      }
+    }
     for (const b of this.playerBullets) {
       b.age++;
       if (b.state === 'fired') {
-        // shotType 1 = ReimuA homing amulets; 2 = her focused variant (SHT
-        // spawns those at speed 2 — the exe routine both steers and
-        // accelerates them; rates shared with type 1/3 are a flagged
-        // approximation, AGENTS.md §7).
-        if (b.shotType === 2 && b.age > 8) b.speed = Math.min(12, b.speed + 0.4);
-        if (b.shotType === 1 || b.shotType === 2) this.steerHomingBullet(b);
-        else if (b.shotType === 3 && b.age > 8) {
-          // Accelerating shots (MarisaA missiles).
-          b.speed = Math.min(14, b.speed + 0.4);
-          b.vx = Math.cos(b.angle) * b.speed;
-          b.vy = Math.sin(b.angle) * b.speed;
+        if (b.shotType === 1 || b.shotType === 2) this.steerHomingBullet(b, homingTarget);
+        else if (b.shotType === 3) {
+          // MarisaA missile, Th07.exe FUN_00439650 (exe-player-funcs1.md §4):
+          // per-frame random vertical boost from spawn, no age gate, no cap,
+          // vx untouched — never routed through angle/speed.
+          b.vy -= this.rng.range(0.1) + 0.27;
         }
         b.x += b.vx;
         b.y += b.vy;
@@ -700,17 +710,42 @@ export class StageScene implements GameHost {
     return best;
   }
 
-  private steerHomingBullet(b: PlayerBullet): void {
-    const best = this.findAimTarget(b.x, b.y);
-    if (!best) return;
-    const target = Math.atan2(best.y - b.y, best.x - b.x);
-    let diff = target - b.angle;
-    while (diff > Math.PI) diff -= Math.PI * 2;
-    while (diff < -Math.PI) diff += Math.PI * 2;
-    const turn = 0.18;
-    b.angle += Math.max(-turn, Math.min(turn, diff));
-    b.vx = Math.cos(b.angle) * b.speed;
-    b.vy = Math.sin(b.angle) * b.speed;
+  // ReimuA homing amulet (shotType 1) / focused orb (shotType 2), Th07.exe
+  // FUN_004391f0/FUN_00439420 (exe-player-funcs1.md §3, byte-identical
+  // algorithms bar 4 constants). Operates directly on b.vx/b.vy — angle is
+  // never consulted or written. `target` is the per-frame shared cache from
+  // updatePlayerBullets, not a per-bullet nearest search.
+  private steerHomingBullet(b: PlayerBullet, target: Enemy | null): void {
+    const maxSpeed = b.shotType === 1 ? 10 : 18;
+    const accel = b.shotType === 1 ? 0.33333334 : 0.6;
+    const homing = target !== null && b.age <= 39;
+    if (!homing) {
+      // No target this frame, or the 40-frame homing window (age 0..39)
+      // has closed: accelerate toward maxSpeed, preserving direction.
+      if (b.speed < maxSpeed) {
+        b.speed += accel;
+        const mag = Math.hypot(b.vx, b.vy);
+        if (mag > 0) {
+          b.vx = (b.vx * b.speed) / mag;
+          b.vy = (b.vy * b.speed) / mag;
+        }
+      }
+      return;
+    }
+    const dx = target!.x - b.x;
+    const dy = target!.y - b.y;
+    const dist = Math.hypot(dx, dy);
+    let denom = dist / (b.speed / 4.0);
+    if (denom < 1.0) denom = 1.0;
+    const pullX = dx / denom + b.vx;
+    const pullY = dy / denom + b.vy;
+    const mag = Math.hypot(pullX, pullY);
+    if (mag === 0) return; // degenerate: bullet exactly on target with zero velocity
+    let newSpeed = Math.min(mag, maxSpeed);
+    if (newSpeed < 1.0) newSpeed = 1.0;
+    b.speed = newSpeed;
+    b.vx = (pullX * b.speed) / mag;
+    b.vy = (pullY * b.speed) / mag;
   }
 
   // SHT behavior func 0 == 4 (every ply02as shooter): the knife aims at an
