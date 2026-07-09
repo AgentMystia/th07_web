@@ -439,3 +439,303 @@ Verify:
     early enemy in this window; unaffected by this change either way).
   - No PAGE ERRORS in any of the four runs.
 - Commit: see below.
+
+## STEP — dialogue freeze + misc ECL ops (op105/136/137/141/142) + op94 cherry sweep drop
+Specs: `reference/re-specs/exe-misc-ecl-ops.md` (CONFIRMED op105/§1,
+DAT_0061c25c/§2, op136/§3, op137/§4, op142/§5 PROBABLE),
+`reference/re-specs/stage1-fidelity-audit.md` (items 2/3/4), and
+`reference/re-specs/exe-enemy-lasers.md` §0 (op138-141 stub corrections).
+
+- `src/game/eclvm.ts` case 105: `game.playSfx(v.i32(a))` fired immediately
+  (was `s.deathSound = v.i32(a)`, deferred to `killEnemy()`) — matches
+  `FUN_00446970 @ 0x413bf6` (op105/§1: no enemy field written, pure
+  immediate side effect). `killEnemy()`'s no-death-callback fallback
+  changed from `s.deathSound >= 0 ? s.deathSound : 1` to a flat `1`
+  (se_enep00) — the exe stores nothing for later replay. Removed the now-
+  dead `EclState.deathSound` field (types.ts/eclvm.ts init).
+- `types.ts`/`eclvm.ts`: `flag136`→`bodyRegrazeFlag: boolean`,
+  `flag137`→`offscreenCullExempt: boolean` (both default false, no
+  confirmed default-on case in stage1's data). Case 136 sets
+  `bodyRegrazeFlag = !!(arg & 1)` (exe `+0x2e29` bit5); case 137 sets
+  `offscreenCullExempt = !!(arg & 1)` (exe `+0x2e2a` bit7).
+- `stage-scene.ts` `checkPlayerCollision()`: both body-graze loops (border-
+  active and normal) now skip enemies with `!e.ecl.bodyRegrazeFlag` — the
+  exe's only body-graze call site is gated entirely on this bit
+  (exe-collision.md §6), so enemies that never call op136 (the
+  overwhelming majority) are never body-grazable, not just "re-graze
+  disabled". `updateEnemies()`'s offscreen cull gains
+  `&& !e.ecl.offscreenCullExempt`.
+- `eclvm.ts` cases 138-141: split out of the old blanket
+  `case 138: case 139: case 140: case 141:` into 138/139 (stub, comment
+  corrected: NOT ambience — 138 is a tracking-shot param block, 139 a
+  global per-ID effect table), 140 (kept as the genuine ambience-config
+  stub), and 141 as an explicit standalone no-op (dead jump-table entry in
+  v1.00b, confirmed by direct jump-table dump per exe-enemy-lasers.md §0).
+  No behavior change (`game.configureAmbience` has no implementation in
+  `stage-scene.ts` either before or after — all four were already no-ops;
+  this is a comment/structure correction only).
+- `eclvm.ts` case 142: comment upgraded to cite exe-misc-ecl-ops.md §5
+  (PROBABLE boss-phase damage-reduction timer; decrement mechanism not
+  located in the exe — stays a stored-only stub, no gate wired).
+- `eclvm.ts` `clearNonBossEnemy(game, enemy)`: gained a `game` param and
+  drops one cherry item (`game.spawnItem('cherry', enemy.x, enemy.y)`) for
+  each swept non-boss enemy that has `bodyRegrazeFlag` set — per
+  exe-ecl-boss.md's op94 section (`FUN_004217c0`, PROBABLE: the exe's
+  "diminishing budget" spend-per-drop mechanism isn't pinned, so only the
+  confirmed part — one drop per flagged swept enemy, no budget decay — is
+  ported). Both callers (`killNonBossEnemies`, `clearNonBossEnemies`)
+  updated to pass `game`.
+- `eclvm.ts` `ENEMY_BULLET_CAP = 640`: added the missing provenance comment
+  (empirically confirmed hard ceiling, stage1-fidelity-audit.md item 4 —
+  no exe address chased, cites the audit's two independent dense-spellcard
+  observations instead).
+- `stage-scene.ts` `update()` — dialogue freeze (`DAT_0061c25c`, §2,
+  5 confirmed read sites, write site UNRESOLVED): captured
+  `const frozen = this.isDialogueBlocking()` once at the top of the frame
+  and gated behind `if (!frozen)`: the bomb-press/tryBomb block, `p.update`,
+  `focusHeld` sync, `tickDeath`/death-respawn dispatch, the fire/volley
+  spawn block, and `this.stageFrame++` (player-side, matches gate 1 +
+  the stage-frame-counter half of gate 4); and separately
+  `this.runtime.update`, `updateEnemies`, `updatePlayerBullets`,
+  `updateBullets`, `checkPlayerCollision` (matches gates 2/3/4). Left
+  `this.dialogue.update(...)`, spell banner/bonus-popup timers, the
+  stageClear timeline-complete check, `this.cherry.tick()`, items/
+  particles/playerEffects unconditional — none of those are among the 5
+  confirmed gates (spec's own explicit guidance for the UNRESOLVED-write-
+  site parts).
+
+Verify:
+- `npm run check` silent; `npm run build` OK (438.6kb); `npm test` 19/19
+  pass (no rewrites needed — no existing test asserted op105/136/137/142
+  values or deathSound).
+- `node scripts/dev-shot.mjs .../basic.png 300 "difficulty=1&shot=reimuA"`
+  and a 6000-frame Lunatic run (`shot=marisaA`, `shoot` held): both clean,
+  `enemies`/`bullets`/`boss`/`spell` sane
+  (Lunatic: `boss:true spell:"霜符「フロストコラムス -Lunatic-」"` at f6091),
+  no PAGE ERRORS.
+- Custom Playwright probe (`window.__TH07_TEST__`, adapted from
+  dev-shot.mjs, deleted after use): dodge-survived (via `setPlayer`
+  teleport-to-farthest-candidate-from-`bulletDump`/`enemyDump`, no combat
+  needed — Cirno has no spellcard on Normal and flees on an unconditional
+  1680-frame timer regardless of damage, stage1-fidelity-audit.md) through
+  Cirno's fight and the post-flee fodder wave to the stage's one dialogue
+  window (frame ~5751, `gameOver:false`, `enemies:0 bullets:0`). Held
+  `left` continuously (never shoot/skip, so dialogue can't be
+  fast-forwarded) across one exact 40-frame in-page batch:
+  **`player.x` 20→20, `enemyDump`/`bulletDump` byte-identical before/after
+  — reproduced on 2 independent runs (frozen span 3167f and 3186f)**.
+  Confirmed the freeze ends on its own (no skip pressed) at frame
+  8920/8937 across the two runs, after which `holdDirection` finally moved
+  the player again — dialogue **opens and closes** correctly. Continuing
+  with `shoot` held to a full Normal clear: `stageClear:true` at frame
+  ~22370-22400 across 4 runs, boss spell sequence
+  **寒符「リンガリングコールド」→冬符「フラワーウィザラウェイ」** (Letty's
+  spell1 then final spell) observed every run — matches this log's own
+  STEP 2 Normal spell-sequence record exactly. No PAGE ERRORS in any run.
+- op105 verified by code read + compile only (SFX playback isn't
+  observable headlessly, per the task's own acceptance criteria).
+- Scratch probe script (`scripts/tmp-dialogue-freeze.mjs`) deleted before
+  finishing (AGENTS.md rule 3).
+- Commit: see below.
+
+## STEP — cherry/border finish: exe shot-hit/item/death/timeout formulas + point-item score; score-unit adjudication
+Spec: `reference/re-specs/exe-cherry-border.md` (all gaps closed per the
+2026-07-09 gap-closing pass — §3a shot-hit, §3b cherry-item cases, §3c
+point-item score, §3d death, §3e boss timeout, §4 border lifecycle).
+
+### STEP 0 — score-unit adjudication (CONFIRMED: display-as-is, ×1, no scaling anywhere)
+Evidence, cross-checked two independent ways:
+1. **HUD digit format strings, read directly from `reference/Th07.exe`**
+   (PE section/RVA math done in a throwaway Python probe, no Ghidra needed
+   for this part): file offset 0x8cd54 (VA 0x48e154, used at
+   `all.c:18547` `FUN_00401f90(&DAT_0048e154, *DAT_0061c258)`) contains
+   the literal C string `"%.8d"`; VA 0x48e148 (`all.c:18554`, the >=1e8
+   branch) is `"%.9d"`. Plain integer format specifiers — **no trailing
+   "0" digit, no `*10`/`/10` in the format string itself** (contrast with
+   the *separate*, unrelated stage-clear-summary screen at `all.c:17126`,
+   `FUN_00401f90("Total = %8d0", ...)`, which DOES bake a literal trailing
+   "0" into its format string for a *different* field,
+   `*(param_1+8)+0x209b8` — that's the end-of-stage bonus-tally subsystem,
+   not the live cherry/score accumulator this task touches; not chased
+   further, out of scope).
+2. **The displayed field is a bare copy of the accumulator, no multiply in
+   between**: `*DAT_0061c258` (offset+0, what `FUN_00401f90` above prints)
+   is written only via `*DAT_0061c258 = DAT_0061c258[1]` (offset+0 =
+   offset+4, the accumulator) at every sync site found (`all.c` lines
+   1459, 1467, 1473, 1626, 17946, 17963, 17972, 17981, 20019) — a bare
+   pointer-copy, no arithmetic.
+3. **Every internal accumulator write that superficially looks like a
+   ×10 is actually a compiler no-op that cancels back to ×1**, checked at
+   the instruction/expression level, not just pattern-matched:
+   - Border-survive (`FUN_0043e620` @ 0x43e64e-0x43e680, already
+     documented in the spec's §4): `local_4 = cherry-base; local_4 *= 10;
+     EAX = local_4/10; score += EAX` — `local_4` is already an exact
+     multiple of 10 pre-multiply is irrelevant, the `*10` then `/10` is
+     lossless regardless, net `score += cherry`.
+   - Shot-hit damage score, **newly traced this pass**,
+     `all.c:14220`: `*(DAT_0061c258+4) = ((local_1c/5)*10)/10 + score`.
+     Same shape, same no-op: `(x/5)*10` is by construction an exact
+     multiple of 10, so `/10` recovers `x/5` exactly. Net: **`score +=
+     min(70, damage)/5`**, NOT `(damage/5)*10` as a naive read of the
+     literal decompiled line (or this task's own framing hint) would
+     suggest — the hint's "(damage/5)*10" describes the *literal*
+     pre-cancellation expression, not the effective value.
+   - Graze (`all.c:27971`): `*(DAT_0061c258+4) += 200` — flat, no
+     multiply anywhere, already ×1.
+   - Point item (`all.c` case 1, §3c): accumulator receives `v/10`
+     directly (`score += v/10`), no compensating `*10`.
+4. **Cross-check against this port's own pre-existing convention**: the
+   port already displays `this.score` with no scaling
+   (`stage-scene.ts` `drawNumber(r, this.score, ...)`, no `*10`/`/10`
+   anywhere in the render path) and the graze site already added a flat
+   `+200` (`stage-scene.ts:803` etc., pre-existing, matches finding #3
+   exactly, confirming the port's existing graze constant needed **no**
+   change).
+
+**Verdict: display = internal accumulator, ×1, no scaling in either
+direction, for the live in-game score field.** Every score constant is
+expressed in this convention below. Two pre-existing bugs surfaced by
+this adjudication, both fixed in this pass (both effectively "was
+10x the exe value" in the score-add path, unrelated to cherry gain which
+was already correct):
+- `stage-scene.ts` `damageEnemy()`: was `addScore(trunc(applied/5)*10)`,
+  corrected to `addScore(trunc(min(70,applied)/5))` per finding #3 above
+  (the `min(70,...)` cap on the *score* term is unconditional in the exe,
+  independent of the cherry-gain 70-cap on `local_44` computed earlier in
+  the same function — two separate caps on two separate values).
+- `cherry.ts` border-survive bonus: was `cherry*10` (this file's own
+  prior comment already said "score = cherry x10" while ALSO saying "this
+  uses current cherry" for the value — a stale, self-contradictory
+  comment); corrected to `cherry` (×1) per spec §4's already-published
+  correction, now consistent with findings #1-3 above.
+- Point/cherry-item score paths (`pointItemValue`/`cherryItemScore`)
+  previously returned the full `v` (e.g. up to 50000), not `v/10` — same
+  class of 10x-too-high bug, fixed by this pass's full item-score rewrite
+  (§7 below) rather than a targeted divide, since the case-wiring itself
+  was also wrong (see §7).
+- `+200` graze (already committed, `stage-scene.ts`) needed **no** change
+  — already ×1, confirmed correct by finding #3.
+
+### Implementation (`src/game/cherry.ts` full rewrite, `stage-scene.ts` call sites, `main.ts` test hook)
+1. **`onShotHit`** (§3a): new signature
+   `onShotHit(damage, isBoss, difficultyIndex, shotTypeBit, bossTimerOdd)`
+   replacing the old `onShotHit(focused: boolean)` +2/+0.2 fabrication.
+   `divisor = isBoss ? 10-floor(min(diff*2,10)/3) : 30-min(diff*2,10)`;
+   `gain = min(70, floor(damage/divisor)*10)`; zero-floors to 10 on an odd
+   boss-timer hit; the `difficultyByte==0` (Easy + shot-type-A only)
+   `{20,30}->-10` parity quirk implemented literally. The
+   `DAT_0062583c>4` difficulty-based damage-halving branch (spec's raw
+   §3a source, not in the "net practical formula") is omitted: it
+   requires an Extra/Phantasm difficulty tier this port's `difficulty`
+   (0..3, Easy..Lunatic) never reaches — dead code under this port's
+   range, not a fidelity gap. `stage-scene.ts` `damageEnemy()` now
+   returns the applied (post-frame-cap) damage; both `updatePlayerBullets`
+   call sites (laser pierce + normal collide) plumb
+   `(applied, e.ecl.isBoss, this.difficulty, shotTypeBit, (e.ecl.bossTimer
+   & 1) === 1)`, only calling `onShotHit` when `applied > 0`.
+   `shotTypeBit = character.endsWith('B') ? 1 : 0` (closest available
+   analogue to the exe's `DAT_00625626` shot-type bit).
+2. **`main.ts` `addCherry` test hook**: replaced the
+   `for (i<n/2) onShotHit(false)` loop (which no longer type-checks under
+   the new signature) with `CherrySystem#debugAddCherry(n)`, a new
+   test-only method that reuses the `gain()` (dc6f-equivalent) path
+   directly — same capping/border-trigger semantics, not exe-derived,
+   documented as such.
+3. **Cherry items** (§3b, 4-case table): `onSmallCherryItem` (+20, case 6),
+   `onLargeCherryItem`/`largeCherryItemGain` (1000+100×`spellsCaptured`,
+   case 7, **UNSPAWNED** — no ItemType maps to it), `onBigCherryItem`
+   (+30 dc6f AND +70 dd6c = +100 total/+30 cherryPlus, case 8),
+   `onCase9CherryItem` (+100, case 9, **UNSPAWNED**). Port ItemType
+   mapping (from `types.ts`/`eclvm.ts`/`stage-scene.ts`): `'cherry'`
+   (dropped by `bodyRegrazeFlag` enemy sweeps, `eclvm.ts:1162`) -> case 6
+   (small); `'bigCherry'` (max-power power/bigPower conversion,
+   `stage-scene.ts` `spawnItem`) -> case 8 (Big Cherry). Cases 7/9 have no
+   ItemType in this port's stage-1 drop set — implemented but unwired, per
+   the task's explicit guidance. Also implemented the case-6/9 shared
+   score term `grazeScaledItemScore(graze) = max(10, floor(graze/40)*10 +
+   300)/10` (the `DAT_004b5e94` min=100 gate is PROBABLE-dead by pattern
+   match to the confirmed-dead `DAT_004b5eXX`/`DAT_004ca4d8` cluster
+   elsewhere in the spec, but NOT independently confirmed for this
+   address, so only the min=10 branch is implemented) and case 7's
+   score-bonus counterpart `largeCherryItemScore` (cherry-saturation-gated,
+   no headroom term, unspawned). `'cherry'` collection now scores via
+   `grazeScaledItemScore`; `'bigCherry'` scores nothing (case 8 has no
+   score effect at all — the previous shared `cherryItemScore` call for
+   both types was wrong on both counts).
+4. **Star/cancel items** (`'pointBullet'` ItemType): removed the
+   `cherry.onStarItem()` call entirely (spec §3/§6: cases 0/2 never touch
+   any cherry accumulator). The `addScore(graze*10+500)` score line is
+   untouched (separate, not part of this task's formula set).
+5. **`onBossTimeout`** (§3e CONFIRMED): `floor10(round(cherry*0.25))`,
+   replacing the previous halving (2x too harsh).
+6. **`onDeath`** (§3d): new signature `onDeath(difficultyIndex)`,
+   `penalty = floor10(min(cap, round(cherry*0.5)))`,
+   `cap = difficultyIndex===2 ? 60000 : 100000` (numeric relationship
+   PROBABLE per spec, not tied to a difficulty *name* — this port's
+   difficulty 2 is "Hard", not confirmed to correspond to the exe's
+   "two highest tiers" framing since this port has no Extra/Phantasm to
+   cross-check). `0.5` is the spec's flagged-PROBABLE `RATE` placeholder
+   (§5 item 1, genuinely unresolved — `*(DAT_0056b928+0x1c)`, write site
+   not traced). **Note on the dropped `lossRatio` arg**: the previous
+   call site passed `p.unfocused.cherryLossOnDeath`, a real per-character
+   SHT header field (`src/formats/sht.ts`, format fact locked in
+   AGENTS.md §6) — SHT genuinely does supply a cherry-loss-shaped field.
+   But the exe's traced death-penalty rate source (`DAT_0056b928+0x1c`)
+   is a per-stage/difficulty config float, not a per-character SHT value,
+   and nothing in this pass's evidence ties the two together. Dropped the
+   arg per spec's explicit guidance; the SHT field is left parsed but
+   unused. Border-progress reset on death (`cherryPlus = 0`) was kept —
+   not in the decompiled §3d snippet, but matches established PCB
+   behavior and was this file's pre-existing behavior.
+7. **Point-item score** (§3c, case 1): `pointItemScore` (renamed from
+   `pointItemValue`, now returns `v/10` per the score-unit verdict instead
+   of raw `v`): height falloff, cherry-headroom bonus/cap once
+   `cherry>50000`, `floor10`, `/10`. The `item.flag_0x280` "guaranteed
+   max" override omitted (dead code, gated on the confirmed-dead
+   `DAT_004b5ec5`, spec §3c).
+8. **`cherryPlus` gate**: kept the `!borderActive` gate in `gain()`
+   (dc6f-equivalent); comment corrected to state it's a port-side
+   mechanism that happens to be behaviorally equivalent to the exe's
+   actually-permanently-open (dead-flag-gated) real gate, not a port of
+   that gate itself (spec §2/§7).
+9. File-top doc comment rewritten to cite the spec's confirmed formulas
+   instead of the old wiki-guess citations (touhouwiki/maribelhearn).
+
+### Verify
+- `npm run check` — silent (tsc clean).
+- `npm run build` — `dist/th07.js` 445.9kb, OK.
+- `npm test` — 24/24 pass. `tests/th07-cherry.test.mjs` fully rewritten:
+  every locked value now cites its spec section (§3a shot-hit divisor
+  table incl. the boss-timer-odd zero-floor and 70-cap; §3b all 4 item
+  cases incl. the case-8 dc6f/dd6c split and the case-6/9 graze-scaled
+  score term; §3c point-item falloff + headroom bonus/cap, both below and
+  above the 50000 line; §3d death incl. the RATE-PROBABLE flag; §3e boss
+  timeout's exact 25%; §4's ×1 border-survive bonus, re-derived to land on
+  a round number by picking fodder-hit damage (28, divisor 28) that gives
+  exactly +10 cherry/hit).
+- **Baseline captured before this pass** (`git stash` to the pre-change
+  tree, same probe): `dev-shot.mjs f2500 d1 shoot` (frame 2539) ->
+  `score:69530`. **After this pass**: `score:75910` (+9.2%). Explained:
+  the damage-score fix is a ~10x *reduction* per hit
+  (`(applied/5)*10`->`applied/5`), but it's dominated by the point-item
+  score fix, which is a large *increase* — the old `pointItemValue`
+  returned `max(10, cherry)` (effectively ~10 early game, since cherry
+  starts at/near 0), while the new `pointItemScore` correctly returns up
+  to `50000/10=5000` per point item collected near the top of the
+  screen/PoC line, regardless of current cherry. Net positive, no NaN, no
+  order-of-magnitude anomaly — fully attributable to the two formula
+  fixes above, not a bug.
+- Border probe (throwaway `scripts/tmp-border-probe.mjs`, deleted before
+  finishing): `addCherry(49000)` -> `cherry:{c:49000,plus:49000,border:0}`;
+  `+2000` more -> `{c:50000,plus:0,border:539}` (border triggers exactly
+  at the 50000 cherryPlus threshold, cherryPlus resets, score unaffected
+  at trigger); advancing 540 more frames -> survive:
+  `{c:60000,max:60000,plus:0,border:0}`, `scoreDelta:50000` — matches
+  "bonus == cherry at trigger" (50000) exactly, confirming the ×1 (not
+  ×10) correction end-to-end through the running scene, not just the
+  isolated `CherrySystem` unit tests.
+- Full Normal run (reimuA, `shoot` held throughout, throwaway
+  `scripts/tmp-clear-probe.mjs`, deleted before finishing):
+  `stageClear:true` at frame 22371, `score:751704`,
+  `cherry:{c:1730,max:52320,plus:230,border:0}`. No PAGE ERRORS.
+- Commit: see below.

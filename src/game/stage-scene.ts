@@ -564,7 +564,11 @@ export class StageScene implements GameHost {
   // squish, matching Th07.exe fcn.0043dca0.
   private onPlayerDeath(): void {
     const p = this.playerObj;
-    this.cherry.onDeath(p.unfocused.cherryLossOnDeath);
+    // exe-cherry-border.md §3d: the traced rate source is a per-stage
+    // config float, not the SHT's per-character cherryLossOnDeath field
+    // (still parsed on `p.unfocused` but unused here — see cherry.ts
+    // CherrySystem#onDeath).
+    this.cherry.onDeath(this.difficulty);
     this.voidSpellCapture();
     this.playSfx(2);
     this.spawnEffectParticles(3, p.x, p.y, 32, 0xffffffff);
@@ -632,15 +636,26 @@ export class StageScene implements GameHost {
     this.onExitToTitle?.();
   }
 
-  damageEnemy(e: Enemy, damage: number): void {
-    if (!e.ecl.canTakeDamage || !e.ecl.interactable || e.ecl.invisible) return;
+  // Returns the actually-applied damage (post frame-cap), 0 if none — the
+  // shot-hit cherry formula (cherry.ts onShotHit) needs this real amount,
+  // not the raw pre-clamp bullet damage.
+  damageEnemy(e: Enemy, damage: number): number {
+    if (!e.ecl.canTakeDamage || !e.ecl.interactable || e.ecl.invisible) return 0;
     const done = this.frameDamage.get(e.id) ?? 0;
     const allowed = Math.max(0, ENEMY_FRAME_DAMAGE_CAP - done);
     const applied = Math.min(allowed, damage);
-    if (applied <= 0) return;
+    if (applied <= 0) return 0;
     this.frameDamage.set(e.id, done + applied);
     e.hp -= applied;
-    this.addScore(Math.trunc(applied / 5) * 10);
+    // Th07.exe FUN_0041ed50 @ all.c:14220: score += ((applied/5)*10)/10 --
+    // the "*10)/10" is a compiler no-op (exact multiple of 10 divided back
+    // down), collapsing to score += floor(min(70,applied)/5); the min(70,..)
+    // cap ("if (0x45 < local_1c) local_1c = 0x46;") is unconditional, unlike
+    // the cherry-gain divisor logic above it. Confirmed against the HUD's
+    // raw "%.8d"/"%.9d" digit format (no display-side rescale anywhere) --
+    // see EXECUTION-LOG.md's score-unit adjudication.
+    this.addScore(Math.trunc(Math.min(70, applied) / 5));
+    return applied;
   }
 
   private updatePlayerBullets(): void {
@@ -649,6 +664,11 @@ export class StageScene implements GameHost {
     // the eligible enemy minimizing |e.x - player.x| (Y ignored entirely).
     // Reset+repopulated once per frame here, not per-bullet.
     const px = this.playerObj.x;
+    // exe-cherry-border.md §3a: DAT_00625627 (raw difficulty*2+shotTypeBit)
+    // gates a parity quirk in the shot-hit cherry formula. shotTypeBit is
+    // the low bit of that byte (spec §3d: DAT_00625626 = byte&1); this
+    // port's "A"/"B" shot suffix is the closest available analogue.
+    const shotTypeBit = this.playerObj.character.endsWith('B') ? 1 : 0;
     let homingTarget: Enemy | null = null;
     let homingBestDx = Infinity;
     for (const e of this.enemies) {
@@ -686,12 +706,16 @@ export class StageScene implements GameHost {
             // of their own age counter only, never enter 'collided', never spawn
             // the hit effect/SE, and pierce indefinitely (no damage decay).
             if ((b.age & 1) === 0) {
-              this.damageEnemy(e, b.damage);
-              this.cherry.onShotHit(this.focusHeld);
+              const applied = this.damageEnemy(e, b.damage);
+              if (applied > 0) {
+                this.cherry.onShotHit(applied, e.ecl.isBoss, this.difficulty, shotTypeBit, (e.ecl.bossTimer & 1) === 1);
+              }
             }
           } else {
-            this.damageEnemy(e, b.damage);
-            this.cherry.onShotHit(this.focusHeld);
+            const applied = this.damageEnemy(e, b.damage);
+            if (applied > 0) {
+              this.cherry.onShotHit(applied, e.ecl.isBoss, this.difficulty, shotTypeBit, (e.ecl.bossTimer & 1) === 1);
+            }
             b.state = 'collided';
             if (b.shotType !== 3) {
               // Th07.exe: velocity/8 on hit — except shotType 3 (MarisaA missile)
@@ -1055,12 +1079,13 @@ export class StageScene implements GameHost {
         break;
       case 'point': {
         this.pointItems++;
-        this.addScore(this.cherry.pointItemValue(it.y, p.sht.pocLineY, it.state === 1));
+        this.addScore(this.cherry.pointItemScore(it.y, p.sht.pocLineY, it.state === 1));
         break;
       }
       case 'pointBullet':
+        // exe-cherry-border.md §3/§6: star/cancel items (cases 0/2) never
+        // touch any cherry accumulator — score/graze-combo only.
         this.addScore(this.graze * 10 + 500);
-        this.cherry.onStarItem();
         break;
       case 'bomb':
         p.bombs = Math.min(8, p.bombs + 1);
@@ -1070,9 +1095,14 @@ export class StageScene implements GameHost {
         this.playSfx(22);
         break;
       case 'cherry':
+        // exe case 6 (spec §3b): +20 cherry, score = grazeScaledValue/10.
+        this.addScore(this.cherry.grazeScaledItemScore(this.graze));
+        this.cherry.onSmallCherryItem();
+        break;
       case 'bigCherry':
-        this.addScore(this.cherry.cherryItemScore(it.y, p.sht.pocLineY, it.state === 1));
-        this.cherry.onCherryItem();
+        // exe case 8 (spec §3b): +100 cherry total (30 dc6f + 70 dd6c), no
+        // score effect at all.
+        this.cherry.onBigCherryItem();
         break;
     }
   }

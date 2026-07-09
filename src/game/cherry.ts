@@ -1,35 +1,49 @@
 // PCB's signature Cherry Point (桜点) system and the Supernatural Border
-// (森羅結界). Rules encoded from en.touhouwiki.net/wiki/Perfect_Cherry_Blossom
-// /Gameplay and maribelhearn.com/faq/scoring; values that are not documented
-// numerically are marked TH07-TODO with the chosen approximation.
+// (森羅結界), reverse-engineered against Th07.exe v1.00b — see
+// reference/re-specs/exe-cherry-border.md for the full trace (all values
+// below cite it by section).
 //
-// - Cherry rises from shooting enemies (per-character rate, ~90% lower while
-//   focused), cherry items, and star (cancel) items; it never exceeds
-//   CherryMax. It drops on death (ratio from the character's SHT data), on
-//   bombing (scaled by difficulty: full on Easy/Normal, 50% on Hard, 25% on
-//   Lunatic), and on boss timeouts.
-// - Cherry+ rises with Cherry; at 50,000 the Supernatural Border activates:
-//   540 frames of invincibility with full-value auto-collection everywhere.
-//   Grazing during the border adds +30 (focused) / +80 (unfocused) to
-//   CherryMax. Surviving the full border awards CherryMax +10,000 and a
-//   score bonus of Cherry × 10; getting hit or bombing breaks it (the hit is
-//   absorbed, no bonus).
-// - Point items collected above the PoC line are worth the current Cherry
-//   value; below it their value decays with height.
-// - Cherry items are worth 0 score unless Cherry == CherryMax, then 50,000
-//   above the PoC (decaying below); they always add 1000 + 100 × (captured
-//   spell cards) to Cherry and Cherry+.
-
-// Th07.exe (v1.00b): the 50000 border-trigger threshold (0xC350) and the
-// 540-frame border duration (0x21C) are both CONFIRMED directly in the exe.
-// 50000: e.g. the CherryPlus-vs-max compares @ 0x4313fb/0x43142c ("cmp eax,
-// 0xc350") in fcn.00430c10, and the flat cherry-item-at-max score (see
-// cherryItemScore below). 540: the border end-of-life fade computes
-// "540 - elapsed" @ 0x43e55d ("mov eax, 0x21c; sub eax, elapsed"),
-// producing a 30-frame fade transition at both ends of the border.
+// - The cherry manager (exe: fixed addr 0x61c250) tracks three counters:
+//   cherry (current, capped at cherryMax), cherryMax (the rising cap), and
+//   cherryPlus (progress toward the border; reaching 50000 triggers it).
+//   `base`, the exe's per-run memory-scramble offset added to every raw
+//   stored value, is implemented as 0 here (spec §1a) — a browser port has
+//   no memory-editing threat model, and every exe read site subtracts
+//   `base` back off before use, so this is a zero-behavior-difference
+//   simplification.
+// - Cherry rises from shot-hits on enemies (§3a, damage/divisor formula,
+//   boss-aware), cherry items (§3b, a 4-case table), and border-survive
+//   (§4); it never touches cherryPlus during grazes (§3, graze feeds
+//   cherryMax/cherry only) nor during star/cancel items (§3 — those have
+//   NO cherry effect at all, score-only).
+// - Cherry drops on death (§3d, rate UNRESOLVED, flagged PROBABLE) and on
+//   boss timeout (§3e, CONFIRMED exactly 25%). Bombing has NO cherry
+//   penalty (§3 — it only ends an active border).
+// - Cherry+ rises only via the same add-helper as cherry (dc6f); at 50,000
+//   the Supernatural Border activates: 540 frames of invincibility with
+//   full-value auto-collection everywhere. Grazing during the border still
+//   adds +30 (focused) / +80 (unfocused) to CherryMax (border-agnostic).
+//   Surviving the full border awards CherryMax +10,000, cherry +10,000,
+//   and a score bonus of `cherry` (§4 CONFIRMED ×1, NOT ×10 — the exe's
+//   `bonus*10` immediately followed by `/10` is a compiler no-op); getting
+//   hit or bombing breaks it (the hit is absorbed, no bonus).
+// - Point items (§3c) and the case-7 "large Cherry" item (§3b) share a
+//   height-based score formula with a "cherry headroom" bonus once cherry
+//   exceeds 50000. The exe's internal score field is added-to at the same
+//   scale it is displayed at (no ×10 anywhere in the HUD digit path —
+//   confirmed via the raw "%.8d"/"%.9d" format strings backing the score
+//   readout; see EXECUTION-LOG.md's score-unit adjudication), so every
+//   `score +=` below is already in the port's `this.score` units.
 export const CHERRY_PLUS_MAX = 50000;
 export const BORDER_DURATION = 540;
 export const INITIAL_CHERRY_MAX = 50000;
+
+// Floors a non-negative integer to the nearest multiple of 10 — the exe's
+// recurring `v = v - v % 10` idiom (point items §3c, death §3d, boss
+// timeout §3e, case-7 cherry item §3b).
+function floor10(v: number): number {
+  return v - (v % 10);
+}
 
 export type BorderEnd = 'none' | 'survived' | 'broken';
 
@@ -43,6 +57,11 @@ export class CherrySystem {
   cherryMax = INITIAL_CHERRY_MAX;
   cherryPlus = 0;
   borderTimer = 0; // frames remaining while the border is active
+  // Stand-in for the exe's *(stats+0x1c) per-run counter driving the
+  // case-7 "large Cherry" item amount (spec §3b, write site UNRESOLVED —
+  // this port tracks spell captures instead, which is NOT confirmed to be
+  // the same counter; flagged PROBABLE, kept only because case 7 is
+  // currently unspawned in this port anyway, see onLargeCherryItem below).
   spellsCaptured = 0;
 
   constructor(private events: CherryEvents = {}) {}
@@ -51,6 +70,16 @@ export class CherrySystem {
     return this.borderTimer > 0;
   }
 
+  // Th07.exe FUN_0042dc6f (spec §2): cherry += amount (capped at
+  // cherryMax); cherryPlus += amount (capped at 50000, -> startBorder when
+  // reached). The exe's actual cherryPlus gate (`DAT_004b5ec5`) is a
+  // write-site-less dead flag, permanently open in retail — this port's
+  // `!borderActive` gate is a different mechanism that happens to be
+  // behaviorally equivalent given the cap/reset mechanics (spec §2: once
+  // cherryPlus hits 50000 the only path past it is startBorder, which
+  // resets it, so gating further gain on "border not active" changes
+  // nothing observable) — kept for that reason, not because it mirrors
+  // the exe's (nonexistent) real gate.
   private gain(amount: number): void {
     if (amount <= 0) return;
     this.cherry = Math.min(this.cherryMax, this.cherry + amount);
@@ -58,6 +87,13 @@ export class CherrySystem {
       this.cherryPlus = Math.min(CHERRY_PLUS_MAX, this.cherryPlus + amount);
       if (this.cherryPlus >= CHERRY_PLUS_MAX) this.startBorder();
     }
+  }
+
+  // Th07.exe FUN_0042de03/FUN_0042dd6c (spec §2): cherry-only add, capped
+  // at cherryMax, cherryPlus untouched.
+  private gainCherryOnly(amount: number): void {
+    if (amount <= 0) return;
+    this.cherry = Math.min(this.cherryMax, this.cherry + amount);
   }
 
   private startBorder(): void {
@@ -71,12 +107,11 @@ export class CherrySystem {
     if (!this.borderActive) return 0;
     this.borderTimer--;
     if (this.borderTimer === 0) {
-      // Th07.exe FUN_0043e620: survive awards +10000 to BOTH cherryMax
-      // (FUN_0042de56) and cherry (FUN_0042de03). The score bonus is the
-      // documented Cherry x10 (the exe reads a persistent CherryMax global
-      // for it whose exact identity is still unresolved — see
-      // reference/re-specs/exe-cherry-border.md — so this uses current cherry).
-      const bonus = this.cherry * 10;
+      // Th07.exe FUN_0043e620 (spec §4, CONFIRMED instruction-by-instruction
+      // @ 0x43e64e-0x43e680): +10000 to both cherryMax (de56) and cherry
+      // (de03); score += cherry (the exe's `(cherry*10)/10` is a lossless
+      // compiler no-op, NOT a ×10 bonus — corrects this file's prior claim).
+      const bonus = this.cherry;
       this.cherryMax += 10000;
       this.cherry = Math.min(this.cherryMax, this.cherry + 10000);
       this.events.onBorderEnd?.('survived', bonus);
@@ -95,37 +130,102 @@ export class CherrySystem {
     return true;
   }
 
-  // TH07-TODO: exact per-character shot-hit cherry rates are undocumented;
-  // +2 unfocused / +0.2 focused approximates the "~90% lower when focused"
-  // rule. Fractions accumulate before truncation.
-  private shotRemainder = 0;
-  onShotHit(focused: boolean): void {
-    this.shotRemainder += focused ? 0.2 : 2;
-    const whole = Math.floor(this.shotRemainder);
-    if (whole > 0) {
-      this.shotRemainder -= whole;
-      this.gain(whole);
-    }
+  // Th07.exe FUN_0041ed50 (spec §3a, all.c 14181-14220), retail-simplified
+  // (DAT_004b5ec3/DAT_004ca4d8 are confirmed-dead gates, spec §2/§3a — the
+  // "alternate/reduced cherry" branch they'd gate is unreachable, omitted).
+  // The DAT_0062583c>4 damage-halving branch (spec §3a raw source) never
+  // fires in this port either: it requires an Extra/Phantasm difficulty
+  // tier this port doesn't have (difficultyIndex is 0..3), so it's omitted
+  // too — not a fidelity gap, just dead code under this port's difficulty
+  // range.
+  //   divisor = isBoss ? 10 - floor(min(difficulty*2,10)/3)
+  //                     : 30 - min(difficulty*2,10)
+  //   gain = min(70, floor(damage/divisor) * 10)
+  //   if gain == 0 and bossTimerOdd: gain = 10
+  //   if (difficulty==0 and shotTypeBit==0) and gain in {20,30} and
+  //      bossTimerOdd: gain -= 10
+  // `bossTimerOdd` is bit0 of the enemy's own boss-phase timer field
+  // (`enemyFlags_2bcc`, PROBABLE identity — spec §3a/§5 item 3); this port
+  // exposes the same counter as `Enemy.ecl.bossTimer`, which is 0 (hence
+  // always even) for every non-boss enemy, matching the exe's
+  // boss-only-observed behavior for this quirk.
+  onShotHit(
+    damage: number,
+    isBoss: boolean,
+    difficultyIndex: number,
+    shotTypeBit: number,
+    bossTimerOdd: boolean
+  ): void {
+    const local14 = Math.min(difficultyIndex * 2, 10);
+    const divisor = isBoss ? 10 - Math.floor(local14 / 3) : 30 - local14;
+    let g = Math.min(70, Math.floor(damage / divisor) * 10);
+    if (g === 0 && bossTimerOdd) g = 10;
+    const difficultyByte = difficultyIndex * 2 + shotTypeBit;
+    if (difficultyByte === 0 && (g === 20 || g === 30) && bossTimerOdd) g -= 10;
+    this.gain(g);
   }
 
-  cherryItemGain(): number {
+  // Th07.exe FUN_00430c10 case 6 (spec §3b): small "Cherry" item, +20
+  // cherry (+cherryPlus via dc6f), unconditional. This port's 'cherry'
+  // ItemType maps to this case (see stage-scene.ts collectItem).
+  onSmallCherryItem(): void {
+    this.gain(20);
+  }
+
+  // Th07.exe FUN_00430c10 case 7 (spec §3b): large "Cherry" item, amount =
+  // 1000 + 100 * (per-run counter @ stats+0x1c, UNRESOLVED — see
+  // spellsCaptured's doc comment above). UNSPAWNED in this port: no
+  // ItemType currently maps to case 7, kept for completeness per the
+  // spec's implementation guidance (§7).
+  largeCherryItemGain(): number {
     return 1000 + 100 * this.spellsCaptured;
   }
 
-  onCherryItem(): void {
-    this.gain(this.cherryItemGain());
+  onLargeCherryItem(): void {
+    this.gain(this.largeCherryItemGain());
   }
 
-  // Star / cancel items also raise cherry. TH07-TODO: exact value; using 10.
-  onStarItem(): void {
-    this.gain(10);
+  // Th07.exe FUN_00430c10 case 8 (spec §3b): "Big Cherry" item, fixed
+  // amount, no gating at all — +30 cherry+cherryPlus (dc6f) AND +70
+  // cherry-only (dd6c), for +100 total cherry / +30 cherryPlus. No score
+  // effect (case 8 has none). This port's 'bigCherry' ItemType maps here.
+  onBigCherryItem(): void {
+    this.gain(30);
+    this.gainCherryOnly(70);
   }
+
+  // Th07.exe FUN_00430c10 case 9 (spec §3b): flat +100 cherry
+  // (+cherryPlus via dc6f). UNSPAWNED in this port (no ItemType maps to
+  // case 9), kept for completeness per §7.
+  onCase9CherryItem(): void {
+    this.gain(100);
+  }
+
+  // Th07.exe FUN_00430c10 score term shared by cases 6 and 9 (spec §3b):
+  // `score += grazeScaledValue/10` where `grazeScaledValue =
+  // max(10, floor(graze/40)*10 + 300)` (or a min of 100 instead of 10 when
+  // `DAT_004b5e94 != 0` — PROBABLE dead, matching the DAT_004b5eXX/
+  // DAT_004ca4d8 confirmed-dead-flag cluster elsewhere in this pass, spec
+  // §2/§3a, but NOT independently confirmed for this specific address, so
+  // only the min=10 branch is implemented here). Already an exact multiple
+  // of 10, so `/10` is lossless integer division.
+  grazeScaledItemScore(graze: number): number {
+    const v = Math.max(10, Math.floor(graze / 40) * 10 + 300);
+    return Math.trunc(v / 10);
+  }
+
+  // Star / cancel ("P-bullet") items: Th07.exe cases 0/2 of the same
+  // item-collect switch never call any cherry accumulator function (spec
+  // §3/§6, closes the prior "+10 guess" as flatly wrong) — pure
+  // score/graze-combo bookkeeping, zero cherry interaction. No method
+  // here on purpose; stage-scene.ts's 'pointBullet' case no longer calls
+  // into CherrySystem at all.
 
   onGraze(focused: boolean): void {
     // Th07.exe FUN_0043bb30: graze raises BOTH cherryMax (FUN_0042de56) and
     // cherry (FUN_0042de03) by 30 focused / 80 unfocused, unconditionally —
     // NOT border-gated, and it never touches cherryPlus (graze does not
-    // progress the border; only shot-hits / cherry items / star items via
+    // progress the border; only shot-hits / cherry items via
     // FUN_0042dc6f do).
     const amt = focused ? 30 : 80;
     this.cherryMax += amt;
@@ -145,38 +245,79 @@ export class CherrySystem {
     this.breakBorder();
   }
 
-  onDeath(lossRatio: number): void {
-    this.cherry = Math.max(0, Math.trunc(this.cherry * (1 - lossRatio)));
+  // Th07.exe FUN_0043dca0 (spec §3d): penalty = floor10(min(cap,
+  // round(cherry*RATE))); cherry -= penalty. `RATE` is
+  // `*(DAT_0056b928+0x1c)`, a per-stage/difficulty config float whose
+  // write site wasn't traced (spec §5 item 1) — 0.5 is a flagged PROBABLE
+  // placeholder ("dying costs about half your cherry"), not
+  // disassembly-confirmed. `cap` = 60000 when `DAT_00625625 == 2` else
+  // 100000; `DAT_00625625` is PROBABLE-identified as the raw numeric
+  // difficulty index (spec §3d) but not confirmed to a difficulty *name*
+  // — this port has no Extra/Phantasm tier to cross-check against, so
+  // `difficultyIndex === 2` (this port's "Hard") is implemented literally
+  // per the numeric relationship, flagged uncertain.
+  //
+  // The previous per-character `lossRatio` arg (SHT `cherryLossOnDeath`,
+  // src/formats/sht.ts) is dropped: the exe's traced rate source is the
+  // per-stage config float above, not a per-character SHT field. The SHT
+  // field is real data (still parsed) but nothing here confirms it's the
+  // same knob — see EXECUTION-LOG.md for the discrepancy note.
+  onDeath(difficultyIndex: number): void {
+    const cap = difficultyIndex === 2 ? 60000 : 100000;
+    const rate = 0.5; // PROBABLE, spec §5 item 1 — see doc comment above
+    const penalty = Math.min(cap, Math.round(this.cherry * rate));
+    this.cherry = Math.max(0, this.cherry - floor10(penalty));
+    // Border progress reset on death is not itself in the decompiled §3d
+    // snippet, but matches well-established PCB behavior (dying zeroes the
+    // Cherry+ meter) and was already this file's behavior; kept.
     this.cherryPlus = 0;
   }
 
+  // Th07.exe FUN_0041e6b0 (spec §3e, CONFIRMED — DAT_0048ed1c == 0.25 via
+  // getFloat): penalty = floor10(round(cherry*0.25)); cherry -= penalty.
+  // No cap (unlike death's 60000/100000 cap). Corrects the previous
+  // "halve cherry" approximation, which was 2x too harsh.
   onBossTimeout(): void {
-    // TH07-TODO: exact timeout penalty; halving cherry.
-    this.cherry = Math.trunc(this.cherry / 2);
+    const penalty = floor10(Math.round(this.cherry * 0.25));
+    this.cherry -= penalty;
   }
 
-  // Score for a point item collected at height y (PoC line from SHT data).
-  pointItemValue(y: number, pocLineY: number, autoCollected: boolean): number {
-    if (autoCollected || y <= pocLineY) return Math.max(10, this.cherry);
-    const t = Math.min(1, Math.max(0, (y - pocLineY) / (448 - pocLineY)));
-    return Math.max(10, Math.trunc(this.cherry * (1 - t * 0.8) / 10) * 10);
+  // Th07.exe FUN_00430c10 case 1 ("P" point item), spec §3c, base=0
+  // collapse (§1a):
+  //   v = (autoCollected || y <= pocLineY) ? 50000
+  //       : 50000 - 100*round(y - pocLineY)
+  //   if v < 50000 and cherry > 50000: v += floor((cherry-50000)/5)
+  //   else if v >= 50000 and cherry > 50000: v = cherry
+  //   v = floor10(v)
+  //   score += v/10
+  // The `item.flag_0x280` "guaranteed max" override is dead code in
+  // retail (its only setter is gated on the always-0 `DAT_004b5ec5` dead
+  // flag, spec §3c) — omitted with zero behavioral difference.
+  pointItemScore(y: number, pocLineY: number, autoCollected: boolean): number {
+    let v = autoCollected || y <= pocLineY ? 50000 : 50000 - 100 * Math.round(y - pocLineY);
+    if (v < 50000) {
+      if (this.cherry > 50000) v += Math.trunc((this.cherry - 50000) / 5);
+    } else if (this.cherry > 50000) {
+      v = this.cherry;
+    }
+    return Math.trunc(floor10(v) / 10);
   }
 
-  // Th07.exe (v1.00b) fcn.00430c10 @ 0x431358 ("case 1" of an item-value
-  // switch reached via the 50000/0xC350 anchor): CONFIRMED the decay below
-  // the PoC line is a flat -100 score per pixel of |y - pocLineY| (imul by
-  // 100 @ 0x4313b2), not proportional to remaining playfield height as
-  // previously approximated here. The final value still floors to the
-  // nearest 10 (cdq/idiv 10, subtract remainder @ 0x431458-0x431468,
-  // matching the trunc-to-10 already used below). A further "excess
-  // CherryMax headroom" bonus term was observed in the same function
-  // (@ 0x4313e1-0x431455) but its struct-field semantics were not pinned
-  // down with enough confidence to encode here -- see ghidra-re-notes.md,
-  // Target B.
-  cherryItemScore(y: number, pocLineY: number, autoCollected: boolean): number {
+  // Th07.exe FUN_00430c10 case 7 score bonus (spec §3b): only fires once
+  // cherry is saturated at cherryMax; same height falloff shape as the
+  // point-item formula but no cherry-headroom bonus term. UNSPAWNED in
+  // this port (paired with onLargeCherryItem above), kept per §7.
+  largeCherryItemScore(y: number, pocLineY: number, autoCollected: boolean): number {
     if (this.cherry < this.cherryMax) return 0;
-    if (autoCollected || y <= pocLineY) return 50000;
-    const raw = 50000 - 100 * Math.abs(y - pocLineY);
-    return Math.max(0, Math.trunc(raw / 10) * 10);
+    const bonus = autoCollected || y <= pocLineY ? 50000 : 50000 - 100 * Math.round(y - pocLineY);
+    return Math.trunc(floor10(bonus) / 10);
+  }
+
+  // Test/debug-only: adds cherry directly through the same capped/
+  // border-triggering path as a real gain, bypassing the shot-hit formula.
+  // Used by main.ts's __TH07_TEST__.addCherry hook so probes can reach a
+  // target cherry magnitude deterministically; not an exe-derived path.
+  debugAddCherry(amount: number): void {
+    this.gain(amount);
   }
 }

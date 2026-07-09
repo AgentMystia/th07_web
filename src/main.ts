@@ -197,7 +197,7 @@ async function boot(): Promise<void> {
       },
       addCherry: (n: number) => {
         if (!stage) return;
-        for (let i = 0; i < n / 2; i++) stage.cherry.onShotHit(false);
+        stage.cherry.debugAddCherry(n);
       },
       bgm: () => ({ active: audio.active, decoded: audio.decodedTracks })
     };

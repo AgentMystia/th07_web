@@ -238,8 +238,17 @@ comments): unfocused orb offsets (∓24, 0), focused (∓8, −32); SakuyaB-only
 option orbit fully decoded (rate vx·π/200, clamp ±36°, focused cluster
 ±π/14 at r=24); focus-toggle glide is 8 frames (x lerp, y eased); cherry
 border trigger 50000 (0xC350), border duration 540 frames (0x21C) with
-30-frame fades; point-item value `50000 − 100·|y − pocLine|` floored to
-tens, min 100.
+30-frame fades; border-survive score bonus is `cherry` (×1, not ×10 — the
+exe's `bonus*10` immediately `/10` is a lossless compiler no-op); point
+item score (case 1 of the item-collect switch) is `v = 50000 − 100·round(y
+− pocLine)` (or flat 50000 at/above the line), `+= floor((cherry−50000)/5)`
+once cherry exceeds 50000 (or capped down to `cherry` itself if `v`
+would've been the flat 50000), floored to tens, **then `score += v/10`**
+— the live in-game score field is added-to (and displayed) at ×1 with no
+further scaling anywhere in the HUD digit path (confirmed via the raw
+"%.8d"/"%.9d" format strings backing the score readout, no appended
+digit); see reference/re-specs/exe-cherry-border.md §3c/§4 and
+EXECUTION-LOG.md's score-unit adjudication.
 
 **HUD layout**: front.png sprite rects and resting coordinates are decoded
 in `src/game/stage-scene.ts` (`FRONT`, `drawSidebar`, `drawFrame`) — labels
