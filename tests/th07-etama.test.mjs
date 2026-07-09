@@ -43,3 +43,22 @@ test('stage-1 bullet scripts resolve entry-scoped to etama.png sprites', () => {
     }
   }
 });
+
+test('every stage-1-observed (sprite,offset) bullet combo resolves to a real etama sprite', () => {
+  // Captured from full Normal+Lunatic playthroughs to stageClear
+  // (reference/re-specs/bullet-render-gap.md). Do not shrink without
+  // re-running that recon.
+  const OBSERVED = [
+    [0, 6], [1, 6], [1, 8], [1, 9], [1, 10], [2, 6], [2, 10],
+    [3, 5], [3, 6], [5, 6], [5, 15], [6, 5], [6, 6], [7, 4]
+  ];
+  for (const [sprite, offset] of OBSERVED) {
+    const runner = new AnmRunner(etama, sprite, { entryIndex: 0, spriteIndexOffset: offset });
+    const frame = runner.spriteFrame();
+    assert.ok(frame, `sprite=${sprite} offset=${offset} has a frame`);
+    assert.equal(frame.imageKey, 'etama', `sprite=${sprite} offset=${offset} sheet`);
+    assert.ok(frame.w > 0 && frame.h > 0, `sprite=${sprite} offset=${offset} rect`);
+    assert.ok(frame.x >= 0 && frame.x + frame.w <= 256 && frame.y >= 0 && frame.y + frame.h <= 256,
+      `sprite=${sprite} offset=${offset} within sheet`);
+  }
+});
