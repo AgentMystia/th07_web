@@ -348,34 +348,32 @@ export class StageScene implements GameHost {
     const p = this.playerObj;
     this.frameDamage.clear();
     this.sfxPlayedThisFrame.clear();
-    // Th07.exe DAT_0061c25c (dialogue-freeze global, read-confirmed at 5
-    // sites, exe-misc-ecl-ops.md §2): while a dialogue box is up the whole
-    // simulation freezes for the frame -- Player::Update never runs at all
-    // (FUN_0043eef0 @ 0x43eef7: no movement/shot/bomb/hitbox handling),
-    // enemy-bullet movement is skipped wholesale (FUN_004241c0 @ 0x4241e4),
-    // and the stage frame counter/per-frame subsystems don't tick
-    // (FUN_00426656 @ 0x42665d). Captured once at the top of the frame (the
-    // dialogue box's own advance below can clear `this.dialogue` mid-frame,
-    // which should take effect starting next frame, matching the exe
-    // checking the flag before running its per-frame subsystems). Dialogue
-    // advance/input and UI-only timers (spell banner, bonus popup, cherry
-    // border) are not among the confirmed gates and keep running.
+    // During a story-dialogue box the player keeps FULL movement control, as
+    // in the original PCB: only damage is suspended. What freezes is the rest
+    // of the simulation -- enemy/boss scripts, enemy-bullet motion, the
+    // player's own shots and bomb, and every collision test -- so you can
+    // reposition while the conversation is up but neither deal nor take
+    // damage. (The exe's DAT_0061c25c freeze, exe-misc-ecl-ops.md §2, covers
+    // the boss timer, enemy-bullet motion and stage spawns; player movement
+    // is deliberately NOT gated by it.) `frozen` is captured once at the top
+    // of the frame; the dialogue box's own advance below may clear
+    // `this.dialogue` mid-frame, taking effect next frame.
     const frozen = this.isDialogueBlocking();
-    if (!frozen) {
-      // Bombing is allowed in normal play AND during the deathbomb window
-      // (p.deathTimer >= 0) -- that window is precisely the few frames after a
-      // hit in which a bomb still rescues you (tryBomb clears deathTimer). It
-      // stays blocked during the death squish / materialize (controllable false,
-      // deathTimer < 0 there).
-      if (input.pressed.has('bomb') && (p.controllable || p.deathTimer >= 0) && !this.gameOver) {
-        if (p.tryBomb()) {
-          this.cherry.onBomb();
-          this.voidSpellCapture();
-          this.onBombUsed();
-        }
+    // Bombing is allowed in normal play AND during the deathbomb window
+    // (p.deathTimer >= 0) -- the few frames after a hit in which a bomb still
+    // rescues you. Blocked during the death squish / materialize (controllable
+    // false, deathTimer < 0) and while a dialogue box is up (no damage in/out).
+    if (!frozen && input.pressed.has('bomb') && (p.controllable || p.deathTimer >= 0) && !this.gameOver) {
+      if (p.tryBomb()) {
+        this.cherry.onBomb();
+        this.voidSpellCapture();
+        this.onBombUsed();
       }
-      p.update(input);
-      this.focusHeld = p.focusHeld;
+    }
+    // Movement runs every frame, dialogue or not.
+    p.update(input);
+    this.focusHeld = p.focusHeld;
+    if (!frozen) {
       const death = p.tickDeath();
       if (death === 'effects') this.onPlayerDeath();
       else if (death === 'respawn') this.onPlayerRespawn();
@@ -430,12 +428,11 @@ export class StageScene implements GameHost {
     }
     this.updateItems();
     this.updateParticles();
-    // Bomb damage / bullet-cancel is part of the player simulation (exe:
-    // Player::Update owns the bomb), so it freezes with the rest during a
-    // dialogue box -- p.update() (which ticks bombTimer) is already gated on
-    // !frozen above, so without this gate a bomb still active when dialogue
-    // opens would keep dealing 8 dmg/frame for the whole dialogue against a
-    // timer that never decrements (DAT_0061c25c, exe-misc-ecl-ops.md §2).
+    // Bomb damage / bullet-cancel is suspended while a dialogue box is up
+    // (no damage dealt during dialogue), even though the player may keep
+    // moving -- otherwise a bomb still active when dialogue opens would keep
+    // clearing bullets and damaging the frozen boss for the whole
+    // conversation.
     if (!frozen && p.bombTimer > 0) this.applyBombEffects();
     // Bomb over: release the interrupt-gated bomb visuals (label 1 is the
     // fade-out path in the player bomb scripts).
