@@ -372,6 +372,15 @@ export class StageScene implements GameHost {
       // shooter with sfxId>=0 (always SE 0), not on a free-running 8f clock.
       for (const b of volley) {
         if (b.behaviorFunc === 4) this.aimBulletAtSpawn(b);
+        else if (b.behaviorFunc === 5) {
+          // Th07.exe FUN_00439160 (SakuyaB): bullets fly at orbitAngle + the
+          // shot's own deviation from straight-up — the whole fan banks with
+          // strafe. At rest (orbit = -π/2) this is exactly the table angle.
+          const spread = b.angle - -Math.PI / 2;
+          b.angle = this.playerObj.orbitAngle + spread;
+          b.vx = Math.cos(b.angle) * b.speed;
+          b.vy = Math.sin(b.angle) * b.speed;
+        }
         this.playerBullets.push(b);
       }
     }

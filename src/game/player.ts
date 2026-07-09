@@ -51,25 +51,15 @@ export interface PlayerBullet {
 }
 
 // Option (orb) offsets relative to the player; fire origins for orb shots.
-//
-// Th07.exe (v1.00b) Player::Update (fcn.0043be00 @ 0x43be00) drives a glide
-// state machine at player+0x2410. Unfocused (settled) offsets are CONFIRMED
-// exe-hardcoded immediates from that machine's terminal "case 3" state:
-// orb 1 x=-32.0 @ 0x43cb30, y=8.0 @ 0x43cb29; orb 2 mirrors orb 1 across x
-// (this codebase's existing left/right symmetry convention). Note the y
-// sign: +8 (below the player), not -8 as previously guessed here.
-//
-// The exe's focused layout is NOT a static offset at all: options
-// continuously orbit the player on a radius-24.0 circle (fmul by 0x48ec78
-// = 24.0 @ 0x43ce2d and 0x43ce59, confirmed), phase-shifted by pi/2 (fadd
-// 0x48eaec = 1.5708 @ 0x43ce16 and 0x43ce42, confirmed), driven by a
-// per-frame angle (player+0xb7e58) whose increment site was not located
-// within this function -- so the rotation rate and orb 2's phase offset
-// are NOT confirmed. We keep a static focused approximation below pending
-// that follow-up (see ghidra-re-notes.md, Target A).
+// Th07.exe FUN_0043be00 option state machine (per-state constants re-read
+// 2026-07: settled unfocused = (∓24, 0), settled focused = (∓8, −32);
+// cross-validated vs the MarisaB laser gates (state 1 vs 3) and SakuyaB's
+// orbit rest point. Overturns the earlier 0x43cb30 (∓32,+8) misread —
+// see reference/re-specs/exe-player-shot.md §4. Tween stays 8f, x linear,
+// y quadratic.
 const ORB_OFFSETS = {
-  unfocused: { 1: { x: -32, y: 8 }, 2: { x: 32, y: 8 } },
-  focused: { 1: { x: -16, y: -24 }, 2: { x: 16, y: -24 } }
+  unfocused: { 1: { x: -24, y: 0 }, 2: { x: 24, y: 0 } },
+  focused: { 1: { x: -8, y: -32 }, 2: { x: 8, y: -32 } }
 } as const;
 
 // Frames to glide between the unfocused/focused layouts on a focus-state
@@ -85,12 +75,11 @@ const ORB_OFFSETS = {
 // lerp(fromY,toY,t*t) in general.
 const GLIDE_FRAMES = 8;
 
-// PCB's shot cadence runs on a 60-frame cycle (Priw8's sht-webedit docs:
-// "PCB - shooting uses a 60-frame timer. For bullets to fire consistently,
-// choose a fire_rate that is a factor of 60"), not the 30-frame cycle used
-// by the TH06 engine family. shot.interval/shot.delay are frame counts
-// within that cycle.
-const SHOT_CYCLE = 60;
+// Th07.exe FUN_0043a820 @ 0x43a820: the shot-cadence counter is hard-
+// capped at 30 (CMP 0x1e @ 0x43a8d5) and re-armed to 0 while shoot is
+// held — a 30-frame cycle. (Priw8's external doc said 60; direct exe
+// disassembly outranks it per AGENTS.md §2. Max data delay is 20.)
+const SHOT_CYCLE = 30;
 
 // Player spawn / lifecycle, decoded from Th07.exe (v1.00b). The exe drives
 // the player through a state byte at player+0x2408 (dispatcher fcn.0043eef0):
@@ -130,6 +119,14 @@ export class Player {
   // Frames elapsed since the last focus-state toggle, saturating at
   // GLIDE_FRAMES once the orb glide has settled; see orbOffset().
   private focusGlideFrame = GLIDE_FRAMES;
+  // Th07.exe SakuyaB-only option orbit (exe-player-shot.md §7): accumulator
+  // at player+0xb7e58; rest = -PI/2; strafe steers by vx*PI/200 per frame;
+  // idle returns at 2*PI/100 per frame with snap inside PI/100; clamped to
+  // [-7*PI/10, -3*PI/10] (±36° around straight up).
+  orbitAngle = -Math.PI / 2;
+  // This frame's horizontal displacement (dx*speed from move()); 0 when not
+  // strafing. Feeds the SakuyaB orbit steer.
+  private lastVx = 0;
   shooting = false;
   // -1 while not shooting so that the first held frame lands on fireFrame 0
   // (see update()): a shot with delay 0 must fire on the very press frame,
@@ -232,6 +229,7 @@ export class Player {
       }
     }
     if (this.controllable) this.move(input);
+    else this.lastVx = 0;
     this.shooting = input.held.has('shoot') && this.controllable;
     if (this.shooting) {
       this.fireFrame = (this.fireFrame + 1) % SHOT_CYCLE;
@@ -240,6 +238,14 @@ export class Player {
     }
     this.updatePose(input);
     this.runner.update();
+    const vx = this.lastVx;
+    if (vx === 0) {
+      if (Math.abs(this.orbitAngle - -Math.PI / 2) <= Math.PI / 100) this.orbitAngle = -Math.PI / 2;
+      else this.orbitAngle += (this.orbitAngle < -Math.PI / 2 ? 1 : -1) * (2 * Math.PI / 100);
+    } else {
+      this.orbitAngle += vx * Math.PI / 200;
+      this.orbitAngle = Math.min(-3 * Math.PI / 10, Math.max(-7 * Math.PI / 10, this.orbitAngle));
+    }
   }
 
   private move(input: InputFrame): void {
@@ -259,6 +265,7 @@ export class Player {
     // DAT_0062585c/860 = 384/448 (confirmed via FUN_0041de20 @ 0x41dfeb/0x41e016).
     this.x = clamp(this.x + dx * speed, 0, 384);
     this.y = clamp(this.y + dy * speed, 0, 448);
+    this.lastVx = dx * speed;
   }
 
   private updatePose(input: InputFrame): void {
@@ -275,6 +282,24 @@ export class Player {
   // Fires shooter entries whose cadence matches this frame; called once per
   // frame while the shoot button is held.
   orbOffset(orb: 1 | 2): { x: number; y: number } {
+    if (this.character === 'sakuyaB') {
+      // exe: unfocused = diametric pair on r=24 at φ=orbitAngle+π/2;
+      // focused = tight cluster at orbitAngle ∓ π/14; 8f linear glide between.
+      const a = this.orbitAngle;
+      const unf = orb === 1
+        ? { x: -24 * Math.cos(a + Math.PI / 2), y: -24 * Math.sin(a + Math.PI / 2) }
+        : { x: 24 * Math.cos(a + Math.PI / 2), y: 24 * Math.sin(a + Math.PI / 2) };
+      const foc = {
+        x: 24 * Math.cos(a + (orb === 1 ? -1 : 1) * Math.PI / 14),
+        y: 24 * Math.sin(a + (orb === 1 ? -1 : 1) * Math.PI / 14)
+      };
+      const to = this.focusHeld ? foc : unf;
+      if (this.focusGlideFrame >= GLIDE_FRAMES) return to;
+      const from = this.focusHeld ? unf : foc;
+      const t = this.focusGlideFrame / GLIDE_FRAMES;
+      // simplified straight lerp, exe uses target-endpoint forms; visual nicety only
+      return { x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t };
+    }
     const to = ORB_OFFSETS[this.focusHeld ? 'focused' : 'unfocused'][orb];
     if (this.focusGlideFrame >= GLIDE_FRAMES) return to;
     const from = ORB_OFFSETS[this.focusHeld ? 'unfocused' : 'focused'][orb];

@@ -226,15 +226,17 @@ pocLine/speed/focusedSpeed/diag×2}` then `{u32 offset, u32 powerThreshold}`
 pairs (brackets 8/16/32/48/64/80/96/128/999). Shooter record 52 bytes:
 `{u16 interval, u16 delay, f32 x,y,hitboxW,hitboxH,angle,speed, i16 damage,
 u8 orb, u8 shotType, i16 sprite, i16 sfxId, i32×4 funcs}`. **PCB's shot
-timer runs a 60-frame cycle** (not TH06's 30); a delay-0 shooter fires on
-the press frame itself. Player sprite ids are SHT sprite + 1024 base.
+timer runs a 30-frame cycle** (Th07.exe FUN_0043a820, counter capped at
+0x1e and re-armed while held; external docs claiming 60 were overruled by
+disassembly); a delay-0 shooter fires on the press frame itself. Player
+sprite ids are SHT sprite + 1024 base.
 Bullet hitboxW/H are full widths; enemy-vs-player-bullet AABB is
 `(enemyW + bulletW)/2`.
 
 **Exe-recovered constants** (Ghidra, Th07.exe v1.00b — keep provenance
-comments): unfocused orb offsets (±32, +8); focused options *orbit* at
-radius 24 phase-shifted π/2 (rate unconfirmed — static approximation in
-place, flagged); focus-toggle glide is 8 frames (x lerp, y eased); cherry
+comments): unfocused orb offsets (∓24, 0), focused (∓8, −32); SakuyaB-only
+option orbit fully decoded (rate vx·π/200, clamp ±36°, focused cluster
+±π/14 at r=24); focus-toggle glide is 8 frames (x lerp, y eased); cherry
 border trigger 50000 (0xC350), border duration 540 frames (0x21C) with
 30-frame fades; point-item value `50000 − 100·|y − pocLine|` floored to
 tens, min 100.
