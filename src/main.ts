@@ -18,6 +18,7 @@ interface TestHook {
   damageBoss(n: number): void;
   addCherry(n: number): void;
   spawnLog(): { t: number; time: number; sub: number }[];
+  bgm(): { active: string | null; decoded: string[] };
 }
 
 declare global {
@@ -97,6 +98,15 @@ async function boot(): Promise<void> {
   renderer.assets = assets.images;
   const input = new Input();
   const audio = new AudioBus();
+  // Eager-preload every BGM track stage 1 can need (title + stage + boss) as
+  // soon as the AudioBus exists, so decodeAudioData has already finished by
+  // the time playBgm() is actually called for it (title on first
+  // interaction; stage/boss at stage start). Without this, the stage track
+  // was measured starting 138.9ms (~8 frames) after stage frame 0 on a
+  // zero-latency local server, and 8.9s/26.2s (~533/~1573 frames) under
+  // throttled Slow-4G/Fast-3G — with the title theme still audibly looping
+  // for the entire gap (bug 5, measurements in reference/re-specs/bgm-audit.md).
+  audio.preloadBgm(['th07_01', 'th07_02', 'th07_03']);
   const params = new URLSearchParams(location.search);
 
   // ?test=1 alone must still boot directly into the stage exactly as before
@@ -188,7 +198,8 @@ async function boot(): Promise<void> {
       addCherry: (n: number) => {
         if (!stage) return;
         for (let i = 0; i < n / 2; i++) stage.cherry.onShotHit(false);
-      }
+      },
+      bgm: () => ({ active: audio.active, decoded: audio.decodedTracks })
     };
   }
   loop.start();

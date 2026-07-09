@@ -27,6 +27,13 @@ export class AudioBus {
   unlocked = false;
   muted = false;
 
+  // Test-only observability: which track names are currently resolved in
+  // the decoded BGM cache, so a headless check can assert preload state
+  // (see window.__TH07_TEST__.bgm() in main.ts).
+  get decodedTracks(): string[] {
+    return Array.from(this.bgmBuffers.keys());
+  }
+
   constructor() {
     const unlock = () => {
       this.unlock();
@@ -102,11 +109,15 @@ export class AudioBus {
       return;
     }
     this.active = name;
+    // Stop the previous track immediately rather than waiting for the new
+    // one's decode to resolve: any residual load gap then plays silence
+    // instead of the old track hard-cutting away later, off by however long
+    // the new track's fetch+decode took (bug 5).
+    this.stopSourceOnly();
     void this.loadBgm(name).then((buffer) => {
       if (!buffer || this.active !== name) return;
       const ctx = this.ensureCtx();
       if (!ctx || !this.bgmGain) return;
-      this.stopSourceOnly();
       const src = ctx.createBufferSource();
       src.buffer = buffer;
       const info = this.trackInfo(name);
