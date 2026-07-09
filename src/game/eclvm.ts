@@ -3,7 +3,7 @@ import { Anm, AnmRunner } from '../formats/anm';
 import { Std } from '../formats/std';
 import { Msg } from '../formats/msg';
 import { normalizeAngle, clamp, TAU } from '../core/util';
-import type { GameHost, Enemy, EclState, EclContext, BulletProps, ItemType } from './types';
+import type { GameHost, Enemy, EclState, EclContext, BulletProps, BulletExSlot, ItemType } from './types';
 
 // TH07 ECL virtual machine. Opcode semantics were derived by aligning thtk's
 // th07 signature table against the TH06 instruction set (implemented in the
@@ -15,6 +15,55 @@ import type { GameHost, Enemy, EclState, EclContext, BulletProps, ItemType } fro
 // gate on `< 0x400`; audit-bullet-motion.md D4). Was 640 (an empirical probe
 // ceiling), which starved the densest Lunatic patterns ~384 bullets early.
 const ENEMY_BULLET_CAP = 1024;
+
+// Resolve a fired bullet's ex-behaviors from the enemy's op-79 slots, exactly
+// mirroring the exe's per-frame queue processor FUN_004229f0 @ 0x4229f0 (but
+// collapsed to one pass at spawn). Each frame the exe advances one slot: it
+// STOPS at the first opcode==0 slot, STOPS at a cond==0 slot once any behavior
+// is already active (the cond gate), otherwise activates the slot iff its
+// opcode bit is in the fire flags. Because the behavior-flag set only grows,
+// a single pass yields the same activation set. The cond gate is why Letty's
+// accel slot (cond 0, after speed-ramp) never activates in the real game.
+// Sentinels: accel angle f1<=-990 -> keep bullet angle (DAT_0048eba4);
+// dir/bounce speed f1/f0<=-999 -> keep bullet speed (DAT_0048eba0).
+function resolveExBehaviors(
+  slots: (BulletExSlot | null)[],
+  fireFlags: number,
+  spawnAngle: number,
+  spawnSpeed: number
+): Pick<import('./types').EnemyBullet, 'exFlags' | 'exAccel' | 'exAngle' | 'exDir' | 'exBounce'> {
+  let exFlags = 0;
+  let exAccel: { mag: number; angle: number; limit: number } | null = null;
+  let exAngle: { speedDelta: number; angleDelta: number; limit: number } | null = null;
+  let exDir: { angle: number; newSpeed: number; interval: number; maxTimes: number } | null = null;
+  let exBounce: { speed: number; maxTimes: number } | null = null;
+  for (let idx = 0; idx < 5; idx++) {
+    const slot = slots[idx];
+    if (!slot || slot.opcode === 0) break; // end of queue (exe: pfVar1[4]==0 -> return)
+    if (slot.cond === 0 && exFlags !== 0) break; // cond gate (exe: cond==0 && flags!=0 -> return)
+    if ((fireFlags & slot.opcode) === 0) continue; // opcode not enabled by this FIRE
+    exFlags |= slot.opcode;
+    switch (slot.opcode) {
+      case 0x10:
+        exAccel = { mag: slot.f0, angle: slot.f1 <= -990 ? spawnAngle : slot.f1, limit: slot.arg3 };
+        break;
+      case 0x20:
+        exAngle = { speedDelta: slot.f0, angleDelta: slot.f1, limit: slot.arg3 };
+        break;
+      case 0x40:
+      case 0x80:
+      case 0x100:
+        exDir = { angle: slot.f0, newSpeed: slot.f1 <= -999 ? spawnSpeed : slot.f1, interval: slot.arg3, maxTimes: slot.arg4 };
+        break;
+      case 0x400:
+      case 0x800:
+        exBounce = { speed: slot.f0 <= -999 ? spawnSpeed : slot.f0, maxTimes: slot.arg3 };
+        break;
+      // opcode 1 (speed-ramp): flag only, no params
+    }
+  }
+  return { exFlags, exAccel, exAngle, exDir, exBounce };
+}
 
 // Item ids as used by ECL drop fields, confirmed against Th07.exe (v1.00b)
 // collection switch FUN_00430c10 @ 0x430c10 (case 0..7 award behavior): the
@@ -235,8 +284,7 @@ export class StageRuntime {
       activeTimer: Infinity,
       bulletProps: null,
       bulletSfx: -1,
-      bulletExInts: [0, 0, 0, 0, 0],
-      bulletExFloats: [0, 0],
+      bulletExSlots: [null, null, null, null, null],
       shootDisabled: false,
       shootInterval: 0,
       shootTimer: 0,
@@ -831,13 +879,15 @@ export class StageRuntime {
       case 75: s.shootDisabled = true; return null;
       case 76: s.shootDisabled = false; return null;
       case 78: s.shootOffset = { x: gf(0), y: gf(4), z: gf(8) }; return null;
-      case 79: { // bullet ex-properties (5 ints, 2 floats)
-        s.bulletExInts = [gi(0), gi(4), gi(8), gi(12), gi(16)];
-        s.bulletExFloats = [gf(20), gf(24)];
-        if (s.bulletProps) {
-          s.bulletProps.exInts = [...s.bulletExInts];
-          s.bulletProps.exFloats = [...s.bulletExFloats];
+      case 79: { // BULLET_EX: write one op-79 template slot (arg0 = slot index)
+        // exe FUN_0040f6c0 case 0x4e: arg0 selects one of 5 per-enemy slots;
+        // args map opcode=arg1, cond=arg2, arg3, arg4(maxTimes), f0=arg5,
+        // f1=arg6. Slots persist and all activate at FIRE via the cond gate.
+        const slot = gi(0);
+        if (slot >= 0 && slot < 5) {
+          s.bulletExSlots[slot] = { opcode: gi(4), cond: gi(8), arg3: gi(12), arg4: gi(16), f0: gf(20), f1: gf(24) };
         }
+        if (s.bulletProps) s.bulletProps.exSlots = s.bulletExSlots.slice();
         return null;
       }
       case 80: if (s.bulletProps) this.spawnBullets(game, e, s.bulletProps); return null;
@@ -1099,8 +1149,7 @@ export class StageRuntime {
         angle2: this.getFloat(game, e, a + 24),
         flags: this.ecl.view.i32(a + 28) | (s.bulletSfx >= 0 ? 0x200 : 0),
         sfx: s.bulletSfx,
-        exInts: [...s.bulletExInts],
-        exFloats: [...s.bulletExFloats],
+        exSlots: s.bulletExSlots.slice(),
         aimMode
       };
     }
@@ -1118,8 +1167,7 @@ export class StageRuntime {
       angle2: this.getFloat(game, e, a + 24),
       flags: this.ecl.view.i32(a + 28) | (s.bulletSfx >= 0 ? 0x200 : 0),
       sfx: s.bulletSfx,
-      exInts: [...s.bulletExInts],
-      exFloats: [...s.bulletExFloats],
+      exSlots: s.bulletExSlots.slice(),
       aimMode
     };
   }
@@ -1191,6 +1239,7 @@ export class StageRuntime {
         // Spawn-in effect: bullets ease in at reduced speed while flashing.
         const spawnDuration = flags & 2 ? 8 : flags & 4 ? 11 : flags & 8 ? 14 : 0;
         const spawnMoveScale = flags & 2 ? 1 / 2 : flags & 4 ? 1 / 2.5 : flags & 8 ? 1 / 3 : 1;
+        const ex = resolveExBehaviors(p.exSlots, flags, angle, spd);
         game.enemyBullets.push({
           id: game.id++,
           x: shootX,
@@ -1209,8 +1258,11 @@ export class StageRuntime {
           grazed: false,
           spawnDuration,
           spawnMoveScale,
-          exInts: p.exInts,
-          exFloats: p.exFloats
+          exFlags: ex.exFlags,
+          exAccel: ex.exAccel,
+          exAngle: ex.exAngle,
+          exDir: ex.exDir,
+          exBounce: ex.exBounce
         });
       }
     }

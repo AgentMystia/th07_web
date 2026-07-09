@@ -921,9 +921,12 @@ export class StageScene implements GameHost {
     this.enemyBullets.length = w;
   }
 
-  // Bullet ex-behaviors, ported from the TH06 Web implementation with TH07's
-  // op-79 field layout: exInts = [?, interval, ?, ?, times], exFloats =
-  // [rotation/accel, speed (-999 keeps current)].
+  // Per-frame bullet ex-behaviors, matching Th07.exe FUN_004241c0 @ 0x4241c0.
+  // Each activated behavior bit in b.exFlags (exe +0xbf4, built at spawn via
+  // the op-79 cond gate — see eclvm resolveExBehaviors) runs as an INDEPENDENT
+  // if in the order 0x1, 0x10, 0x20, 0x40/0x100/0x80, 0xc00, then velocity is
+  // added to position ONCE. Every behavior reads only its OWN op-79 slot's
+  // resolved params and clears its own bit when finished.
   private updateBulletMotion(b: EnemyBullet): void {
     if (b.age < b.spawnDuration) {
       b.x += b.vx * b.spawnMoveScale;
@@ -932,75 +935,68 @@ export class StageScene implements GameHost {
       return;
     }
     const age = b.age - b.spawnDuration;
-    // Th07.exe FUN_004241c0 runs every set behavior bit as an INDEPENDENT if
-    // (order 0x1, 0x10, 0x20, 0x40/0x100/0x80, 0xc00), not else-if. The
-    // duration/limit for accel/angle-change/dir-change/bounce is exInts[3]
-    // (= op-79 arg3 = pfVar1[2]) for all of them; dir-change keeps
-    // maxTimes=exInts[4] (audit-bullet-motion.md D1). Previously speed-ramp
-    // (0x1), accel (0x10) and angle-change (0x20) were a mutually-exclusive
-    // else-if chain, so a bullet carrying both speed-ramp and accel (every
-    // Letty emitter, flags 0x215/0x211) never accelerated until the 17-frame
-    // ramp self-cleared — and the limits read the slot index/opcode, so accel
-    // and turns quit after 0-2 frames.
-    if (b.flags & 1) {
-      // speed-ramp: +5 decaying over 17 frames (op-79 slot carries only defaults).
+    if (b.exFlags & 1) {
+      // speed-ramp (FUN_00423840): velocity = polar(angle, speed + 5·decay)
+      // for 17 frames; then just clears the bit. Never writes the speed
+      // scalar, so it composes cleanly with accel/angle-change.
       if (age <= 16) {
         const extra = 5 - (age * 5) / 16;
         b.vx = Math.cos(b.angle) * (b.speed + extra);
         b.vy = Math.sin(b.angle) * (b.speed + extra);
       } else {
-        b.flags ^= 1;
-        b.vx = Math.cos(b.angle) * b.speed;
-        b.vy = Math.sin(b.angle) * b.speed;
+        b.exFlags &= ~1;
       }
     }
-    if (b.flags & 0x10) {
-      const limit = b.exInts[3] > 0 ? b.exInts[3] : 99999;
-      if (age >= limit) b.flags &= ~0x10;
+    if ((b.exFlags & 0x10) && b.exAccel) {
+      // accel (FUN_00423910): add a fixed accel vector to velocity and
+      // recompute the heading. Does NOT touch the speed scalar (the exe
+      // doesn't — writing hypot() here would feed the speed-ramp into a
+      // runaway loop = the "supersonic" bug). Runs while age < limit.
+      const ac = b.exAccel;
+      if (age >= ac.limit) b.exFlags &= ~0x10;
       else {
-        const angle = b.exFloats[1] <= -990 ? b.angle : b.exFloats[1];
-        const accel = b.exFloats[0] || 0;
-        b.vx += Math.cos(angle) * accel;
-        b.vy += Math.sin(angle) * accel;
+        b.vx += Math.cos(ac.angle) * ac.mag;
+        b.vy += Math.sin(ac.angle) * ac.mag;
         b.angle = Math.atan2(b.vy, b.vx);
-        b.speed = Math.hypot(b.vx, b.vy);
       }
     }
-    if (b.flags & 0x20) {
-      const limit = b.exInts[3] || 0;
-      if (age >= limit) b.flags &= ~0x20;
+    if ((b.exFlags & 0x20) && b.exAngle) {
+      // angle-change (FUN_00423a80): angle += angleDelta, speed += speedDelta,
+      // velocity = polar(angle, speed). Runs while age < limit.
+      const an = b.exAngle;
+      if (age >= an.limit) b.exFlags &= ~0x20;
       else {
-        b.angle = normalizeAngle(b.angle + (b.exFloats[1] || 0));
-        b.speed += b.exFloats[0] || 0;
+        b.angle = normalizeAngle(b.angle + an.angleDelta);
+        b.speed += an.speedDelta;
         b.vx = Math.cos(b.angle) * b.speed;
         b.vy = Math.sin(b.angle) * b.speed;
       }
     }
-    if (b.flags & 0x40) this.dirChangeBullet(b, age, 'relative');
-    else if (b.flags & 0x100) this.dirChangeBullet(b, age, 'absolute');
-    else if (b.flags & 0x80) this.dirChangeBullet(b, age, 'aimed');
-    if (b.flags & 0x400) this.bounceBullet(b, true);
-    if (b.flags & 0x800) this.bounceBullet(b, false);
+    if ((b.exFlags & 0x40) && b.exDir) this.dirChangeBullet(b, age, 'relative');
+    else if ((b.exFlags & 0x100) && b.exDir) this.dirChangeBullet(b, age, 'absolute');
+    else if ((b.exFlags & 0x80) && b.exDir) this.dirChangeBullet(b, age, 'aimed');
+    if ((b.exFlags & 0x400) && b.exBounce) this.bounceBullet(b, true);
+    if ((b.exFlags & 0x800) && b.exBounce) this.bounceBullet(b, false);
     b.x += b.vx;
     b.y += b.vy;
     b.age++;
   }
 
   private dirChangeBullet(b: EnemyBullet, age: number, mode: 'relative' | 'absolute' | 'aimed'): void {
-    const interval = Math.max(1, b.exInts[3] | 0);
-    const maxTimes = Math.max(1, b.exInts[4] | 0);
+    const d = b.exDir!;
+    const interval = Math.max(1, d.interval | 0);
+    const maxTimes = Math.max(1, d.maxTimes | 0);
     const times = b.dirTimes ?? 0;
-    const dirSpeed = b.exFloats[1] > -999 ? b.exFloats[1] : b.speed;
     let speed: number;
     if (age >= interval * (times + 1)) {
       b.dirTimes = times + 1;
       if (b.dirTimes >= maxTimes) {
-        b.flags &= mode === 'relative' ? ~0x40 : mode === 'absolute' ? ~0x100 : ~0x80;
+        b.exFlags &= mode === 'relative' ? ~0x40 : mode === 'absolute' ? ~0x100 : ~0x80;
       }
-      if (mode === 'relative') b.angle = normalizeAngle(b.angle + b.exFloats[0]);
-      else if (mode === 'absolute') b.angle = b.exFloats[0];
-      else b.angle = Math.atan2(this.player.y - b.y, this.player.x - b.x) + b.exFloats[0];
-      b.speed = dirSpeed;
+      if (mode === 'relative') b.angle = normalizeAngle(b.angle + d.angle);
+      else if (mode === 'absolute') b.angle = d.angle;
+      else b.angle = Math.atan2(this.player.y - b.y, this.player.x - b.x) + d.angle;
+      b.speed = d.newSpeed;
       speed = b.speed;
     } else {
       speed = b.speed - ((age - interval * times) * b.speed) / interval;
@@ -1011,14 +1007,15 @@ export class StageScene implements GameHost {
 
   private bounceBullet(b: EnemyBullet, includeBottom: boolean): void {
     if (b.x >= 0 && b.x < 384 && b.y >= 0 && (includeBottom ? b.y < 448 : true)) return;
-    const maxTimes = Math.max(1, b.exInts[3] | 0);
+    const bo = b.exBounce!;
+    const maxTimes = Math.max(1, bo.maxTimes | 0);
     if (b.x < 0 || b.x >= 384) b.angle = normalizeAngle(-b.angle - Math.PI);
     if (b.y < 0 || (includeBottom && b.y >= 448)) b.angle = -b.angle;
-    b.speed = b.exFloats[0] > -999 ? b.exFloats[0] : b.speed;
+    b.speed = bo.speed;
     b.vx = Math.cos(b.angle) * b.speed;
     b.vy = Math.sin(b.angle) * b.speed;
     b.dirTimes = (b.dirTimes ?? 0) + 1;
-    if (b.dirTimes >= maxTimes) b.flags &= includeBottom ? ~0x400 : ~0x800;
+    if (b.dirTimes >= maxTimes) b.exFlags &= includeBottom ? ~0x400 : ~0x800;
   }
 
   private updateItems(): void {

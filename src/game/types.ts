@@ -23,10 +23,32 @@ export interface EnemyBullet {
   grazed: boolean;
   spawnDuration: number;
   spawnMoveScale: number;
-  exInts: number[];
-  exFloats: number[];
+  // Activated ex-behavior flags (exe bullet+0xbf4), built at spawn from the
+  // op-79 slots whose opcode bit is in the fire flags AND which pass the
+  // cond gate (FUN_004229f0). Behaviors clear their own bit when they finish.
+  exFlags: number;
+  // Per-behavior params resolved once at spawn from the matching op-79 slot.
+  // null => that behavior did not activate (bit absent from exFlags). Each
+  // maps to the exe's dedicated per-behavior parameter block.
+  exAccel: { mag: number; angle: number; limit: number } | null; // 0x10
+  exAngle: { speedDelta: number; angleDelta: number; limit: number } | null; // 0x20
+  exDir: { angle: number; newSpeed: number; interval: number; maxTimes: number } | null; // 0x40/0x80/0x100
+  exBounce: { speed: number; maxTimes: number } | null; // 0x400/0x800
   dirTimes?: number;
   dead?: boolean;
+}
+
+// One BULLET_EX (op 79) template slot on the firing enemy. op 79 writes slot
+// `index` (arg0); up to 5 persist on the enemy and are snapshotted at each
+// FIRE. Fields mirror the exe's queue entry pfVar1[0..5] (audit-bullet-motion
+// §op79): opcode=arg1, cond=arg2, arg3=duration, arg4=maxTimes, f0/f1=floats.
+export interface BulletExSlot {
+  opcode: number; // 1 ramp / 0x10 accel / 0x20 angle / 0x40|0x80|0x100 dir / 0x400|0x800 bounce
+  cond: number; // arg2: cond gate — a cond==0 slot activates only before any other behavior
+  arg3: number; // duration / interval / limit / bounce-maxTimes
+  arg4: number; // dir-change maxTimes
+  f0: number; // angle / accel-mag / angle-change speedDelta / bounce-speed
+  f1: number; // accel-angle / angle-change angleDelta / dir-change new-speed
 }
 
 export interface EnemyLaser {
@@ -153,8 +175,9 @@ export interface EclState {
   activeTimer: number;
   bulletProps: BulletProps | null;
   bulletSfx: number;
-  bulletExInts: number[];
-  bulletExFloats: number[];
+  // op-79 template slots, indexed by arg0 (0..4). Persist across FIREs (exe
+  // enemy+0x2bf4 table); snapshotted into BulletProps.exSlots at each FIRE.
+  bulletExSlots: (BulletExSlot | null)[];
   shootDisabled: boolean;
   shootInterval: number;
   shootTimer: number;
@@ -237,8 +260,7 @@ export interface BulletProps {
   angle2: number;
   flags: number;
   sfx: number;
-  exInts: number[];
-  exFloats: number[];
+  exSlots: (BulletExSlot | null)[];
   aimMode: number;
 }
 
