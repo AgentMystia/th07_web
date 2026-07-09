@@ -71,6 +71,8 @@ export class StageRuntime {
   private randomItemIndex = 0;
   private randomSpawnIndex = 0;
   bossSlots: (Enemy | null)[] = [];
+  // Th07.exe DAT_00495bf4: true while any boss entity is registered.
+  private bossRegistered = false;
 
   constructor(stage: StageData, anms: { etama: Anm; enemy: Anm; effect: Anm }) {
     this.ecl = new Ecl(stage.ecl);
@@ -86,6 +88,7 @@ export class StageRuntime {
     this.randomItemIndex = 0;
     this.randomSpawnIndex = 0;
     this.bossSlots = [];
+    this.bossRegistered = false;
     this.std.reset();
   }
 
@@ -115,16 +118,10 @@ export class StageRuntime {
           cursor.index++;
           continue;
         }
-        const action = this.runTimelineEvent(game, evt);
+        const action = this.runTimelineEvent(game, evt, t);
         if (action === 'hold') {
           held = true;
           break;
-        }
-        // Timing-audit trace: which timeline fired which event at what
-        // timeline-clock value (scripts/audit code reads this via the test
-        // hook; unused and near-free in normal play).
-        if ((evt.op & 1) === 0 && evt.op <= 6) {
-          this.spawnLog.push({ t, time: evt.time, sub: evt.arg0 });
         }
         cursor.index++;
       }
@@ -132,17 +129,18 @@ export class StageRuntime {
     }
   }
 
-  private runTimelineEvent(game: GameHost, evt: TimelineEvent): 'hold' | null {
+  private runTimelineEvent(game: GameHost, evt: TimelineEvent, t: number): 'hold' | null {
     switch (evt.op) {
       case 0:
       case 2:
       case 4:
       case 6: {
+        // Th07.exe FUN_0041de20 ops 0-7: all timeline spawns are dropped while
+        // DAT_00495bf4 (any boss registered) is set — consumed, not deferred.
+        if (this.bossRegistered) return null;
+        this.spawnLog.push({ t, time: evt.time, sub: evt.arg0 });
         // Spawn enemy. op bit 1 = mirrored (as in TH06's even/odd pairs).
         // TH07-TODO: semantics of bit 2 (ops 4/6) unverified; treated as plain.
-        // No boss-active suppression here: the data's ins_12 holds are the
-        // real coordination (timeline1 deliberately spawns its side fairies
-        // while the timeline0 midboss is still on screen).
         let { x = 0, y = 0, z = 0 } = evt;
         if (x <= -990) x = game.rng.range(384);
         if (y <= -990) y = game.rng.range(448);
@@ -813,6 +811,8 @@ export class StageRuntime {
         s.bossSlot = slot >= 0 ? slot : null;
         s.isBoss = slot >= 0;
         if (s.isBoss) this.bossSlots[slot] = e;
+        // Th07.exe DAT_00495bf4: global flag, set on register, cleared on ins_99(-1).
+        this.bossRegistered = slot >= 0;
         game.setBossPresent?.(s.isBoss, s.isBoss ? e : null);
         return null;
       }
@@ -1062,6 +1062,9 @@ export class StageRuntime {
       this.bossSlots[s.bossSlot] = null;
       game.setBossPresent?.(false, null);
     }
+    // Th07.exe FUN_0041ea00: releasing/culling a registered boss entity clears
+    // the global bossRegistered flag too.
+    if (s.isBoss) this.bossRegistered = false;
   }
 
   killEnemy(game: GameHost, e: Enemy): boolean {
