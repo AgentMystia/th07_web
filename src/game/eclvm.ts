@@ -993,7 +993,10 @@ export class StageRuntime {
       // op number and arg shape are correct; only the renderer-side
       // consumer remains unimplemented (exe-enemy-lasers.md §0).
       case 140:
-        game.configureAmbience?.(op, [v.i32(a), v.i32(a + 4), v.i32(a + 8), v.i32(a + 12)]);
+        // thtk format ffff: read the 4 args as FLOATS (palette/fade), not the
+        // raw i32 bit patterns, so a future configureAmbience consumer gets
+        // 1.0 rather than 1065353216.
+        game.configureAmbience?.(op, [gf(0), gf(4), gf(8), gf(12)]);
         return null;
       // Op 141 (exe case 0x8c): dead jump-table entry in v1.00b -- the
       // exe's own dispatcher routes index 0x8c to the identical

@@ -430,7 +430,13 @@ export class StageScene implements GameHost {
     }
     this.updateItems();
     this.updateParticles();
-    if (p.bombTimer > 0) this.applyBombEffects();
+    // Bomb damage / bullet-cancel is part of the player simulation (exe:
+    // Player::Update owns the bomb), so it freezes with the rest during a
+    // dialogue box -- p.update() (which ticks bombTimer) is already gated on
+    // !frozen above, so without this gate a bomb still active when dialogue
+    // opens would keep dealing 8 dmg/frame for the whole dialogue against a
+    // timer that never decrements (DAT_0061c25c, exe-misc-ecl-ops.md §2).
+    if (!frozen && p.bombTimer > 0) this.applyBombEffects();
     // Bomb over: release the interrupt-gated bomb visuals (label 1 is the
     // fade-out path in the player bomb scripts).
     if (this.prevBombTimer > 0 && p.bombTimer === 0) this.playerEffects.interruptAll(1);
