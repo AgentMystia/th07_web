@@ -8,7 +8,7 @@ import type { GameAssets } from './assets';
 import { AnmRunner, type AnmFrame } from '../formats/anm';
 import { TH07_DATA } from '../data/th07-data';
 import type { AudioBus } from '../audio/audio';
-import { CHARACTERS, Player, type CharacterId, type PlayerBullet } from './player';
+import { CHARACTERS, ENTRANCE_FRAMES, Player, type CharacterId, type PlayerBullet } from './player';
 import { PlayerEffects } from './player-effects';
 import { CherrySystem, BORDER_DURATION, CHERRY_PLUS_MAX } from './cherry';
 import { DialogueRunner, portraitSprite } from './dialogue';
@@ -1023,10 +1023,17 @@ export class StageScene implements GameHost {
         }
       }
       if (p.alive || p.respawnTimer > 0) {
-        const blink = p.invulnFrames > 0 && (this.frame & 2) === 0;
         const pf = p.runner.spriteFrame();
-        if (!blink) r.drawAnmFrame(pf, ox + p.x, oy + p.y);
-        if (this.focusHeld && p.alive) {
+        if (p.entranceTimer > 0) {
+          // Stage-start fly-in: fade the sprite in over its first part; no
+          // invuln blink while entering.
+          const fade = Math.min(1, (ENTRANCE_FRAMES - p.entranceTimer) / 20);
+          r.drawAnmFrame(pf, ox + p.x, oy + p.y, { alpha: fade });
+        } else {
+          const blink = p.invulnFrames > 0 && (this.frame & 2) === 0;
+          if (!blink) r.drawAnmFrame(pf, ox + p.x, oy + p.y);
+        }
+        if (this.focusHeld && p.alive && p.entranceTimer <= 0) {
           r.ctx.fillStyle = '#fff';
           r.ctx.beginPath();
           r.ctx.arc(ox + p.x, oy + p.y, p.hitboxHalf + 1.5, 0, Math.PI * 2);

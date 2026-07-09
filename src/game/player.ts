@@ -92,9 +92,34 @@ const GLIDE_FRAMES = 8;
 // within that cycle.
 const SHOT_CYCLE = 60;
 
+// Player spawn / entrance. The original Th07.exe (v1.00b) Player::Init
+// (fcn.0043f320 @ 0x43f320) places the player directly at the spawn point
+// -- x = fieldW/2 (DAT_0062584c/2.0 @ 0x43f376) -- and enters a 240-frame
+// (0xf0) invulnerability window (fcn.0043e2e0) with no entrance animation:
+// init preloads the materialize-state timer past its 0x1d threshold
+// (fcn.0043e170) so the spawn-in animation is skipped.
+//
+// APPROVED DEVIATION (user-requested stage intro): instead of appearing in
+// place, the player flies up from below the playfield over ENTRANCE_FRAMES
+// before play begins. Input and firing stay locked and the player is
+// invulnerable throughout the fly-in, then the exe-standard 240-frame spawn
+// invulnerability takes over. Respawn after death (die()) reuses this
+// object and does not replay the entrance -- it has its own respawnTimer
+// fly-in (see update()).
+export const ENTRANCE_FRAMES = 60;
+// Local playfield coords: start fully below the 448-tall playfield and ease
+// up to the resting y (432, this codebase's movement-range bottom; kept as
+// the resting position rather than the exe's fieldH-64=384 to match the
+// established player-zone verification baseline).
+const ENTRANCE_START_Y = 480;
+const ENTRANCE_REST_Y = 432;
+// fcn.0043e2e0: 240-frame spawn invulnerability after materializing.
+const SPAWN_INVULN_FRAMES = 240;
+
 export class Player {
   x = 192;
-  y = 432;
+  // Stage start: begin below the playfield for the fly-in (see update()).
+  y = ENTRANCE_START_Y;
   readonly character: CharacterId;
   readonly unfocused: Sht;
   readonly focused: Sht;
@@ -115,6 +140,9 @@ export class Player {
   invulnFrames = 0;
   deathTimer = -1; // counts down the deathbomb window when hit
   respawnTimer = 0;
+  // >0 during the stage-start fly-in; counts down in update(). Stays 0 on
+  // respawn (die() reuses this object and runs its own respawnTimer fly-in).
+  entranceTimer = ENTRANCE_FRAMES;
   bombTimer = 0;
   bombInvuln = 0;
   runner: AnmRunner;
@@ -129,6 +157,9 @@ export class Player {
     this.anm = anms[spec.anmKey];
     this.bombs = Math.trunc(this.unfocused.bombs);
     this.runner = new AnmRunner(this.anm, 0);
+    // Begin the stage-start fly-in: invulnerable through the entrance and
+    // the 240-frame spawn grace that follows it (see update()/entranceTimer).
+    this.invulnFrames = ENTRANCE_FRAMES + SPAWN_INVULN_FRAMES;
   }
 
   get sht(): Sht {
@@ -148,7 +179,9 @@ export class Player {
   }
 
   get controllable(): boolean {
-    return this.deathTimer < 0;
+    // Input is locked during the deathbomb window (deathTimer) and during
+    // the stage-start fly-in (entranceTimer).
+    return this.deathTimer < 0 && this.entranceTimer <= 0;
   }
 
   update(input: InputFrame): void {
@@ -162,9 +195,18 @@ export class Player {
     if (this.invulnFrames > 0) this.invulnFrames--;
     if (this.bombInvuln > 0) this.bombInvuln--;
     if (this.bombTimer > 0) this.bombTimer--;
+    if (this.entranceTimer > 0) {
+      // Stage-start fly-in: ease-out from below the playfield to the rest
+      // point. e = 1-(1-t)^2 rises fast then settles.
+      this.entranceTimer--;
+      const t = 1 - this.entranceTimer / ENTRANCE_FRAMES;
+      const e = 1 - (1 - t) * (1 - t);
+      this.y = ENTRANCE_START_Y + (ENTRANCE_REST_Y - ENTRANCE_START_Y) * e;
+      if (this.entranceTimer === 0) this.y = ENTRANCE_REST_Y;
+    }
     if (this.respawnTimer > 0) {
       this.respawnTimer--;
-      this.y = Math.min(432, this.y - 1.5); // fly in from the bottom
+      this.y = Math.min(ENTRANCE_REST_Y, this.y - 1.5); // fly in from the bottom
     }
     if (this.controllable && this.respawnTimer <= 0) this.move(input);
     this.shooting = input.held.has('shoot') && this.controllable;

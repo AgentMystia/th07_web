@@ -47,6 +47,13 @@ otherwise, the implementation is wrong.
 - Web Audio BGM looping via `loopStart/loopEnd` sample frames from
   `thbgm.fmt` instead of whole-file loops.
 - Plain-text control hints on menu screens.
+- Stage-start player fly-in: the original places the player in-residence at
+  the spawn point with a 240-frame invuln window and no entrance animation
+  (its init preloads the materialize timer past its threshold). On stage
+  start we instead fly the player up from below the playfield over 60
+  frames (input/firing locked, invulnerable), then hand off to that
+  240-frame invuln. Respawn after death is unchanged. Player-only visual;
+  no gameplay, timing, or collision semantics change once landed.
 
 Nothing else. In particular: **no invented visual content**. If the data
 has no moon, there is no moon. Absence of data gets a flagged fallback and
