@@ -1585,8 +1585,9 @@ export class StageScene implements GameHost {
     const s = this.bossActive?.ecl;
     if (!s) return 0;
     if (s.timerCallbackThreshold >= 0) return s.timerCallbackThreshold;
-    const sched = s.scheduledTimerSubs.find((t) => !t.fired);
-    return sched ? sched.time : 6000;
+    // op148 is now an HP-threshold callback (no timer subs remain); fall back
+    // to the default spell-card window.
+    return 6000;
   }
 
   private drawStar(ctx: CanvasRenderingContext2D, cx: number, cy: number, color: string): void {

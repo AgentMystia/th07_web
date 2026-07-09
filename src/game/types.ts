@@ -154,11 +154,9 @@ export interface EclState {
   deathSound: number;
   deathMode: number;
   deathCallbackSub: number;
-  lifeCallbackThreshold: number;
-  lifeCallbackSub: number;
+  lifeThresholds: { threshold: number; sub: number }[];
   timerCallbackThreshold: number;
   timerCallbackSub: number;
-  scheduledTimerSubs: { time: number; sub: number; fired: boolean }[];
   bossTimer: number;
   currentAnm: number;
   anmRunner: AnmRunner | null;

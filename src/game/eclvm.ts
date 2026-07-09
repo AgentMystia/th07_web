@@ -233,11 +233,9 @@ export class StageRuntime {
       deathSound: -1,
       deathMode: 0,
       deathCallbackSub: -1,
-      lifeCallbackThreshold: -1,
-      lifeCallbackSub: -1,
+      lifeThresholds: [{threshold:-1,sub:-1},{threshold:-1,sub:-1},{threshold:-1,sub:-1},{threshold:-1,sub:-1}],
       timerCallbackThreshold: -1,
       timerCallbackSub: -1,
-      scheduledTimerSubs: [],
       bossTimer: 0,
       currentAnm: -1,
       anmRunner: null,
@@ -411,20 +409,28 @@ export class StageRuntime {
   // fires, life callbacks fire on hp < threshold (strict) and clamp hp up.
   private checkCallbacks(game: GameHost, e: Enemy): void {
     const s = e.ecl;
-    if (s.lifeCallbackThreshold >= 0 && s.lifeCallbackSub >= 0 && e.hp < s.lifeCallbackThreshold) {
-      const sub = s.lifeCallbackSub;
-      e.hp = s.lifeCallbackThreshold;
-      s.lifeCallbackThreshold = -1;
-      s.timerCallbackSub = s.deathCallbackSub;
-      this.phaseTransition(game, e, sub);
-      return;
+    // Life callbacks: exe FUN_0041e4a0 scans slots 0..3 in order, fires the
+    // FIRST armed slot with hp < threshold, clamps hp UP to it, and also
+    // cancels any pending timer callback.
+    for (let i = 0; i < 4; i++) {
+      const t = s.lifeThresholds[i];
+      if (t.threshold >= 0 && t.sub >= 0 && e.hp < t.threshold) {
+        e.hp = t.threshold;
+        t.threshold = -1;
+        s.timerCallbackThreshold = -1; // exe: cleared on every life-cb fire
+        s.timerCallbackSub = s.deathCallbackSub;
+        this.phaseTransition(game, e, t.sub);
+        return;
+      }
     }
     if (s.timerCallbackThreshold >= 0 && s.timerCallbackSub >= 0 && s.bossTimer >= s.timerCallbackThreshold) {
       const sub = s.timerCallbackSub;
-      if (s.lifeCallbackThreshold > 0) {
-        e.hp = s.lifeCallbackThreshold;
-        s.lifeCallbackThreshold = -1;
+      // exe FUN_0041e6b0: clamp hp to the LARGEST still-armed life threshold
+      let best = -1, bestIdx = -1;
+      for (let i = 0; i < 4; i++) {
+        if (s.lifeThresholds[i].threshold > best) { best = s.lifeThresholds[i].threshold; bestIdx = i; }
       }
+      if (best > 0 && bestIdx >= 0) { e.hp = best; s.lifeThresholds[bestIdx].threshold = -1; }
       s.timerCallbackThreshold = -1;
       s.timerCallbackSub = s.deathCallbackSub;
       s.bossTimer = 0;
@@ -432,13 +438,6 @@ export class StageRuntime {
       if (s.spellName && !s.spellTimeoutFlag) game.voidSpellCapture?.();
       this.phaseTransition(game, e, sub);
       return;
-    }
-    for (const sched of s.scheduledTimerSubs) {
-      if (!sched.fired && s.bossTimer >= sched.time) {
-        sched.fired = true;
-        this.phaseTransition(game, e, sched.sub);
-        return;
-      }
     }
   }
 
@@ -451,7 +450,6 @@ export class StageRuntime {
     s.bulletRankAmount2Low = 0;
     s.bulletRankAmount2High = 0;
     s.stack.length = 0;
-    s.scheduledTimerSubs.length = 0;
     s.ctx.windowBase = 0;
     if (s.isBoss) this.clearNonBossEnemies(game, e);
     this.enterSub(s, sub);
@@ -832,9 +830,13 @@ export class StageRuntime {
       case 109: s.runInterrupt = v.i32(a); return null;
       case 110: e.hp = e.maxHp = v.i32(a); return null;
       case 111: s.bossTimer = v.i32(a); return null;
-      case 112: s.lifeCallbackThreshold = v.i32(a); return null;
-      case 113: s.lifeCallbackSub = v.i32(a); return null;
-      case 114: s.timerCallbackThreshold = v.i32(a); return null;
+      case 112: s.lifeThresholds[0].threshold = v.i32(a); return null;
+      case 113: s.lifeThresholds[0].sub = v.i32(a); return null;
+      case 114:
+        s.timerCallbackThreshold = v.i32(a);
+        // Th07.exe case 0x71: arming a timer threshold also zeroes the timer.
+        s.bossTimer = 0;
+        return null;
       case 115: s.timerCallbackSub = v.i32(a); return null;
       case 116: s.interactable = !!v.i32(a); return null;
       case 117: game.spawnEffectParticles(v.i32(a), e.x, e.y, v.i32(a + 4), v.u32(a + 8) >>> 0); return null;
@@ -884,8 +886,9 @@ export class StageRuntime {
         game.configureAmbience?.(op, [v.i32(a), v.i32(a + 4), v.i32(a + 8), v.i32(a + 12)]);
         return null;
       case 142: s.param142 = v.i32(a); return null; // TH07-TODO: unknown phase parameter
-      case 148: { // schedule sub at boss timer: (slot?, frames, sub)
-        s.scheduledTimerSubs.push({ time: v.i32(a + 4), sub: v.i32(a + 8), fired: false });
+      case 148: { // Th07.exe FUN_0040f6c0 case 0x93: HP-threshold callback slot
+        const slot = Math.max(0, Math.min(3, v.i32(a)));
+        s.lifeThresholds[slot] = { threshold: v.i32(a + 4), sub: v.i32(a + 8) };
         return null;
       }
       case 154:
@@ -1089,9 +1092,8 @@ export class StageRuntime {
       // invulnerable between phases, and every live phase re-arms damage
       // itself via ins_103(1) (Sub38/39/42/48...).
       s.canTakeDamage = false;
-      s.lifeCallbackThreshold = -1;
+      for (let i = 0; i < 4; i++) s.lifeThresholds[i] = { threshold: -1, sub: -1 };
       s.timerCallbackThreshold = -1;
-      s.scheduledTimerSubs.length = 0;
       s.stack.length = 0;
       s.ctx.windowBase = 0;
       const sub = s.deathCallbackSub;
