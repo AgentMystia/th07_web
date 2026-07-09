@@ -33,6 +33,13 @@ const RANDOM_ITEMS: ItemType[] = [
   'point', 'power', 'bigCherry', 'point', 'point', 'point', 'power', 'bigPower'
 ];
 
+// Th07.exe FUN_004256d0 @ 0x4256d0 builds 11 bullet templates; the graze
+// hitbox is a per-shape FULL width read from the size brackets
+// (0x425a3b/0x425aa5/0x425c14), NOT derived from the sprite rect. Index is the
+// ECL sprite/shape id 0-10. Out-of-table ids fall back to the sprite-fraction
+// approximation at point of use (flagged per AGENTS.md §7).
+const BULLET_HITBOX_BY_SPRITE = [4, 6, 4, 4, 4, 4, 4, 10, 5, 8, 24];
+
 // Special variable ids (reads resolved from game state). Writable general
 // variables live in EclState.vars. Locals (10000..10007) are saved/restored
 // across sub calls, matching the TH06 call-frame behavior.
@@ -766,10 +773,22 @@ export class StageRuntime {
         // ins_91 with a redundant ins_94, so this stays a no-op there.
         this.killNonBossEnemies(game);
         return null;
-      case 92: case 93: { // spawn child enemy: (sub, x, y, z, life, item, score)
+      case 93: { // spawn child enemy relative to parent: (sub, x, y, z, life, item, score)
         this.spawnEclEnemy(game, {
           subId: v.i32(a),
           x: e.x + gf(4), y: e.y + gf(8), z: e.z + gf(12),
+          life: v.i32(a + 16),
+          item: v.i32(a + 20),
+          score: v.i32(a + 24),
+          mirrored: false,
+          parent: e
+        });
+        return null;
+      }
+      case 92: { // Th07.exe case 0x5b: op92 spawns at ABSOLUTE position (op93 = relative)
+        this.spawnEclEnemy(game, {
+          subId: v.i32(a),
+          x: gf(4), y: gf(8), z: gf(12),
           life: v.i32(a + 16),
           item: v.i32(a + 20),
           score: v.i32(a + 24),
@@ -1009,8 +1028,8 @@ export class StageRuntime {
           sprite: p.sprite,
           spriteOffset: p.offset,
           rect,
-          grazeW: Math.max(3, rect.w * 0.4),
-          grazeH: Math.max(3, rect.h * 0.4),
+          grazeW: BULLET_HITBOX_BY_SPRITE[p.sprite] ?? Math.max(3, rect.w * 0.4),
+          grazeH: BULLET_HITBOX_BY_SPRITE[p.sprite] ?? Math.max(3, rect.h * 0.4),
           grazed: false,
           spawnDuration,
           spawnMoveScale,
