@@ -355,7 +355,7 @@ export class StageScene implements GameHost {
     // deathTimer < 0 there).
     if (input.pressed.has('bomb') && (p.controllable || p.deathTimer >= 0) && !this.gameOver) {
       if (p.tryBomb()) {
-        this.cherry.onBomb(this.difficulty);
+        this.cherry.onBomb();
         this.voidSpellCapture();
         this.onBombUsed();
       }

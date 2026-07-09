@@ -71,8 +71,14 @@ export class CherrySystem {
     if (!this.borderActive) return 0;
     this.borderTimer--;
     if (this.borderTimer === 0) {
-      this.cherryMax += 10000;
+      // Th07.exe FUN_0043e620: survive awards +10000 to BOTH cherryMax
+      // (FUN_0042de56) and cherry (FUN_0042de03). The score bonus is the
+      // documented Cherry x10 (the exe reads a persistent CherryMax global
+      // for it whose exact identity is still unresolved — see
+      // reference/re-specs/exe-cherry-border.md — so this uses current cherry).
       const bonus = this.cherry * 10;
+      this.cherryMax += 10000;
+      this.cherry = Math.min(this.cherryMax, this.cherry + 10000);
       this.events.onBorderEnd?.('survived', bonus);
       return bonus;
     }
@@ -116,25 +122,27 @@ export class CherrySystem {
   }
 
   onGraze(focused: boolean): void {
-    if (this.borderActive) {
-      this.cherryMax += focused ? 30 : 80;
-    } else {
-      // TH07-TODO: out-of-border graze cherry gain is undocumented; using +5.
-      this.gain(5);
-    }
+    // Th07.exe FUN_0043bb30: graze raises BOTH cherryMax (FUN_0042de56) and
+    // cherry (FUN_0042de03) by 30 focused / 80 unfocused, unconditionally —
+    // NOT border-gated, and it never touches cherryPlus (graze does not
+    // progress the border; only shot-hits / cherry items / star items via
+    // FUN_0042dc6f do).
+    const amt = focused ? 30 : 80;
+    this.cherryMax += amt;
+    this.cherry = Math.min(this.cherryMax, this.cherry + amt);
   }
 
   onSpellCapture(): void {
     this.spellsCaptured++;
   }
 
-  onBomb(difficulty: number): void {
+  onBomb(): void {
+    // Th07.exe: bombing ends an active border (exe-bombs.md §1, "cancel
+    // border" path) but applies NO cherry/CherryPlus penalty — none of the 24
+    // per-character bomb functions nor the trigger sequence write anything to
+    // the cherry accumulators (exe-bombs.md §1c). The previous
+    // trunc(12000*scale) deduction was fabricated; removed.
     this.breakBorder();
-    // TH07-TODO: exact per-character bomb penalty; base 12000, halved on
-    // Hard, quartered on Lunatic (documented difficulty scaling).
-    const scale = difficulty === 2 ? 0.5 : difficulty === 3 ? 0.25 : 1;
-    this.cherry = Math.max(0, this.cherry - Math.trunc(12000 * scale));
-    this.cherryPlus = 0;
   }
 
   onDeath(lossRatio: number): void {
