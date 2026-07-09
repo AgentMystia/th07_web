@@ -1,5 +1,8 @@
 // Dev screenshot tool: node scripts/dev-shot.mjs <outfile.png> [frames] [query] [heldKeys]
 // e.g. node scripts/dev-shot.mjs /tmp/shot.png 900 "shot=marisaA&difficulty=1" shoot
+// A heldKeys entry prefixed with + (e.g. "shoot,+bomb") is injected as a
+// pressed edge on the first batch only — for actions that need a press edge
+// (bombing) rather than a hold.
 import { chromium } from '@playwright/test';
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -30,12 +33,14 @@ page.on('pageerror', (e) => errors.push(String(e).slice(0, 200)));
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text().slice(0, 200)); });
 await page.goto(`http://127.0.0.1:${port}/index.html?test=1${query ? '&' + query : ''}`);
 await page.waitForFunction(() => window.__TH07_TEST__?.ready, null, { timeout: 20000 });
-const heldKeys = held ? held.split(',') : [];
+const keyArgs = held ? held.split(',') : [];
+const heldKeys = keyArgs.filter((k) => !k.startsWith('+'));
+const pressKeys = keyArgs.filter((k) => k.startsWith('+')).map((k) => k.slice(1));
 for (let done = 0; done < frames; done += 30) {
-  await page.evaluate(({ keys, n }) => {
-    if (keys.length) window.__TH07_TEST__.inject(keys, []);
+  await page.evaluate(({ keys, pressed, n }) => {
+    if (keys.length || pressed.length) window.__TH07_TEST__.inject(keys, pressed);
     window.__TH07_TEST__.advance(n);
-  }, { keys: heldKeys, n: Math.min(30, frames - done) });
+  }, { keys: heldKeys, pressed: done === 0 ? pressKeys : [], n: Math.min(30, frames - done) });
 }
 await page.screenshot({ path: out });
 const snap = await page.evaluate(() => window.__TH07_TEST__.snapshot());

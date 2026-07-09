@@ -26,6 +26,10 @@ export interface AnmEntry {
   width: number;
   height: number;
   format: number;
+  // Global id of this entry's embedded sprite 0 (the running entry base at
+  // parse time). Callers that address an entry's sprites by embedded id must
+  // add this — entry bases depend on every earlier entry's max embedded id.
+  spriteBase: number;
   spriteIds: number[];
   scriptIds: number[];
 }
@@ -85,7 +89,7 @@ export class Anm {
       if (version !== 2) throw new Error(`${this.name}: ANM entry version ${version}, expected 2`);
       const name = v.cstring(entryStart + nameOffset);
       const imageKey = imageKeyFromName(name);
-      const entry: AnmEntry = { name, imageKey, width, height, format, spriteIds: [], scriptIds: [] };
+      const entry: AnmEntry = { name, imageKey, width, height, format, spriteBase: entryBase, spriteIds: [], scriptIds: [] };
 
       let ptr = entryStart + 64;
       let maxEmbedded = -1;

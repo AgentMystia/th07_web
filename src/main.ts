@@ -40,6 +40,7 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
     enemies: scene.enemies.length,
     bullets: scene.enemyBullets.length,
     items: scene.items.length,
+    itemDump: scene.items.slice(0, 12).map((it) => ({ type: it.type, x: Math.round(it.x), y: Math.round(it.y) })),
     timelines: scene.runtime.timelineCursors.map((c) => ({ ...c })),
     bossActive: !!scene.bossActive,
     bossHp: scene.bossActive?.hp ?? null,
@@ -47,8 +48,10 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
     gameOver: scene.gameOver,
     continueActive: !!scene.continueScreen,
     spellName: scene.spellName,
+    spell: scene.spellcard ? { id: scene.spellcard.id, capturing: scene.spellcard.capturing, declAge: scene.spellcard.declAge } : null,
     rngSeed: scene.rng.seed,
     player: { x: scene.playerObj.x, y: scene.playerObj.y, lives: scene.playerObj.lives, bombs: scene.playerObj.bombs, power: scene.playerObj.power },
+    bomb: { timer: scene.playerObj.bombTimer },
     graze: scene.graze,
     playerBullets: scene.playerBullets.length,
     playerBulletDump: scene.playerBullets.slice(0, 8).map((b) => ({

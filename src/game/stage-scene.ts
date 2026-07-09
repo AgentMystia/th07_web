@@ -9,24 +9,32 @@ import { AnmRunner, type AnmFrame } from '../formats/anm';
 import { TH07_DATA } from '../data/th07-data';
 import type { AudioBus } from '../audio/audio';
 import { CHARACTERS, Player, type CharacterId, type PlayerBullet } from './player';
+import { PlayerEffects } from './player-effects';
 import { CherrySystem, BORDER_DURATION, CHERRY_PLUS_MAX } from './cherry';
 import { DialogueRunner, portraitSprite } from './dialogue';
 
 // Stage host. At the M3 milestone this runs the full stage 1 timeline with a
 // movable player stub (no collision yet) so ECL patterns can be verified.
 
-// Item sprites live in etama entry1 (etama2.png); global sprite ids 64+.
+// Item sprites live in etama.anm entry 1 (the etama2.png sheet), addressed
+// here by their entry-embedded ids; add entries[1].spriteBase (168 — entry 0
+// embeds ids 0..167) for the global id. The 16x16 boxed items sit in a row at
+// texture y=64 (crop-verified: red P, blue 点, big red P, green B, yellow F,
+// magenta 1up, grey star, pink petal box), matching the original item order.
 const ITEM_SPRITES: Record<ItemType, number> = {
-  power: 68,
-  point: 69,
-  bigPower: 70,
-  bomb: 71,
-  fullPower: 72,
-  life: 73,
-  cherry: 76, // pink petal
-  bigCherry: 76,
-  pointBullet: 77 // cancel-item triangle
+  power: 4,
+  point: 5,
+  bigPower: 6,
+  bomb: 7,
+  fullPower: 8,
+  life: 9,
+  pointBullet: 10, // grey star box (bullet-cancel item)
+  cherry: 11, // boxed pink petal
+  bigCherry: 11 // TH07-TODO: distinct big-cherry art unconfirmed; shares the box
 };
+// Per-type offscreen indicator arrows sit 10 embedded ids after their item
+// (emb14-21, same order) — drawn while an item is still above the top edge.
+const ITEM_ARROW_OFFSET = 10;
 
 // Per-frame damage cap for a single enemy, from the TH06 engine family; the
 // ECL op 142 parameter appears related but is not yet confirmed (TH07-TODO).
@@ -112,12 +120,28 @@ export class StageScene implements GameHost {
   stageFrame = 0;
   stageClear = false;
   private clearTimer = 0;
-  spellcard: { name: string; id: number; capturing: boolean; bonus: number } | null = null;
+  spellcard: { name: string; id: number; capturing: boolean; bonus: number; declAge: number; portraitSprite: number } | null = null;
   private spellBanner = 0;
   private bonusPopup: { text: string; timer: number } | null = null;
   bossActive: Enemy | null = null;
   bossLifeCount = 0;
   spellName = '';
+  // Session-scoped per-spell attempt/capture tally for the "History n/m"
+  // line of the declaration banner. The original persists this in
+  // score.dat across runs — out of scope here (AGENTS.md §7).
+  private spellHistory = new Map<number, { seen: number; got: number }>();
+  // Latched when the pre-boss dialogue starts: stage 1's ename.png rows are
+  // 0 = Cirno (midboss, no dialogue) and 1 = Letty (after the dialogue) —
+  // stage-1 heuristic, TH07-TODO a data-driven boss->nameplate mapping.
+  private dialogueSeen = false;
+  private eff01Pattern: CanvasPattern | null = null;
+
+  // Global sprite id of etama entry 1's embedded sprite 0 (the etama2.png
+  // item sheet); see ITEM_SPRITES above.
+  private readonly etamaItemBase: number;
+  // Script-driven bomb visuals (see spawnBombEffects).
+  private readonly playerEffects: PlayerEffects;
+  private prevBombTimer = 0;
 
   constructor(private assets: GameAssets, private audio: AudioBus, difficulty = 1, character: CharacterId = 'reimuA') {
     this.difficulty = difficulty;
@@ -126,7 +150,9 @@ export class StageScene implements GameHost {
       enemy: assets.anms.stg1enm,
       effect: assets.anms.eff01
     });
+    this.etamaItemBase = assets.anms.etama.entries[1].spriteBase;
     this.playerObj = new Player(character, assets.anms);
+    this.playerEffects = new PlayerEffects(this.playerObj.anm);
     this.player = this.playerObj;
   }
 
@@ -214,10 +240,19 @@ export class StageScene implements GameHost {
 
   startBossSpell(spellId: number, arg0: number, name: string): void {
     this.spellName = name;
+    // Stage-1 spell ownership decoded from ecldata1 op 90: ids 0-1 are the
+    // Cirno midboss cards (霜符「フロストコラムス」), 2-9 Letty's — picks
+    // the face_01_00 cutin portrait (sprite 3 = Cirno, 0 = Letty).
+    const portraitSprite = spellId <= 1 ? 3 : 0;
     // TH07-TODO: exact per-spell capture bonus values.
-    this.spellcard = { name, id: spellId, capturing: true, bonus: 100000 + spellId * 10000 };
+    this.spellcard = { name, id: spellId, capturing: true, bonus: 100000 + spellId * 10000, declAge: 0, portraitSprite };
     this.spellBanner = 150;
+    const tally = this.spellHistory.get(spellId) ?? { seen: 0, got: 0 };
+    tally.seen++;
+    this.spellHistory.set(spellId, tally);
     this.playSfx(12);
+    // Declaration charge burst at the boss (se_cat00 above is the charge SE).
+    if (this.bossActive) this.spawnEffectParticles(3, this.bossActive.x, this.bossActive.y, 24, 0xffffffff);
   }
 
   endBossSpell(): void {
@@ -225,6 +260,8 @@ export class StageScene implements GameHost {
       const bonus = this.spellcard.bonus;
       this.addScore(bonus);
       this.cherry.onSpellCapture();
+      const tally = this.spellHistory.get(this.spellcard.id);
+      if (tally) tally.got++;
       this.bonusPopup = { text: `Spell Card Bonus! ${bonus.toLocaleString('en-US')}`, timer: 180 };
       this.playSfx(28);
     } else if (this.spellcard) {
@@ -306,12 +343,14 @@ export class StageScene implements GameHost {
     if (death === 'died') this.onPlayerDeath();
     if (!this.gameOver) {
       for (const b of p.fire()) {
+        if (b.behaviorFunc === 4) this.aimBulletAtSpawn(b);
         this.playerBullets.push(b);
       }
       if (p.shooting && this.frame % 8 === 0) this.playSfx(0);
     }
     this.stageFrame++;
     if (this.dialogue) {
+      this.dialogueSeen = true;
       this.dialogue.update(input.pressed.has('shoot') || input.held.has('skip'));
       if (this.dialogue.resumeTicket) {
         this.dialogue.resumeTicket = false;
@@ -320,6 +359,7 @@ export class StageScene implements GameHost {
       if (this.dialogue.done) this.dialogue = null;
     }
     if (this.spellBanner > 0) this.spellBanner--;
+    if (this.spellcard) this.spellcard.declAge++;
     if (this.bonusPopup && --this.bonusPopup.timer <= 0) this.bonusPopup = null;
     if (!this.stageClear && this.runtime.isTimelineComplete() && !this.bossActive && this.enemies.length <= 1) {
       this.clearTimer++;
@@ -338,12 +378,93 @@ export class StageScene implements GameHost {
     this.updateItems();
     this.updateParticles();
     if (p.bombTimer > 0) this.applyBombEffects();
+    // Bomb over: release the interrupt-gated bomb visuals (label 1 is the
+    // fade-out path in the player bomb scripts).
+    if (this.prevBombTimer > 0 && p.bombTimer === 0) this.playerEffects.interruptAll(1);
+    this.prevBombTimer = p.bombTimer;
+    this.playerEffects.update();
     if (this.score > this.hiScore) this.hiScore = this.score;
   }
 
   private onBombUsed(): void {
     this.playSfx(12);
     this.spawnEffectParticles(3, this.playerObj.x, this.playerObj.y, 24, 0xffffffff);
+    this.spawnBombEffects();
+  }
+
+  // Bomb visuals, per shot type, from the character's own playerXX.anm bomb
+  // scripts (decoded from the embedded data; script ids and their behavior
+  // are the original's, the spawn cadence/anchor offsets below are flagged
+  // approximations — the exe routine that places them is not reimplemented;
+  // AGENTS.md §7).
+  private spawnBombEffects(): void {
+    const p = this.playerObj;
+    const fx = this.playerEffects;
+    const dur = p.bombTimer;
+    switch (p.character) {
+      case 'reimuA': {
+        // 夢想封印: colored orbs (player00.anm scr133-136, offset-mode wander
+        // + interrupt-1 fade) drifting outward in two waves.
+        for (let wave = 0; wave < 2; wave++) {
+          for (let i = 0; i < 4; i++) {
+            const angle = -Math.PI / 2 + (i - 1.5) * 0.55 + (wave ? 0.27 : 0);
+            fx.spawn({
+              scriptId: 133 + i,
+              x: p.x, y: p.y,
+              vx: Math.cos(angle) * 1.1,
+              vy: Math.sin(angle) * 1.1,
+              delay: wave * 40
+            });
+          }
+        }
+        break;
+      }
+      case 'reimuB':
+        // 封魔陣: the big seal circles (scr141-143) plus the four cross
+        // beams sweeping out from the cast point (scr137-140).
+        for (const id of [141, 142, 143, 137, 138, 139, 140]) fx.spawn({ scriptId: id, x: p.x, y: p.y });
+        break;
+      case 'marisaA':
+        // スターダストレヴァリエ: magic circle (scr71) at the cast point;
+        // star bursts (scr98-104) respawn per-frame in applyBombEffects.
+        fx.spawn({ scriptId: 71, x: p.x, y: p.y, ttl: dur });
+        break;
+      case 'marisaB':
+        // マスタースパーク: magic circle (scr72) + the star-column beam
+        // layers (scr73-78, interrupt-1 releases their fade) tiled up the
+        // playfield from the muzzle; bursts along the beam come from
+        // applyBombEffects.
+        fx.spawn({ scriptId: 72, x: p.x, y: p.y, ttl: dur });
+        for (let tier = 0; tier < 3; tier++) {
+          const y = p.y - 56 - tier * 94;
+          fx.spawn({ scriptId: 73 + tier, x: p.x, y });
+          fx.spawn({ scriptId: 76 + tier, x: p.x, y });
+        }
+        break;
+      case 'sakuyaA': {
+        // 殺人ドール: a ring of knives (scr5/6 trails) thrown outward, with
+        // the red/blue "world" squares (scr9/10) flashing at the cast point.
+        fx.spawn({ scriptId: 9, x: p.x, y: p.y });
+        fx.spawn({ scriptId: 10, x: p.x, y: p.y });
+        for (let i = 0; i < 16; i++) {
+          const angle = (i / 16) * Math.PI * 2;
+          fx.spawn({
+            scriptId: 5 + (i & 1),
+            x: p.x, y: p.y,
+            vx: Math.cos(angle) * 3.2,
+            vy: Math.sin(angle) * 3.2,
+            rotation: angle + Math.PI / 2
+          });
+        }
+        break;
+      }
+      case 'sakuyaB':
+        // プライベートスクウェア: the staggered grow/shrink world squares
+        // (scr9-12) under the two slow-rotating additive overlays (scr13/14,
+        // ~300f — the time-stop tint for the whole bomb).
+        for (const id of [9, 10, 11, 12, 13, 14]) fx.spawn({ scriptId: id, x: p.x, y: p.y - 96 });
+        break;
+    }
   }
 
   private applyBombEffects(): void {
@@ -355,6 +476,23 @@ export class StageScene implements GameHost {
         this.spawnItem('pointBullet', b.x, b.y, { state: 1 });
         b.dead = true;
       }
+    }
+    // Marisa's bombs continuously pop star bursts (player01.anm scr98-104)
+    // — around the player for A, along the spark beam for B (cadence
+    // approximated, AGENTS.md §7).
+    const p = this.playerObj;
+    if (p.character === 'marisaA' && this.frame % 4 === 0) {
+      this.playerEffects.spawn({
+        scriptId: 98 + this.rng.u32InRange(7),
+        x: p.x + this.rng.range(192) - 96,
+        y: p.y - this.rng.range(224)
+      });
+    } else if (p.character === 'marisaB' && this.frame % 3 === 0) {
+      this.playerEffects.spawn({
+        scriptId: 98 + this.rng.u32InRange(7),
+        x: p.x + this.rng.range(48) - 24,
+        y: p.y - 40 - this.rng.range(280)
+      });
     }
   }
 
@@ -368,6 +506,7 @@ export class StageScene implements GameHost {
       this.spawnItem('power', p.x + this.rng.range(64) - 32, p.y - this.rng.range(32));
     }
     for (const b of this.enemyBullets) b.dead = true;
+    this.playerEffects.clear();
     p.die();
     if (p.lives < 0) {
       this.gameOver = true;
@@ -435,7 +574,12 @@ export class StageScene implements GameHost {
     for (const b of this.playerBullets) {
       b.age++;
       if (b.state === 'fired') {
-        if (b.shotType === 1) this.steerHomingBullet(b);
+        // shotType 1 = ReimuA homing amulets; 2 = her focused variant (SHT
+        // spawns those at speed 2 — the exe routine both steers and
+        // accelerates them; rates shared with type 1/3 are a flagged
+        // approximation, AGENTS.md §7).
+        if (b.shotType === 2 && b.age > 8) b.speed = Math.min(12, b.speed + 0.4);
+        if (b.shotType === 1 || b.shotType === 2) this.steerHomingBullet(b);
         else if (b.shotType === 3 && b.age > 8) {
           // Accelerating shots (MarisaA missiles).
           b.speed = Math.min(14, b.speed + 0.4);
@@ -456,8 +600,10 @@ export class StageScene implements GameHost {
         if (Math.abs(b.x - e.x) <= hw && Math.abs(b.y - e.y) <= hh) {
           this.damageEnemy(e, b.damage);
           this.cherry.onShotHit(this.focusHeld);
-          if (b.shotType === 4) {
-            // Piercing shots (MarisaB laser) pass through.
+          if (b.shotType === 4 || b.shotType === 5) {
+            // Piercing shots pass through (MarisaB lasers; type 5 is her
+            // focused laser — SHT funcs[2] = 1, the suspected pierce flag.
+            // TH07-TODO: exe confirmation).
             b.damage = Math.max(1, Math.trunc(b.damage / 2));
           } else {
             b.state = 'collided';
@@ -475,17 +621,24 @@ export class StageScene implements GameHost {
     this.playerBullets.length = w;
   }
 
-  private steerHomingBullet(b: PlayerBullet): void {
+  // Nearest damageable enemy to (x, y); shared by the homing steer and the
+  // SakuyaA focused spawn-aim.
+  private findAimTarget(x: number, y: number): Enemy | null {
     let best: Enemy | null = null;
     let bestDist = 1e9;
     for (const e of this.enemies) {
       if (!e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.canTakeDamage) continue;
-      const d = (e.x - b.x) ** 2 + (e.y - b.y) ** 2;
+      const d = (e.x - x) ** 2 + (e.y - y) ** 2;
       if (d < bestDist) {
         bestDist = d;
         best = e;
       }
     }
+    return best;
+  }
+
+  private steerHomingBullet(b: PlayerBullet): void {
+    const best = this.findAimTarget(b.x, b.y);
     if (!best) return;
     const target = Math.atan2(best.y - b.y, best.x - b.x);
     let diff = target - b.angle;
@@ -493,6 +646,22 @@ export class StageScene implements GameHost {
     while (diff < -Math.PI) diff += Math.PI * 2;
     const turn = 0.18;
     b.angle += Math.max(-turn, Math.min(turn, diff));
+    b.vx = Math.cos(b.angle) * b.speed;
+    b.vy = Math.sin(b.angle) * b.speed;
+  }
+
+  // SHT behavior func 0 == 4 (every ply02as shooter): the knife aims at an
+  // enemy the moment it spawns, keeping its small per-shooter spread relative
+  // to the aim direction — SakuyaA's focused shot converges on one target.
+  // Snap-aim (vs a continuous steer) is a flagged approximation of the exe
+  // routine the index selects (AGENTS.md §7); with no target it flies by its
+  // table angle. behaviorFunc 5 (SakuyaB) is intentionally not handled —
+  // semantics unknown, knives fly straight per the table (AGENTS.md §7).
+  private aimBulletAtSpawn(b: PlayerBullet): void {
+    const target = this.findAimTarget(b.x, b.y);
+    if (!target) return;
+    const spread = b.angle - -Math.PI / 2; // table angle relative to straight up
+    b.angle = Math.atan2(target.y - b.y, target.x - b.x) + spread;
     b.vx = Math.cos(b.angle) * b.speed;
     b.vy = Math.sin(b.angle) * b.speed;
   }
@@ -791,6 +960,7 @@ export class StageScene implements GameHost {
       const ox = PLAYFIELD.x;
       const oy = PLAYFIELD.y;
       this.drawBackground(r, ox, oy);
+      this.drawSpellBackground(r);
       for (const p of this.particles) {
         const alpha = 1 - p.age / p.life;
         r.ctx.globalAlpha = alpha * 0.8;
@@ -817,12 +987,15 @@ export class StageScene implements GameHost {
         });
       }
       for (const it of this.items) {
-        const sprite = this.assets.anms.etama.sprites.get(ITEM_SPRITES[it.type]);
+        // Items falling above the top edge peek in as their per-type arrow
+        // sprite (original UX; etama2 emb14-21, +10 from the item id).
+        const above = it.y < 0;
+        const emb = ITEM_SPRITES[it.type] + (above ? ITEM_ARROW_OFFSET : 0);
+        const sprite = this.assets.anms.etama.sprites.get(this.etamaItemBase + emb);
         if (sprite) {
-          // Items falling above the top edge peek in as arrows (original UX).
           const drawY = Math.max(8, it.y);
           r.drawSprite(sprite.imageKey, sprite.x, sprite.y, sprite.w, sprite.h, ox + it.x, oy + drawY, {
-            alpha: it.y < 0 ? 0.55 : 1
+            alpha: above ? 0.85 : 1
           });
         }
       }
@@ -835,6 +1008,7 @@ export class StageScene implements GameHost {
           scaleMultiplier: b.state === 'collided' ? 1 + b.hitAge / 10 : 1
         });
       }
+      this.playerEffects.draw(r, ox, oy);
       // Option orbs (yin-yang, local sprite 128).
       if (p.alive && p.power >= 8) {
         const orbSprite = p.anm.sprites.get(128) ?? p.anm.sprites.get(66);
@@ -862,6 +1036,7 @@ export class StageScene implements GameHost {
         }
       }
       if (this.cherry.borderActive) this.drawBorder(r, ox, oy);
+      this.drawSpellDeclaration(r, ox, oy);
     });
     this.drawFrame(r);
     this.drawSidebar(r);
@@ -1123,13 +1298,104 @@ export class StageScene implements GameHost {
     }
   }
 
+  // Spellcard background: the scrolling eff01 sheet over the 3D scene while
+  // a card is active. Open-coded from eff01.anm script 0 — cornerRel quad at
+  // (32,16) sized 384x448 (a tiled view of the 256x256 texture), alpha
+  // 0->255 over 60 frames, then a per-frame loop shifting u +0.004167 and
+  // v -0.008333. Not run through AnmRunner: the script's op-4 frame-reset
+  // loop would pin the frame-keyed fade interpolation near zero.
+  private drawSpellBackground(r: Renderer): void {
+    const sc = this.spellcard;
+    if (!sc) return;
+    const img = r.image('eff01');
+    if (!img) return;
+    if (!this.eff01Pattern) this.eff01Pattern = r.ctx.createPattern(img, 'repeat');
+    if (!this.eff01Pattern) return;
+    const ctx = r.ctx;
+    const u = 0.004167 * 256 * sc.declAge;
+    const v = -0.008333 * 256 * sc.declAge;
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, sc.declAge / 60);
+    ctx.translate(PLAYFIELD.x - u, PLAYFIELD.y - v);
+    ctx.fillStyle = this.eff01Pattern;
+    ctx.fillRect(u, v, PLAYFIELD.width, PLAYFIELD.height);
+    ctx.restore();
+  }
+
+  // Declaration-time effects drawn over the playfield entities: the teal
+  // flash (capture.anm scr0: full-playfield quad, color 0x10c0e0, 30-frame
+  // fade in/out — its runtime '@' texture is not extractable, so a flat
+  // tint approximates it) and the boss portrait cutin sweep (face_01_00,
+  // the dialogue portrait art; path/timing approximated — AGENTS.md §7).
+  private drawSpellDeclaration(r: Renderer, ox: number, oy: number): void {
+    const sc = this.spellcard;
+    if (!sc) return;
+    const t = sc.declAge;
+    const ctx = r.ctx;
+    if (t < 60) {
+      const flash = (t < 30 ? t / 30 : 1 - (t - 30) / 30) * 0.5;
+      ctx.save();
+      ctx.globalAlpha = flash;
+      ctx.fillStyle = 'rgb(16,192,224)';
+      ctx.fillRect(ox, oy, PLAYFIELD.width, PLAYFIELD.height);
+      ctx.restore();
+    }
+    if (t < 110) {
+      const sprite = this.assets.anms.face_01_00.sprites.get(sc.portraitSprite);
+      const img = r.image('face_01_00');
+      if (sprite && img) {
+        const p = t / 110;
+        const scale = 0.85;
+        const w = sprite.w * scale;
+        const h = sprite.h * scale;
+        const x = ox + PLAYFIELD.width * 0.62 - w / 2;
+        // Ease-out vertical sweep, fading in and back out at the ends.
+        const ease = 1 - (1 - p) * (1 - p);
+        const y = oy + PLAYFIELD.height / 2 - h / 2 + 140 - ease * 280;
+        const alpha = Math.min(1, Math.min(p, 1 - p) * 5) * 0.55;
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.drawImage(img, sprite.x, sprite.y, sprite.w, sprite.h, x, y, w, h);
+        ctx.restore();
+      }
+    }
+  }
+
   private drawSpellOverlay(r: Renderer): void {
     if (!this.spellName) return;
-    const slide = Math.max(0, this.spellBanner - 90) / 60;
-    const x = PLAYFIELD.x + PLAYFIELD.width - 12 - slide * 200;
-    r.text(this.spellName, x, PLAYFIELD.y + 22, { size: 13, color: '#fdd', align: 'right' });
-    if (this.spellcard) {
-      r.text(`Bonus ${this.spellcard.capturing ? this.spellcard.bonus.toLocaleString('en-US') : 'failed'}`, PLAYFIELD.x + PLAYFIELD.width - 12, PLAYFIELD.y + 40, { size: 11, color: this.spellcard.capturing ? '#adf' : '#977', align: 'right' });
+    const sc = this.spellcard;
+    const declAge = sc?.declAge ?? 999;
+    const ctx = r.ctx;
+    // Declaration window: the name rides a red ribbon banner in the lower
+    // third, with Bonus / History beneath (text.anm's pre-rendered banner
+    // textures are not extractable — r.text over a gradient approximates
+    // the original look); afterwards it rests top-right under the HP bar.
+    const declPhase = Math.min(1, Math.max(0, (declAge - 120) / 30));
+    const slideIn = Math.min(1, declAge / 20);
+    const bannerY = PLAYFIELD.y + 300;
+    const restY = PLAYFIELD.y + 22;
+    const y = bannerY + (restY - bannerY) * declPhase;
+    const xRest = PLAYFIELD.x + PLAYFIELD.width - 12;
+    const xBanner = PLAYFIELD.x + PLAYFIELD.width - 16 + (1 - slideIn) * 120;
+    const x = xBanner + (xRest - xBanner) * declPhase;
+    if (declPhase < 1) {
+      const bannerAlpha = (1 - declPhase) * slideIn;
+      const grad = ctx.createLinearGradient(PLAYFIELD.x, 0, PLAYFIELD.x + PLAYFIELD.width, 0);
+      grad.addColorStop(0, 'rgba(160,16,16,0)');
+      grad.addColorStop(0.55, 'rgba(190,24,24,0.75)');
+      grad.addColorStop(1, 'rgba(120,8,8,0.9)');
+      ctx.save();
+      ctx.globalAlpha = bannerAlpha;
+      ctx.fillStyle = grad;
+      ctx.fillRect(PLAYFIELD.x, y - 13, PLAYFIELD.width, 18);
+      ctx.restore();
+    }
+    r.text(this.spellName, x, y, { size: 13, color: '#fee', align: 'right' });
+    if (sc) {
+      const tally = this.spellHistory.get(sc.id);
+      const history = tally ? `  history ${tally.got}/${tally.seen}` : '';
+      const bonusText = sc.capturing ? `Bonus ${sc.bonus.toLocaleString('en-US')}${history}` : `Bonus failed${history}`;
+      r.text(bonusText, x, y + 18, { size: 11, color: sc.capturing ? '#adf' : '#977', align: 'right' });
     }
   }
 
@@ -1262,6 +1528,12 @@ export class StageScene implements GameHost {
       }
       const seconds = Math.max(0, Math.trunc((this.timerThreshold() - this.bossActive.ecl.bossTimer) / 60));
       this.drawNumber(r, seconds, PLAYFIELD.x + PLAYFIELD.width - 20, PLAYFIELD.y + 4, 2);
+      // Boss nameplate: ename.png 16px rows composited at (32,26) (AGENTS.md
+      // §6). Row selection is the stage-1 heuristic from dialogueSeen (0 =
+      // Cirno midboss, 1 = Letty after the pre-boss dialogue).
+      if (!this.dialogue) {
+        this.blit(r, 'ename', [0, this.dialogueSeen ? 16 : 0, 128, 16], 32, 26);
+      }
       // Enemy position marker on the bottom edge (PCB feature).
       const bx = PLAYFIELD.x + Math.max(0, Math.min(PLAYFIELD.width, this.bossActive.x));
       ctx.fillStyle = '#f8bcd0';

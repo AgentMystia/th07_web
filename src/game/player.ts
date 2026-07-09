@@ -37,6 +37,9 @@ export interface PlayerBullet {
   speed: number;
   damage: number;
   shotType: number;
+  // ShtShot.funcs[0], the spawn-time behavior selector: 4 = aim at an enemy
+  // at spawn (SakuyaA focused); 5 = unknown SakuyaB variant (flies straight).
+  behaviorFunc: number;
   hitboxW: number;
   hitboxH: number;
   sfxId: number; // from ShtShot.sfxId; playback not wired up (stage-scene.ts uses a fixed fire sound instead)
@@ -229,6 +232,7 @@ export class Player {
         speed: shot.speed,
         damage: shot.damage,
         shotType: shot.shotType,
+        behaviorFunc: shot.funcs[0],
         hitboxW: shot.hitboxW,
         hitboxH: shot.hitboxH,
         sfxId: shot.sfxId,

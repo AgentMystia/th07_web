@@ -146,7 +146,7 @@ Standard stage checkpoints (dev-shot frame → machine-checkable criteria):
 | 800 | enemies >0, bullets >0 (Lunatic) | all three `ground-*` textured; `sky` flat |
 | 2500 | score >0 when `shoot` held | `cherry-banner` texture ≥15% |
 | 3400 | — | `sky`/`ground-*` avgs visibly darker than at 800 (dark-purple fog section) |
-| 5600–6200 | `boss:true`, `spell` non-empty at spell phases | `ground-*` all textured (boss-loop background — no fog-colored void) |
+| 5600–6200 | `boss:true`, `spell` non-empty at spell phases | `ground-*` all textured (boss-loop background — no fog-colored void). While a spellcard is ACTIVE the playfield reads the scrolling eff01 sheet instead (dark purple, texture ≥10%) |
 
 Menus (`dev-menu.mjs`): each step's snapshot must report the expected
 `scene`/`cursor`/`difficultyName`/`character`/`shotType`; after the final
@@ -254,11 +254,21 @@ comparisons against real play).
 - Frame tiling positions (exact-fit math, engine placement not literal).
 - HUD star icon x positions; spell-timer and fps exact placement.
 - Cherry+ banner interrupt→state mapping (dim=charging, bright=border).
-- Bombs are functionally accurate first-pass; per-type visuals and exact
-  damage/cancel cadence not yet exe-verified.
+- Bomb mechanics are functionally accurate first-pass; damage/cancel cadence
+  not yet exe-verified. Bomb visuals run the characters' own playerXX.anm
+  bomb scripts (Reimu scr133–143, Marisa scr71–78/98–104, Sakuya scr5–14 —
+  decoded from the embedded data), but the spawn cadence/anchor offsets in
+  `StageScene#spawnBombEffects` approximate the exe's placement routine.
 - ECL per-frame damage cap 70 inherited from the TH06 family (op 142
   parameter suspected related, unconfirmed).
 - `ins_30/31` render flags unknown (no-op everywhere, matches PyTouhou).
+- Spell declaration presentation: the eff01.anm background script is
+  open-coded (its op-4 loop defeats AnmRunner's frame-keyed fades); the
+  capture.anm flash draws as a flat teal tint (its runtime `'@'` texture is
+  not extractable); the face_01_00 cutin sweep path/timing and the red
+  name-banner gradient (text.anm textures not extractable) are hand-tuned;
+  spell history is session-scoped (original persists in score.dat);
+  ename nameplate row picked by the stage-1 dialogueSeen heuristic.
 
 ## 8. Pitfall catalog (check these FIRST when something looks wrong)
 
