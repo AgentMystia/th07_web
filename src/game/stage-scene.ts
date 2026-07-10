@@ -36,10 +36,6 @@ const ITEM_SPRITES: Record<ItemType, number> = {
 // (emb14-21, same order) — drawn while an item is still above the top edge.
 const ITEM_ARROW_OFFSET = 10;
 
-// Per-frame damage cap for a single enemy, from the TH06 engine family; the
-// ECL op 142 parameter appears related but is not yet confirmed (TH07-TODO).
-const ENEMY_FRAME_DAMAGE_CAP = 70;
-
 // front.png sprite rects [x,y,w,h], recovered from front.anm's entry0 sprite
 // table (see the HUD spec derived by thanm -l7 disassembly). The original
 // HUD blits these directly rather than typesetting text, so we do the same.
@@ -91,7 +87,10 @@ export class StageScene implements GameHost {
   playerBullets: PlayerBullet[] = [];
   graze = 0;
   pointItems = 0;
-  private frameDamage = new Map<number, number>();
+  // Th07.exe DAT_012f40bc: latched to the spell-active state at each bomb
+  // trigger — bomb damage during a spell card is 0 until a bomb has been
+  // triggered during that spell (anti pre-bomb rule, disasm @ 0x41faeb).
+  private bombDuringSpell = false;
   // Th07.exe FUN_00446970: the 5-slot SE queue drops a request whose id is
   // already queued this service cycle — net effect, any SE id plays at most
   // once per frame no matter how many requests (bug 2: se_damage00 spam).
@@ -126,7 +125,22 @@ export class StageScene implements GameHost {
   stageFrame = 0;
   stageClear = false;
   private clearTimer = 0;
-  spellcard: { name: string; id: number; capturing: boolean; bonus: number; declAge: number; portraitSprite: number } | null = null;
+  spellcard: {
+    name: string;
+    id: number;
+    capturing: boolean;
+    // Live decaying capture bonus, Th07.exe FUN_0040ee30 @ 0x40ee30:
+    // base from the per-spell table @ 0x4951a8; decays by
+    // base/(timerSeconds+10) per second while the capture is valid;
+    // grazes add 2500 + floor(cherry/1500)*20 (FUN_0043bb30, all.c:27969).
+    bonus: number;
+    bonusBase: number;
+    decayPerSec: number;
+    grazeBonus: number;
+    elapsed: number;
+    declAge: number;
+    portraitSprite: number;
+  } | null = null;
   private spellBanner = 0;
   private bonusPopup: { text: string; timer: number } | null = null;
   bossActive: Enemy | null = null;
@@ -260,8 +274,26 @@ export class StageScene implements GameHost {
     // Cirno midboss cards (霜符「フロストコラムス」), 2-9 Letty's — picks
     // the face_01_00 cutin portrait (sprite 3 = Cirno, 0 = Letty).
     const portraitSprite = spellId <= 1 ? 3 : 0;
-    // TH07-TODO: exact per-spell capture bonus values.
-    this.spellcard = { name, id: spellId, capturing: true, bonus: 100000 + spellId * 10000, declAge: 0, portraitSprite };
+    // Per-spell base bonus, Th07.exe table @ 0x4951a8 (ids 0-9 = stage 1;
+    // read from the exe binary): Cirno cards 2.0M, Ringing Cold 2.2M
+    // (E/N) / 2.4M (H/L per id), finals 2.4M. Decay divisor uses the boss's
+    // timer-callback threshold armed before the declare (enemy+0x2edc).
+    const SPELL_BONUS_BASE = [2000000, 2000000, 2200000, 2200000, 2400000, 2400000, 2400000, 2400000, 2400000, 2400000];
+    const base = SPELL_BONUS_BASE[spellId] ?? 2000000;
+    const timerFrames = this.bossActive?.ecl.timerCallbackThreshold ?? -1;
+    const timerSec = timerFrames > 0 ? Math.trunc(timerFrames / 60) : 50;
+    this.spellcard = {
+      name,
+      id: spellId,
+      capturing: true,
+      bonus: base,
+      bonusBase: base,
+      decayPerSec: Math.trunc(base / (timerSec + 10)),
+      grazeBonus: 0,
+      elapsed: 0,
+      declAge: 0,
+      portraitSprite
+    };
     this.spellBanner = 150;
     const tally = this.spellHistory.get(spellId) ?? { seen: 0, got: 0 };
     tally.seen++;
@@ -273,8 +305,12 @@ export class StageScene implements GameHost {
 
   endBossSpell(): void {
     if (this.spellcard?.capturing) {
-      const bonus = this.spellcard.bonus;
-      this.addScore(bonus);
+      // Th07.exe FUN_0040f340 @ 0x40f340: award = decayed base + graze
+      // additions; the banner shows the full value while the score field
+      // gains value/10 (same 10:1 display convention as point items —
+      // score += uVar6/10 at all.c:6644).
+      const bonus = this.spellcard.bonus + this.spellcard.grazeBonus;
+      this.addScore(Math.trunc(bonus / 10));
       this.cherry.onSpellCapture();
       const tally = this.spellHistory.get(this.spellcard.id);
       if (tally) tally.got++;
@@ -289,6 +325,10 @@ export class StageScene implements GameHost {
 
   voidSpellCapture(): void {
     if (this.spellcard) this.spellcard.capturing = false;
+  }
+
+  onBossPhaseTimeout(): void {
+    this.cherry.onBossTimeout();
   }
 
   setBossPresent(present: boolean, enemy: Enemy | null): void {
@@ -346,7 +386,6 @@ export class StageScene implements GameHost {
       if (++this.stageClearTimer > 480) this.exitToTitle();
     }
     const p = this.playerObj;
-    this.frameDamage.clear();
     this.sfxPlayedThisFrame.clear();
     // During a story-dialogue box the player keeps FULL movement control, as
     // in the original PCB: only damage is suspended. What freezes is the rest
@@ -367,6 +406,9 @@ export class StageScene implements GameHost {
       if (p.tryBomb()) {
         this.cherry.onBomb();
         this.voidSpellCapture();
+        // Th07.exe bomb trigger @ all.c:28503-28506: zeroes the pending
+        // spell bonus and latches DAT_012f40bc = spell-active state.
+        this.bombDuringSpell = this.spellcard !== null;
         this.onBombUsed();
       }
     }
@@ -408,7 +450,18 @@ export class StageScene implements GameHost {
       if (this.dialogue.done) this.dialogue = null;
     }
     if (this.spellBanner > 0) this.spellBanner--;
-    if (this.spellcard) this.spellcard.declAge++;
+    if (this.spellcard) {
+      this.spellcard.declAge++;
+      // Bonus decay runs only while the capture is still valid (exe gates
+      // the decay on DAT_012f40a4, all.c:7331); floored to tens like the
+      // exe's floor10 write at all.c:7334.
+      const sc = this.spellcard;
+      if (sc.capturing) {
+        sc.elapsed++;
+        const decayed = sc.bonusBase - Math.trunc((sc.decayPerSec * sc.elapsed) / 60);
+        sc.bonus = Math.max(0, decayed - (decayed % 10));
+      }
+    }
     if (this.bonusPopup && --this.bonusPopup.timer <= 0) this.bonusPopup = null;
     if (!this.stageClear && this.runtime.isTimelineComplete() && !this.bossActive && this.enemies.length <= 1) {
       this.clearTimer++;
@@ -533,8 +586,11 @@ export class StageScene implements GameHost {
     // region at 8 dmg/frame. Full 24-state-machine fidelity out of scope;
     // flagged per AGENTS.md §7. No full-screen sweep exists in the exe.
     for (const e of this.enemies) {
-      if (!e.ecl.canTakeDamage || !e.ecl.interactable) continue;
-      if (Math.abs(e.x - p.x) <= 128 && Math.abs(e.y - p.y) <= 128) this.damageEnemy(e, 8);
+      // shotCollision: bomb damage flows through the same bit4-gated hit
+      // test as shots (Th07.exe FUN_0041ed50) — emitters with op104=0 are
+      // bomb-immune too.
+      if (!e.ecl.canTakeDamage || !e.ecl.interactable || !e.ecl.shotCollision) continue;
+      if (Math.abs(e.x - p.x) <= 128 && Math.abs(e.y - p.y) <= 128) this.damageEnemy(e, 8, 'bomb');
     }
     for (const b of this.enemyBullets) {
       if (b.dead) continue;
@@ -639,26 +695,56 @@ export class StageScene implements GameHost {
     this.onExitToTitle?.();
   }
 
-  // Returns the actually-applied damage (post frame-cap), 0 if none — the
-  // shot-hit cherry formula (cherry.ts onShotHit) needs this real amount,
-  // not the raw pre-clamp bullet damage.
-  damageEnemy(e: Enemy, damage: number): number {
-    if (!e.ecl.canTakeDamage || !e.ecl.interactable || e.ecl.invisible) return 0;
-    const done = this.frameDamage.get(e.id) ?? 0;
-    const allowed = Math.max(0, ENEMY_FRAME_DAMAGE_CAP - done);
-    const applied = Math.min(allowed, damage);
-    if (applied <= 0) return 0;
-    this.frameDamage.set(e.id, done + applied);
-    e.hp -= applied;
-    // Th07.exe FUN_0041ed50 @ all.c:14220: score += ((applied/5)*10)/10 --
-    // the "*10)/10" is a compiler no-op (exact multiple of 10 divided back
-    // down), collapsing to score += floor(min(70,applied)/5); the min(70,..)
-    // cap ("if (0x45 < local_1c) local_1c = 0x46;") is unconditional, unlike
-    // the cherry-gain divisor logic above it. Confirmed against the HUD's
-    // raw "%.8d"/"%.9d" digit format (no display-side rescale anywhere) --
-    // see EXECUTION-LOG.md's score-unit adjudication.
-    this.addScore(Math.trunc(Math.min(70, applied) / 5));
-    return applied;
+  // Accumulates a hit into the enemy's per-frame damage pool; the pool is
+  // settled once per frame by settlePendingDamage() through the exe's exact
+  // pipeline (Th07.exe FUN_0041ed50). NOT gated on canTakeDamage — in the
+  // exe, hits on an invulnerable boss still award score and cherry (the
+  // bit2 check only guards the HP subtraction).
+  damageEnemy(e: Enemy, damage: number, kind: 'shot' | 'bomb' = 'shot'): void {
+    if (!e.ecl.interactable || e.ecl.invisible) return;
+    // Th07.exe FUN_0043a980 @ 0x43a9e6: while the player's own bomb is
+    // active (player+0x16a20), each SHOT deals table/3 damage, min 1.
+    if (kind === 'shot' && this.playerObj.bombTimer > 0) {
+      damage = Math.max(1, Math.trunc(damage / 3));
+    }
+    if (kind === 'shot') e.pendingShotDmg += damage;
+    else e.pendingBombDmg += damage;
+  }
+
+  // Th07.exe FUN_0041ed50 damage pipeline (all.c:14174-14253), run once per
+  // enemy per frame:
+  //   raw = this frame's shot+bomb sum (shots pre-scaled /3 during a bomb)
+  //   cherry gain from the PRE-cap raw sum (its own internal 70 cap)
+  //   raw capped at 70 (0x46 @ all.c:14226 — TH07-confirmed, not TH06 lore)
+  //   score += capped/5
+  //   if canTakeDamage:
+  //     spell card active (DAT_012f40a8): shots-only → /7 (min 1);
+  //       any bomb contribution → 0 unless a bomb was triggered during this
+  //       spell (DAT_012f40bc latch), then /2.5 (min 1; DAT_0048eda8=2.5,
+  //       disasm @ 0x41fafa-0x41fb0e)
+  //     op-142 shield active: boss → /9, non-boss → 0
+  //     hp -= result
+  private settlePendingDamage(e: Enemy): void {
+    const raw = e.pendingShotDmg + e.pendingBombDmg;
+    const hadBomb = e.pendingBombDmg > 0;
+    e.pendingShotDmg = 0;
+    e.pendingBombDmg = 0;
+    if (raw <= 0) return;
+    // exe-cherry-border.md §3a: DAT_00625627 (raw difficulty*2+shotTypeBit)
+    // gates a parity quirk in the shot-hit cherry formula. shotTypeBit is
+    // the low bit of that byte; this port's "A"/"B" suffix is the analogue.
+    const shotTypeBit = this.playerObj.character.endsWith('B') ? 1 : 0;
+    this.cherry.onShotHit(raw, e.ecl.isBoss, this.difficulty, shotTypeBit, (e.ecl.bossTimer & 1) === 1);
+    let dmg = Math.min(70, raw);
+    this.addScore(Math.trunc(dmg / 5));
+    if (!e.ecl.canTakeDamage) return;
+    if (this.spellcard) {
+      if (!hadBomb) dmg = dmg >= 8 ? Math.trunc(dmg / 7) : dmg > 0 ? 1 : 0;
+      else if (!this.bombDuringSpell) dmg = 0;
+      else dmg = dmg > 2 ? Math.trunc(dmg / 2.5) : dmg > 0 ? 1 : 0;
+    }
+    if (e.ecl.damageShield > 0) dmg = e.ecl.isBoss ? Math.trunc(dmg / 9) : 0;
+    e.hp -= dmg;
   }
 
   private updatePlayerBullets(): void {
@@ -667,15 +753,13 @@ export class StageScene implements GameHost {
     // the eligible enemy minimizing |e.x - player.x| (Y ignored entirely).
     // Reset+repopulated once per frame here, not per-bullet.
     const px = this.playerObj.x;
-    // exe-cherry-border.md §3a: DAT_00625627 (raw difficulty*2+shotTypeBit)
-    // gates a parity quirk in the shot-hit cherry formula. shotTypeBit is
-    // the low bit of that byte (spec §3d: DAT_00625626 = byte&1); this
-    // port's "A"/"B" shot suffix is the closest available analogue.
-    const shotTypeBit = this.playerObj.character.endsWith('B') ? 1 : 0;
     let homingTarget: Enemy | null = null;
     let homingBestDx = Infinity;
     for (const e of this.enemies) {
-      if (!e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.canTakeDamage) continue;
+      // The exe's homing-target repopulate lives inside the bit4-gated shot
+      // block (FUN_0041ed50 all.c:14258+) — shot-transparent emitters are
+      // never homing candidates.
+      if (!e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.canTakeDamage || !e.ecl.shotCollision) continue;
       const dx = Math.abs(e.x - px);
       if (dx < homingBestDx) {
         homingBestDx = dx;
@@ -700,7 +784,9 @@ export class StageScene implements GameHost {
       }
       if (b.state !== 'fired') continue;
       for (const e of this.enemies) {
-        if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead) continue;
+        // Exe shot gate is bit0 (interactable) && bit4 (shotCollision) —
+        // NOT bit1 (collisionEnabled), which only covers body-vs-player.
+        if (!e.ecl.shotCollision || !e.ecl.interactable || e.ecl.invisible || e.dead) continue;
         const hw = (e.ecl.hitbox.x + b.hitboxW) / 2;
         const hh = (e.ecl.hitbox.y + b.hitboxH) / 2;
         if (Math.abs(b.x - e.x) <= hw && Math.abs(b.y - e.y) <= hh) {
@@ -708,17 +794,9 @@ export class StageScene implements GameHost {
             // Th07.exe FUN_0043a980: lasers deal FULL table damage on even values
             // of their own age counter only, never enter 'collided', never spawn
             // the hit effect/SE, and pierce indefinitely (no damage decay).
-            if ((b.age & 1) === 0) {
-              const applied = this.damageEnemy(e, b.damage);
-              if (applied > 0) {
-                this.cherry.onShotHit(applied, e.ecl.isBoss, this.difficulty, shotTypeBit, (e.ecl.bossTimer & 1) === 1);
-              }
-            }
+            if ((b.age & 1) === 0) this.damageEnemy(e, b.damage);
           } else {
-            const applied = this.damageEnemy(e, b.damage);
-            if (applied > 0) {
-              this.cherry.onShotHit(applied, e.ecl.isBoss, this.difficulty, shotTypeBit, (e.ecl.bossTimer & 1) === 1);
-            }
+            this.damageEnemy(e, b.damage);
             b.state = 'collided';
             if (b.shotType !== 3) {
               // Th07.exe: velocity/8 on hit — except shotType 3 (MarisaA missile)
@@ -744,7 +822,7 @@ export class StageScene implements GameHost {
     let best: Enemy | null = null;
     let bestDist = 1e9;
     for (const e of this.enemies) {
-      if (!e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.canTakeDamage) continue;
+      if (!e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.canTakeDamage || !e.ecl.shotCollision) continue;
       const d = (e.x - x) ** 2 + (e.y - y) ** 2;
       if (d < bestDist) {
         bestDist = d;
@@ -834,10 +912,7 @@ export class StageScene implements GameHost {
       if (!b.grazed && b.age > 15 && dx <= b.grazeW / 2 + p.grazeboxHalf + 20 && dy <= b.grazeH / 2 + p.grazeboxHalf + 20) {
         // exe: 16-frame minimum age before graze eligibility
         b.grazed = true;
-        this.graze++;
-        this.addScore(200); // Th07.exe FUN_0043bb30: +200 per graze
-        this.cherry.onGraze(this.focusHeld);
-        this.playSfx(24);
+        this.onGrazeAward();
       }
       // exe FUN_004241c0: kill test runs from spawn; only graze has a min age (outer gate +0xbf0 unresolved)
       if (dx <= b.grazeW / 2 + hit && dy <= b.grazeH / 2 + hit) {
@@ -864,12 +939,24 @@ export class StageScene implements GameHost {
       if (Math.abs(e.x - px) <= e.ecl.hitbox.x / 1.4 + p.grazeboxHalf + 20 &&
           Math.abs(e.y - py) <= e.ecl.hitbox.y / 1.4 + p.grazeboxHalf + 20) {
         this.bodyGrazeCooldown.set(e.id, 6);
-        this.graze++;
-        this.addScore(200);
-        this.cherry.onGraze(this.focusHeld);
-        this.playSfx(24);
+        this.onGrazeAward();
       }
     }
+  }
+
+  // Th07.exe FUN_0043bb30 (shared graze routine): +200 score, cherry/
+  // cherryMax gain, and — while a spell card is up — the pending capture
+  // bonus grows by 2500 + floor(cherry/1500)*20 (all.c:27969; the exe
+  // accumulator DAT_012f40b0 is reset at each declare, so accumulating
+  // only while a card is active is equivalent).
+  private onGrazeAward(): void {
+    this.graze++;
+    this.addScore(200);
+    this.cherry.onGraze(this.focusHeld);
+    if (this.spellcard) {
+      this.spellcard.grazeBonus += 2500 + Math.trunc(this.cherry.cherry / 1500) * 20;
+    }
+    this.playSfx(24);
   }
 
   private onPlayerHit(): void {
@@ -884,6 +971,11 @@ export class StageScene implements GameHost {
 
   private updateEnemies(): void {
     for (const e of this.enemies) {
+      // Settle last frame's shot/bomb damage through the exe pipeline
+      // before the ECL runs, so life-threshold callbacks see the new HP —
+      // same relative order as Th07.exe FUN_0041ed50 (hit test, damage,
+      // then FUN_0041e4a0/FUN_0041e6b0 callbacks in the same pass).
+      this.settlePendingDamage(e);
       e.frame++;
       this.runtime.updateEnemy(this, e);
     }
@@ -1588,7 +1680,7 @@ export class StageScene implements GameHost {
     if (sc) {
       const tally = this.spellHistory.get(sc.id);
       const history = tally ? `  history ${tally.got}/${tally.seen}` : '';
-      const bonusText = sc.capturing ? `Bonus ${sc.bonus.toLocaleString('en-US')}${history}` : `Bonus failed${history}`;
+      const bonusText = sc.capturing ? `Bonus ${(sc.bonus + sc.grazeBonus).toLocaleString('en-US')}${history}` : `Bonus failed${history}`;
       r.text(bonusText, x, y + 18, { size: 11, color: sc.capturing ? '#adf' : '#977', align: 'right' });
     }
   }

@@ -11,6 +11,7 @@ interface TestHook {
   ready: boolean;
   advance(n: number): void;
   setLives(n: number): void;
+  setInvuln(frames: number): void;
   snapshot(): Record<string, unknown>;
   pixelAt(x: number, y: number): number[];
   setPlayer(x: number, y: number): void;
@@ -205,6 +206,10 @@ async function boot(): Promise<void> {
       // no-dodge headless run would otherwise die before reaching. Same
       // spirit as setPower/addCherry above.
       setLives: (n: number) => { if (stage) stage.playerObj.lives = n; },
+      // Test-only, same spirit as setLives: hold spawn-invulnerability so
+      // probes can observe full bullet patterns without death-wipes
+      // (player death clears all enemy bullets) resetting the field.
+      setInvuln: (frames: number) => { if (stage) stage.playerObj.invulnFrames = frames; },
       bgm: () => ({ active: audio.active, decoded: audio.decodedTracks })
     };
   }

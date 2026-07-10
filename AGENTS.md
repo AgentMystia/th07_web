@@ -277,8 +277,12 @@ comparisons against real play).
   bomb scripts (Reimu scr133–143, Marisa scr71–78/98–104, Sakuya scr5–14 —
   decoded from the embedded data), but the spawn cadence/anchor offsets in
   `StageScene#spawnBombEffects` approximate the exe's placement routine.
-- ECL per-frame damage cap 70 inherited from the TH06 family (op 142
-  parameter suspected related, unconfirmed).
+- Spell-bonus decay rounding: exe writes `floor10(ftol(<register-arg float
+  expr>))` per frame (0x41f8a8 region); the port computes
+  `floor10(base − decayPerSec·elapsed/60)`. Sub-10-point drift only.
+  (The damage cap 70 and op 142 are no longer approximations: cap
+  confirmed at all.c:14226; op 142 = N-frame damage shield, boss /9 /
+  non-boss 0, countdown at all.c:14440 — see FIX_LOG 2026-07-10.)
 - `ins_30/31` render flags unknown (no-op everywhere, matches PyTouhou).
 - Spell declaration presentation: the eff01.anm background script is
   open-coded (its op-4 loop defeats AnmRunner's frame-keyed fades); the

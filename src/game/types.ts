@@ -133,6 +133,10 @@ export interface GameHost {
   spawnEnemyDeathEffect?(e: Enemy): void;
   turnBulletsIntoPointItems(): void;
   configureAmbience?(op: number, args: number[]): void;
+  // Boss timer-callback fired with the ECL "timeout is normal" flag unset
+  // (exe flags +0x2e2a bit6 == 0): cherry -25% (FUN_0041e6b0's
+  // floor10(cherry*0.25) penalty) — applies to nonspell timeouts too.
+  onBossPhaseTimeout?(): void;
   unpauseStd(): void;
 }
 
@@ -187,7 +191,12 @@ export interface EclState {
   canTakeDamage: boolean;
   collisionEnabled: boolean;
   interactable: boolean;
-  hitSound: number;
+  // Th07.exe enemy flags +0x2e29 bit4 (op 104, dispatcher case 0x67): gates
+  // the entire player-shot/bomb hit test (FUN_0041ed50 @ all.c:14174-14176)
+  // — a 0 makes the enemy shot-transparent (no damage, no shot absorption,
+  // no homing eligibility). Distinct from collisionEnabled (bit1, op 102),
+  // which gates only the enemy-body-vs-player check.
+  shotCollision: boolean;
   deathMode: number;
   deathCallbackSub: number;
   lifeThresholds: { threshold: number; sub: number }[];
@@ -242,11 +251,14 @@ export interface EclState {
   // false -- ordinary enemies get culled once seen-then-offscreen.
   offscreenCullExempt: boolean;
   // Op 142 (exe case 0x8d @ 0x413.. -> `+0x4f40/+0x4f3c/+0x4f38`): PROBABLE
-  // boss-phase damage-reduction/grace timer (dmg/9 if boss else 0 while
-  // active) per exe-misc-ecl-ops.md §5; stored only, not decremented or
-  // consumed -- the exe's own decrement/countdown mechanism was not
-  // located (UNRESOLVED), so wiring the gate itself would be invented.
-  param142: number;
+  // op 142 damage shield, frames remaining (exe enemy+0x4f40, case 0x8d):
+  // while > 0, settled damage is /9 for bosses and 0 for non-bosses
+  // (FUN_0041ed50 @ all.c:14245). Decrement located: the enemy loop ticks
+  // the {+0x4f38,+0x4f3c,+0x4f40} countdown via FUN_00436a06(1) each frame
+  // while > 0 (all.c:14440) — resolves exe-misc-ecl-ops.md §5's UNRESOLVED.
+  // Every stage-1 spell card arms it at declare (Cirno 60f, Ringing Cold
+  // 300f, finals 360/240/240f).
+  damageShield: number;
 }
 
 export interface BulletProps {
@@ -271,6 +283,11 @@ export interface Enemy {
   z: number;
   hp: number;
   maxHp: number;
+  // Damage taken this frame, settled once per frame through the exe's
+  // pipeline (Th07.exe FUN_0041ed50: cherry from the pre-cap sum, cap 70,
+  // spell-card /7, op-142 shield /9) — see StageScene#settlePendingDamage.
+  pendingShotDmg: number;
+  pendingBombDmg: number;
   score: number;
   frame: number;
   dead?: boolean;

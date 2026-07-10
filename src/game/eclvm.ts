@@ -245,6 +245,8 @@ export class StageRuntime {
       x, y, z,
       hp: hasLife ? life | 0 : 1,
       maxHp: hasLife ? life | 0 : 1,
+      pendingShotDmg: 0,
+      pendingBombDmg: 0,
       score: hasScore ? score | 0 : 100,
       frame: 0,
       ecl: this.makeEnemyState(subId, mirrored, item, parent)
@@ -294,7 +296,8 @@ export class StageRuntime {
       canTakeDamage: true,
       collisionEnabled: true,
       interactable: true,
-      hitSound: -1,
+      shotCollision: true, // default bit4=1, Th07.exe FUN_0041d190 @ 0x41d190
+
       deathMode: 0,
       deathCallbackSub: -1,
       lifeThresholds: [{threshold:-1,sub:-1},{threshold:-1,sub:-1},{threshold:-1,sub:-1},{threshold:-1,sub:-1}],
@@ -338,7 +341,7 @@ export class StageRuntime {
       seen: false,
       bodyRegrazeFlag: false,
       offscreenCullExempt: false,
-      param142: 0
+      damageShield: 0
     };
   }
 
@@ -468,6 +471,9 @@ export class StageRuntime {
     // value for this frame's gate.
     const active = s.activeTimer > 0;
     if (active) s.activeTimer--;
+    // op-142 damage shield counts down once per frame while armed (exe
+    // FUN_00436a06(1) on the +0x4f38 struct, all.c:14440).
+    if (s.damageShield > 0) s.damageShield--;
     this.applyMovement(e, active);
     s.frameVx = e.x - prevX;
     s.frameVy = e.y - prevY;
@@ -577,6 +583,10 @@ export class StageRuntime {
       s.bossTimer = 0;
       // Timing out voids the spell capture unless the ECL flagged otherwise.
       if (s.spellName && !s.spellTimeoutFlag) game.voidSpellCapture?.();
+      // Exe timer-callback path (all.c:13820-13840, gated on the same
+      // +0x2e2a bit6 flag): cherry -25% penalty — fires on nonspell
+      // timeouts as well, not just spell cards.
+      if (!s.spellTimeoutFlag) game.onBossPhaseTimeout?.();
       this.phaseTransition(game, e, sub);
       return;
     }
@@ -997,7 +1007,11 @@ export class StageRuntime {
       case 101: s.hitbox = { x: gf(0), y: gf(4), z: gf(8) }; return null;
       case 102: s.collisionEnabled = !!v.i32(a); return null;
       case 103: s.canTakeDamage = !!v.i32(a); return null;
-      case 104: s.hitSound = v.i32(a); return null; // TH07-TODO verify
+      // Player-shot collision enable — Th07.exe dispatcher case 0x67 writes
+      // bit4 of enemy+0x2e29; FUN_0041ed50 (all.c:14174) runs the player
+      // shot/bomb hit test only when bit0 && bit4. Stage 1 subs 36/41/43/
+      // 50/54/57 (boss emitter children) set 0 = shot-transparent.
+      case 104: s.shotCollision = (v.i32(a) & 1) !== 0; return null;
       // Op 105 (exe case 0x68 @ 0x413bf6, FUN_00446970): IMMEDIATE PlaySE --
       // requests SFX playback of the (possibly variable-resolved) arg the
       // instant this instruction runs, deduped against up to 5 pending IDs.
@@ -1108,7 +1122,9 @@ export class StageRuntime {
       // in the exe (exe-misc-ecl-ops.md §5, UNRESOLVED). Stored only --
       // wiring the damage gate without a confirmed decay path would be
       // invented behavior, not a transcription.
-      case 142: s.param142 = v.i32(a); return null;
+      // op 142: N-frame damage shield (exe case 0x8d writes enemy+0x4f40;
+      // gate at FUN_0041ed50 all.c:14245: boss dmg/9, non-boss dmg=0).
+      case 142: s.damageShield = v.i32(a); return null;
       case 148: { // Th07.exe FUN_0040f6c0 case 0x93: HP-threshold callback slot
         const slot = Math.max(0, Math.min(3, v.i32(a)));
         s.lifeThresholds[slot] = { threshold: v.i32(a + 4), sub: v.i32(a + 8) };

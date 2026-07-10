@@ -7,6 +7,110 @@ stage-1 ECL dump (`reference/re-specs/stage1-ecl-dump.txt`). Newest first.
 
 ---
 
+## 2026-07-10 — exe-faithful damage pipeline (fixes "spell card HP melts too fast" for Cirno + Letty)
+
+**Symptom reported:** Cirno's spell card (and Letty's) die far too fast vs
+vanilla; user asked for exe-exact per-phase HP and player shot damage.
+
+**Per-phase HP was already exe-correct** (Cirno 10000 nonspell → 1200 spell
+via the op-148 life threshold; Letty 15000/1700/15000/2000). The real gap
+was the DAMAGE side: Th07.exe applies several reductions our engine lacked.
+Decoded from FUN_0041ed50 @ 0x41ed50 (+ disassembly for the register-arg
+sites) and FUN_0043a980 @ 0x43a980:
+
+1. **Spell card active → shot damage /7** (raw < 8 → 1). Gate global is
+   DAT_012f40a8, set by op 90 declare (FUN_0040ee30), cleared by op 91.
+   With the per-frame cap this bounds spells to ≤10 HP/frame from shots.
+2. **Per-enemy per-frame damage cap 70** — now TH07-CONFIRMED
+   (`0x46` @ all.c:14226), no longer TH06 lore. Applied to the frame SUM,
+   after cherry accrual (cherry uses the pre-cap sum).
+3. **op 142 = N-frame damage shield** (enemy+0x4f40, case 0x8d; countdown
+   FUN_00436a06(1) @ all.c:14440): boss damage /9, non-boss 0. Every
+   stage-1 spell arms it at declare: Cirno 60f, Ringing Cold 300f, finals
+   360/240/240f. Resolves exe-misc-ecl-ops.md §5's UNRESOLVED decrement.
+4. **While the player's bomb is active, shots do table/3 (min 1)**
+   (FUN_0043a980, player+0x16a20 gate).
+5. **Bomb damage during a spell = 0** unless a bomb was triggered during
+   that spell (DAT_012f40bc latch @ 0x41faeb); then /2.5 min 1
+   (DAT_0048eda8 = 2.5, read from the exe binary).
+6. **Score/cherry accrue even on invulnerable bosses** — the canTakeDamage
+   bit only guards the HP subtraction in the exe; shots absorbed during
+   declare still feed score + cherry.
+7. **Boss timer-callback timeout costs 25% cherry** (FUN_0041e6b0 path,
+   all.c:13820-13840, gated on the op-135 flag) — applies to nonspell
+   timeouts too. cherry.onBossTimeout existed but was never wired; now is.
+8. **Real spell capture bonus**: base table @ 0x4951a8 (stage-1 ids 0-9:
+   2.0M/2.0M/2.2M/2.2M/2.4M×6), decays base/(timerSec+10) per second while
+   capture valid, +2500+floor(cherry/1500)·20 per graze (all.c:27969);
+   banner shows the full value, score += value/10 (all.c:6644). Replaces
+   the fabricated `100000 + spellId*10000`. Sanity check vs the user's
+   vanilla screenshot: Ringing Cold -Lunatic- base 2.4M, timer 3000f →
+   decay 40000/s → +1766840 banner ≈ capture at ~15.8s. ✓
+
+**Implementation:** damage is now accumulated per enemy per frame
+(`Enemy.pendingShotDmg/pendingBombDmg`) and settled once per frame through
+the exe pipeline (`StageScene#settlePendingDamage`), replacing the per-hit
+`frameDamage` ledger. Cherry's onShotHit moves to the settled pre-cap sum
+(exe order), fixing per-hit-vs-per-frame divisor rounding drift.
+
+### Verification (Lunatic, ReimuA power 128, constant fire, no cheats)
+Phase durations: Cirno nonspell 27.9s, **Frost Columns 17.8s** (was ~2s),
+Letty nonspell-1 18.2s, Ringing Cold 21.9s, nonspell-2 16.2s, Table Turning
+31.8s. Full fight, 0 page errors; tsc clean; 24/24 tests.
+
+### Known approximations (flagged)
+- Bonus decay rounding: exe writes floor10(ftol(<hidden float expr>)) per
+  frame; we compute floor10(base − decay·elapsed/60). Sub-10-point drift.
+- Bomb damage cadence itself is still the flat 8/frame 128px approximation
+  (AGENTS.md §7); only its interaction rules (/3 shots, spell-zero latch,
+  /2.5) are exe-derived.
+
+---
+
+## 2026-07-10 — op 104 = player-shot collision gate (fixes Letty nonspell 2 "spawns no bullets", emitter survival everywhere)
+
+**Symptom reported:** Letty's 2nd nonspell spawns no bullets in real play.
+
+**Root cause:** op 104 was decoded as `HIT_SOUND` (TH07-TODO, stored and
+ignored). Th07.exe dispatcher `case 0x67` actually writes **bit4 of the
+enemy flag byte `+0x2e29`**, and the master enemy loop `FUN_0041ed50`
+(all.c:14174-14176) runs the player-shot/bomb hit test `FUN_0043a980` only
+when `bit0 && bit4`. Default is bit4=1 (`FUN_0041d190 @ 0x41d190`). Stage 1
+sets `op104 = 0` in subs **36/41/43/50/54/57** — every boss *emitter child*
+(Letty nonspell-1 sweep children, nonspell-2 orbiting orbs, Ringing Cold
+emitters, all three final-spell snowflake/orb spawners). In the exe these
+are **shot-transparent**: player shots pass straight through (no damage, no
+shot absorption, no homing eligibility — the homing-target repopulate at
+all.c:14258 is *inside* the bit4-gated block).
+
+Our engine ignored the flag, so every 1-HP (`life=1`) emitter died to the
+player's shot stream the frame it spawned — patterns only appeared if the
+player stopped firing. Measured (Lunatic, power 128, holding shoot):
+nonspell-2 bullets 0 → **413 peak** after the fix; ring-sweep children now
+reach 20 concurrent; final spell reaches 386 bullets with 5 snowflakes.
+
+**Also corrected:** the player-bullet loop previously gated shot collision
+on `collisionEnabled` (bit1, op 102) — the exe uses bit1 only for the
+enemy-body-vs-player check; shots use bit4. Bomb damage and homing/aim
+target selection now respect the same gate (both sit inside the gated block
+in the exe).
+
+### Files
+- `types.ts`/`eclvm.ts`: `EclState.hitSound` → `shotCollision` (default
+  true); op 104 sets it.
+- `stage-scene.ts`: shot loop gates on `shotCollision` (not
+  `collisionEnabled`); homing cache, `findAimTarget`, and bomb damage add
+  the gate.
+- `main.ts`: test-only `setInvuln` hook (same spirit as `setLives`) so
+  probes can watch full patterns without death-wipes clearing bullets.
+
+### Verification
+`npm run check` clean, 24/24 tests, full Lunatic probe to Letty phases 1-4
+with no page errors; nonspell-2 peak screenshot matches the user's vanilla
+reference (dense blue-ball spray from three orbiting emitters).
+
+---
+
 ## 2026-07-10 — op-79 ex-behaviors: per-slot params + cond gate (fixes Cirno "frozen/supersonic", Letty "supersonic")
 
 **Symptoms reported:** Cirno's nonspell froze (or went supersonic); Letty's
