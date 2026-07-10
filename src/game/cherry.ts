@@ -151,12 +151,14 @@ export class CherrySystem {
   // tier this port doesn't have (difficultyIndex is 0..3), so it's omitted
   // too — not a fidelity gap, just dead code under this port's difficulty
   // range.
-  //   divisor = isBoss ? 10 - floor(min(difficulty*2,10)/3)
-  //                     : 30 - min(difficulty*2,10)
+  //   local14 = stage < 5 ? stage*2 : 10          (all.c:13997-14003 —
+  //     DAT_0062583c is the STAGE NUMBER, not a difficulty tier;
+  //     spec-extra-phantasm.md §0 corrected the old reading)
+  //   divisor = isBoss ? 10 - floor(local14/3) : 30 - local14
   //   gain = min(70, floor(damage/divisor) * 10)
   //   if gain == 0 and bossTimerOdd: gain = 10
-  //   if (difficulty==0 and shotTypeBit==0) and gain in {20,30} and
-  //      bossTimerOdd: gain -= 10
+  //   if shotTypeBit==0 (type-A shot, DAT_00625627=='\0') and gain in
+  //      {20,30} and bossTimerOdd: gain -= 10      (all.c:14198-14202)
   // `bossTimerOdd` is bit0 of the enemy's own boss-phase timer field
   // (`enemyFlags_2bcc`, PROBABLE identity — spec §3a/§5 item 3); this port
   // exposes the same counter as `Enemy.ecl.bossTimer`, which is 0 (hence
@@ -165,16 +167,15 @@ export class CherrySystem {
   onShotHit(
     damage: number,
     isBoss: boolean,
-    difficultyIndex: number,
+    stageNumber: number,
     shotTypeBit: number,
     bossTimerOdd: boolean
   ): void {
-    const local14 = Math.min(difficultyIndex * 2, 10);
+    const local14 = stageNumber < 5 ? stageNumber * 2 : 10;
     const divisor = isBoss ? 10 - Math.floor(local14 / 3) : 30 - local14;
     let g = Math.min(70, Math.floor(damage / divisor) * 10);
     if (g === 0 && bossTimerOdd) g = 10;
-    const difficultyByte = difficultyIndex * 2 + shotTypeBit;
-    if (difficultyByte === 0 && (g === 20 || g === 30) && bossTimerOdd) g -= 10;
+    if (shotTypeBit === 0 && (g === 20 || g === 30) && bossTimerOdd) g -= 10;
     this.gain(g);
   }
 

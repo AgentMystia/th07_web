@@ -104,6 +104,36 @@ const DIGIT_Y = 208;
 // quad is drawn in full every frame with plenty of headroom to spare.
 const BG_MAX_CELL_STEPS = 24;
 
+// Th07.exe spell-card base-bonus table @ 0x4951a8, int32[141] (one entry
+// per spell id 0-140), read directly from the binary — see
+// spec-extra-phantasm.md §6c. Stage ranges: 0-9 s1, 10-25 s2, 26-43 s3,
+// 44-67 s4, 68-87 s5, 88-115 s6 (112-115 = the secret 反魂蝶 set),
+// 116-127 Extra, 128-140 Phantasm.
+const SPELL_BONUS_BASE = [
+  2000000, 2000000, 2200000, 2200000, 2400000, 2400000, 2400000, 2400000, 2400000, 2400000,
+  2600000, 2600000, 2600000, 2600000, 2600000, 2600000, 2600000, 2600000, 2600000, 2600000,
+  2600000, 2600000, 2600000, 2600000, 2600000, 2600000,
+  3000000, 3000000, 3000000, 3000000, 3000000, 3000000, 3000000, 3000000, 3000000, 3000000,
+  3000000, 3000000, 3000000, 3000000, 3000000, 3000000, 3000000, 3000000,
+  3500000, 3500000, 3500000, 3500000, 3500000, 3500000, 3500000, 3500000, 3500000, 3500000,
+  3500000, 3500000, 3500000, 3500000, 3500000, 3500000, 3500000, 3500000, 3500000, 3500000,
+  3500000, 3500000, 3500000, 3500000,
+  4000000, 4000000, 4000000, 4000000, 4000000, 4000000, 4000000, 4000000, 4000000, 4000000,
+  4000000, 4000000, 4000000, 4000000, 4000000, 4000000, 4000000, 4000000, 4000000, 4000000,
+  5000000, 5000000, 5000000, 5000000, 5000000, 5000000, 5000000, 5000000, 5000000, 5000000,
+  5000000, 5000000, 5000000, 5000000, 5000000, 5000000, 5000000, 5000000, 5000000, 5000000,
+  5000000, 5000000, 5000000, 5000000,
+  3000000, 3000000, 3000000, 3000000,
+  6000000, 6000000,
+  7000000, 7000000, 7000000, 7000000, 7000000, 7000000, 7000000, 7000000,
+  4000000,
+  7000000, 7000000, 7000000,
+  8000000, 8000000, 8000000, 8000000, 8000000, 8000000, 8000000, 8000000,
+  4000000,
+  8000000,
+  4000000
+];
+
 export class StageScene implements GameHost {
   rng = new Rng();
   difficulty = 1;
@@ -121,6 +151,7 @@ export class StageScene implements GameHost {
   enemies: Enemy[] = [];
   enemyBullets: EnemyBullet[] = [];
   enemyLasers: EnemyLaser[] = [];
+  postBombLaserCounter = 0;
   items: ItemEntity[] = [];
   particles: EffectParticle[] = [];
   power = 0;
@@ -170,6 +201,7 @@ export class StageScene implements GameHost {
   stageClear = false;
   private clearTimer = 0;
   readonly stageNumber: number;
+  private stageIntroRunners: AnmRunner[] = [];
   private readonly bgScripts = new Map<number, { anm: Anm; entryIndex: number; localId: number; spriteBase: number }>();
   private readonly enemyAnm: Anm;
   private readonly bgAnm: Anm;
@@ -177,7 +209,10 @@ export class StageScene implements GameHost {
   private readonly stdTxtAnm: Anm;
   private readonly faceAnm: Anm;
   // Stage-clear bonus tally, computed once when the stage ends.
-  clearBonus: { clear: number; point: number; graze: number; cherry: number; mult: number; total: number } | null = null;
+  clearBonus: {
+    clear: number; point: number; graze: number; cherry: number;
+    player: number; bomb: number; mult: number; total: number;
+  } | null = null;
   spellcard: {
     name: string;
     id: number;
@@ -255,6 +290,18 @@ export class StageScene implements GameHost {
         }
       });
     });
+    // Stage-intro title: stdNtxt.anm scripts 0-4 are the full vanilla
+    // presentation with positions/slides/fades baked in, in 640x480 SCREEN
+    // coordinates (the playfield sits at +32,+16 like the original):
+    // script0 = stage crest (128x128, add-blend), 1 = vertical JP title
+    // (rotated pi/2, drifts right), 2 = "Stage N", 3 = subtitle strip,
+    // 4 = vertical BGM label rising along the right edge. All finish and
+    // self-remove by ~frame 460.
+    const introEntry = this.stdTxtAnm.entries[0];
+    this.stageIntroRunners = (introEntry?.scriptIds ?? []).map(
+      (id) =>
+        new AnmRunner(this.stdTxtAnm, id, { entryIndex: 0, spriteIndexOffset: introEntry.spriteBase })
+    );
     this.cherry = new CherrySystem(
       {
         onBorderStart: () => this.playSfx(32),
@@ -273,6 +320,14 @@ export class StageScene implements GameHost {
     this.playerObj = new Player(character, assets.anms);
     this.playerEffects = new PlayerEffects(this.playerObj.anm);
     this.player = this.playerObj;
+    // Extra/Phantasm run-init (FUN_0042cf2f @ all.c:19715-19717): lives
+    // forced to 2 for difficulty >= 4. Power 128 at start is the
+    // community-documented convention (PROBABLE — the exe-side write site
+    // wasn't located; spec-extra-phantasm.md §2).
+    if (!carry && this.difficulty >= 4) {
+      this.playerObj.lives = 2;
+      this.playerObj.power = 128;
+    }
     // Mid-run stage entry: score/lives/power/graze/cherry persist across
     // stages within one credit (the exe keeps them in the run-global stats
     // block; only per-stage state — enemies, items, spell state — resets).
@@ -291,24 +346,41 @@ export class StageScene implements GameHost {
     }
   }
 
-  // Stage-clear bonus per the vanilla result tally (observed on a stage-2
-  // Lunatic clear: Clear=1000000, Point=39x50000, Graze=303x500,
-  // Cherry=cherry x10, "Lunatic Rank *1.5", Total=(sum)*1.5). Clear base
-  // scales with stage number (stage 2 -> 1M => 500k per stage; Extra/
-  // Phantasm use the stage-6 tier). Display rows show full values; the
-  // score field gains total/10 per the port's score-unit convention
-  // (same 10:1 as the spell bonus / point items).
+  // Stage-clear bonus, exe-exact (FUN_00429446's credit block @
+  // all.c:18308-18337, display strings @ all.c:17038-17120):
+  //   internal = stage*100000 + graze*50 + pointItems*5000 + cherry
+  //   [+ lives*2,000,000 + bombs*400,000 on route-final clears (stage>5)]
+  //   Easy /2, Hard *12/10, Lunatic *15/10, Extra <<1; Normal AND Phantasm
+  //   have no arm (x1.0 — the Phantasm screen prints no Rank line at all).
+  //   Continue penalty: x0.5 / x0.2 tiers.
+  // The tally rows display internal*10 (the exe's "%8d0" appended-zero
+  // trick); the score field gains the internal total via ten +=/10 ticks.
   private computeClearBonus(): void {
-    const stageTier = Math.min(this.stageNumber, 7);
-    const clear = 500000 * stageTier;
-    const point = this.pointItems * 50000;
-    const graze = this.graze * 500;
-    const cherry = this.cherry.cherry * 10;
-    const MULT_BY_DIFFICULTY = [0.5, 1.0, 1.2, 1.5, 2.0, 2.0];
+    const finalClear = this.stageNumber >= 6;
+    let internal =
+      this.stageNumber * 100000 + this.graze * 50 + this.pointItems * 5000 + this.cherry.cherry;
+    let playerBonus = 0;
+    let bombBonus = 0;
+    if (finalClear) {
+      playerBonus = this.playerObj.lives * 2000000;
+      bombBonus = this.playerObj.bombs * 400000;
+      internal += playerBonus + bombBonus;
+    }
+    const MULT_BY_DIFFICULTY = [0.5, 1.0, 1.2, 1.5, 2.0, 1.0];
     const mult = MULT_BY_DIFFICULTY[this.difficulty] ?? 1.0;
-    const total = Math.trunc((clear + point + graze + cherry) * mult);
-    this.clearBonus = { clear, point, graze, cherry, mult, total };
-    this.addScore(Math.trunc(total / 10));
+    internal = Math.trunc(internal * mult);
+    if (this.continuesUsed > 0) internal = Math.trunc((internal * 5) / 10);
+    this.clearBonus = {
+      clear: this.stageNumber * 1000000,
+      point: this.pointItems * 50000,
+      graze: this.graze * 500,
+      cherry: this.cherry.cherry * 10,
+      player: playerBonus * 10,
+      bomb: bombBonus * 10,
+      mult,
+      total: internal * 10
+    };
+    this.addScore(Math.trunc(internal / 10) * 10);
   }
 
   // Snapshot of everything that persists across a stage transition.
@@ -421,7 +493,9 @@ export class StageScene implements GameHost {
     // read from the exe binary): Cirno cards 2.0M, Ringing Cold 2.2M
     // (E/N) / 2.4M (H/L per id), finals 2.4M. Decay divisor uses the boss's
     // timer-callback threshold armed before the declare (enemy+0x2edc).
-    const SPELL_BONUS_BASE = [2000000, 2000000, 2200000, 2200000, 2400000, 2400000, 2400000, 2400000, 2400000, 2400000];
+    // Full per-spell base-bonus table, int32[141] @ 0x4951a8 read directly
+    // from the exe binary (spec-extra-phantasm.md §6c) — ids 0-9 stage 1
+    // ... 116-127 Extra, 128-140 Phantasm.
     const base = SPELL_BONUS_BASE[spellId] ?? 2000000;
     const timerFrames = this.bossActive?.ecl.timerCallbackThreshold ?? -1;
     const timerSec = timerFrames > 0 ? Math.trunc(timerFrames / 60) : 50;
@@ -480,10 +554,12 @@ export class StageScene implements GameHost {
   onBossPhaseTimeout(): void {
     this.cherry.onBossTimeout();
     // Exe timeout path (all.c:13831): FUN_00422ea0(10) — every bullet fades
-    // out with NO item conversion — and the spell is marked failed
+    // out with NO item conversion, lasers clear unconditionally (bombType
+    // 10 ignores the immunity bit) — and the spell is marked failed
     // (DAT_012f40a8 -> 2) so the op91 that follows skips the scored sweep.
     this.phaseTimedOut = true;
     this.enemyBullets.length = 0;
+    this.cancelLasers(true);
   }
 
   setBossPresent(present: boolean, enemy: Enemy | null): void {
@@ -520,6 +596,7 @@ export class StageScene implements GameHost {
       this.spawnItem('cherry', b.x, b.y, { state: 1 });
     }
     this.enemyBullets.length = 0;
+    this.cancelLasers(false);
   }
 
   // Th07.exe FUN_00423100(8000,1) (op91 spell end, boss nonspell death):
@@ -535,7 +612,36 @@ export class StageScene implements GameHost {
       value = Math.min(8000, value + 20);
     }
     this.enemyBullets.length = 0;
+    this.cancelLasers(false);
     return total;
+  }
+
+  // Laser half of every FUN_00422ea0 field clear: non-bomb-immune lasers
+  // (flags bit 2 clear) get the op-89-style graceful shrink and stop
+  // hit-testing immediately (shrinkCutoff=0); `unconditional` mirrors
+  // bombType 10 (spell timeout) which ignores the immunity bit. Every
+  // clear also arms the exe's 10-frame new-laser suppression counter
+  // (gamestate+0x37a12c).
+  cancelLasers(unconditional: boolean): void {
+    for (const l of this.enemyLasers) {
+      if (!l.inUse) continue;
+      if ((l.flags & 4) !== 0 && !unconditional) continue;
+      if (l.state < 2) {
+        l.state = 2;
+        l.phaseFrame = 0;
+        l.width = l.displayWidth;
+      }
+      l.shrinkCutoff = 0;
+    }
+    this.postBombLaserCounter = 10;
+  }
+
+  awardCherry(v: number): void {
+    this.cherry.debugAddCherry(v);
+  }
+
+  playBgmTrack(name: string): void {
+    this.audio.playBgm(name);
   }
 
   // ECL op 125 ("STD unpause") is a no-op here: stage1.std's script clock
@@ -628,9 +734,12 @@ export class StageScene implements GameHost {
       }
       this.stageFrame++;
     }
+    for (const runner of this.stageIntroRunners) {
+      if (!runner.removed) runner.update();
+    }
     if (this.dialogue) {
       this.dialogueSeen = true;
-      this.dialogue.update(input.pressed.has('shoot') || input.held.has('skip'));
+      this.dialogue.update(input.pressed.has('shoot'), input.held.has('skip'));
       if (this.dialogue.resumeTicket) {
         this.dialogue.resumeTicket = false;
         this.dialogueResume = true;
@@ -666,7 +775,9 @@ export class StageScene implements GameHost {
       this.updateEnemies();
       this.updatePlayerBullets();
       this.updateBullets();
+      this.updateLasers();
       this.checkPlayerCollision();
+      if (this.postBombLaserCounter > 0) this.postBombLaserCounter--;
     } else {
       // Dialogue up: in-flight player shots keep moving and leave the
       // screen (the exe's shot manager keeps running; only firing and
@@ -924,17 +1035,33 @@ export class StageScene implements GameHost {
   //     op-142 shield active: boss → /9, non-boss → 0
   //     hp -= result
   private settlePendingDamage(e: Enemy): void {
-    const raw = e.pendingShotDmg + e.pendingBombDmg;
-    const hadBomb = e.pendingBombDmg > 0;
+    let shotRaw = e.pendingShotDmg;
+    const bombRaw = e.pendingBombDmg;
+    const raw = shotRaw + bombRaw;
+    const hadBomb = bombRaw > 0;
     e.pendingShotDmg = 0;
     e.pendingBombDmg = 0;
     if (raw <= 0) return;
-    // exe-cherry-border.md §3a: DAT_00625627 (raw difficulty*2+shotTypeBit)
-    // gates a parity quirk in the shot-hit cherry formula. shotTypeBit is
-    // the low bit of that byte; this port's "A"/"B" suffix is the analogue.
+    // DAT_00625627 = the shot-type bit (A=0 / B=1); the formulas below gate
+    // on it being 0 (type-A shots).
     const shotTypeBit = this.playerObj.character.endsWith('B') ? 1 : 0;
-    this.cherry.onShotHit(raw, e.ecl.isBoss, this.difficulty, shotTypeBit, (e.ecl.bossTimer & 1) === 1);
-    let dmg = Math.min(70, raw);
+    // Cherry gain uses the UNREDUCED damage — the exe computes it before
+    // the per-stage reductions below (all.c:14189 vs 14200-14209). The
+    // divisor input is the STAGE number (local_14 = min(stage*2,10),
+    // all.c:13997-14003 — DAT_0062583c is the stage, not the difficulty;
+    // spec-extra-phantasm.md §0).
+    this.cherry.onShotHit(raw, e.ecl.isBoss, this.stageNumber, shotTypeBit, (e.ecl.bossTimer & 1) === 1);
+    // Per-stage type-A shot-damage reduction vs NON-boss enemies
+    // (all.c:14200-14209, gated on DAT_00625627=='\0' and bit6 clear):
+    // stage 4 -> dmg - dmg/4 - dmg/16 (11/16), stages 5-6 -> dmg/2.
+    if (shotTypeBit === 0 && !e.ecl.isBoss && shotRaw > 0) {
+      if (this.stageNumber === 4) {
+        shotRaw = shotRaw - Math.trunc(shotRaw / 4) - Math.trunc(shotRaw / 16);
+      } else if (this.stageNumber === 5 || this.stageNumber === 6) {
+        shotRaw = Math.trunc(shotRaw / 2);
+      }
+    }
+    let dmg = Math.min(70, shotRaw + bombRaw);
     this.addScore(Math.trunc(dmg / 5));
     if (!e.ecl.canTakeDamage) return;
     if (this.spellcard) {
@@ -1118,6 +1245,15 @@ export class StageScene implements GameHost {
         this.onPlayerHit();
         return;
       }
+    }
+    for (const l of this.enemyLasers) {
+      if (!l.inUse) continue;
+      const result = this.checkLaserCollision(l);
+      if (result === 'hit') {
+        this.onPlayerHit();
+        return;
+      }
+      if (result === 'graze') this.onGrazeAward();
     }
     for (const e of this.enemies) {
       if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead) continue;
@@ -1316,6 +1452,129 @@ export class StageScene implements GameHost {
     if (b.dirTimes >= maxTimes) b.exFlags &= includeBottom ? ~0x400 : ~0x800;
   }
 
+  // Additive two-pass beam: a soft colored outer quad at displayWidth plus
+  // a bright core. Color indexes the standard 16-hue ZUN bullet palette
+  // (ground truth uses 2/4/6/8/10). The telegraph (grow) line renders from
+  // frame 0 — only the HIT test waits for telegraphDelay; a shrinking beam
+  // stops drawing at shrinkCutoff like the exe.
+  private static readonly LASER_COLORS = [
+    '#888888', '#663333', '#ff3333', '#cc44cc', '#8844ff', '#4444ff', '#44aaff', '#44ffff',
+    '#44ff88', '#44cc44', '#aaff44', '#ffff44', '#ffcc44', '#ff8844', '#cccccc', '#ffffff'
+  ];
+
+  private drawLasers(r: Renderer, ox: number, oy: number): void {
+    const ctx = r.ctx;
+    for (const l of this.enemyLasers) {
+      if (!l.inUse) continue;
+      if (l.state === 2 && l.phaseFrame >= l.shrinkCutoff) continue;
+      const len = l.farDist - l.nearDist;
+      if (len <= 0 || l.displayWidth <= 0) continue;
+      const color = StageScene.LASER_COLORS[((l.color % 16) + 16) % 16];
+      ctx.save();
+      ctx.translate(ox + l.x, oy + l.y);
+      ctx.rotate(l.angle);
+      ctx.globalCompositeOperation = 'lighter';
+      const w = l.displayWidth;
+      ctx.globalAlpha = l.state === 0 ? 0.55 : 0.4;
+      ctx.fillStyle = color;
+      ctx.fillRect(l.nearDist, -w / 2, len, w);
+      ctx.globalAlpha = l.state === 0 ? 0.7 : 0.95;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(l.nearDist, -w * 0.18, len, w * 0.36);
+      // Tip glow at the origin, per the exe render gate (suppressed during
+      // grow when op156 armed hideTipDuringGrow).
+      if ((l.nearDist < 16 || l.speed === 0) && (!l.hideTipDuringGrow || l.state !== 0)) {
+        ctx.globalAlpha = 0.8;
+        ctx.beginPath();
+        ctx.arc(l.nearDist, 0, Math.max(3, w * 0.7), 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+  }
+
+  // Th07.exe laser updater FUN_004241c0 (all.c:16205-16321), per
+  // spec-lasers.md §3/§7.4: farDist auto-grows by speed, nearDist trails
+  // by maxLength; state 0 GROW ramps displayWidth 1.2->width over
+  // growDuration (hit-testable only after telegraphDelay), state 1 HOLD
+  // runs holdDuration frames at full width (the ONLY state whose kill box
+  // spans the beam's length), then the shared shrink body ramps width back
+  // to 0 over shrinkDuration (drawn/hit only while phaseFrame <
+  // shrinkCutoff); nearDist >= 640 or the shrink finishing frees the slot.
+  private updateLasers(): void {
+    for (const l of this.enemyLasers) {
+      if (!l.inUse) continue;
+      l.farDist += l.speed;
+      if (l.farDist - l.nearDist > l.maxLength) l.nearDist = l.farDist - l.maxLength;
+      if (l.nearDist < 0) l.nearDist = 0;
+      if (l.state === 0) {
+        if ((l.flags & 1) === 0) {
+          l.displayWidth = Math.min(l.width, 1.2 + (l.width - 1.2) * (l.phaseFrame / Math.max(1, l.growDuration)));
+        }
+        if (l.phaseFrame >= l.growDuration) {
+          l.state = 1;
+          l.phaseFrame = 0;
+          l.displayWidth = l.width;
+          continue;
+        }
+      } else if (l.state === 1) {
+        l.displayWidth = l.width;
+        if (l.phaseFrame >= l.holdDuration) {
+          l.state = 2;
+          l.phaseFrame = 0;
+          continue;
+        }
+      } else {
+        if ((l.flags & 1) === 0) {
+          l.displayWidth = Math.max(0, l.width - (l.phaseFrame * l.width) / Math.max(1, l.shrinkDuration));
+        }
+        if (l.phaseFrame >= l.shrinkDuration) l.inUse = false;
+      }
+      if (l.nearDist >= 640) l.inUse = false;
+      l.phaseFrame++;
+    }
+    // Compact the pool once nothing references dead entries (the per-enemy
+    // handle tables hold object references, so splicing is safe).
+    if (this.enemyLasers.length > 96) {
+      let w = 0;
+      for (const l of this.enemyLasers) if (l.inUse) this.enemyLasers[w++] = l;
+      this.enemyLasers.length = w;
+    }
+  }
+
+  // Player-vs-laser test, exe FUN_0043b650 (all.c:27867-27925) via
+  // spec-lasers.md §7: rotate (player - anchor) by -angle into the beam's
+  // local frame, then AABB the player hitbox against a box whose along-
+  // axis extent is state-dependent (§7.4) — full length only during HOLD,
+  // a width-sized nub around the midpoint during grow/shrink. Graze pads
+  // the box by a flat 48 (DAT_0048eb94).
+  private checkLaserCollision(l: EnemyLaser): 'miss' | 'graze' | 'hit' {
+    const inGrow = l.state === 0;
+    if (inGrow && l.phaseFrame < l.telegraphDelay) return 'miss';
+    if (l.state === 2 && l.phaseFrame >= l.shrinkCutoff) return 'miss';
+    const p = this.playerObj;
+    const dx = p.x - l.x;
+    const dy = p.y - l.y;
+    const sin = Math.sin(-l.angle);
+    const cos = Math.cos(-l.angle);
+    const along = sin * dy + cos * dx;
+    const perp = cos * dy - sin * dx;
+    const phw = p.hitboxHalf;
+    const midDist = (l.farDist - l.nearDist) / 2 + l.nearDist;
+    const extX = l.state === 1 ? l.farDist - l.nearDist : l.displayWidth / 2;
+    const extY = l.width / 2;
+    const sepX = Math.abs(along - midDist) - (extX / 2 + phw);
+    const sepY = Math.abs(perp) - (extY / 2 + phw);
+    if (sepX <= 0 && sepY <= 0) return 'hit';
+    // Graze ticks every 12 frames (the exe passes phaseFrame % 12 == 0 as
+    // the tick flag at all three call sites), box padded a flat 48.
+    if (l.phaseFrame % 12 !== 0) return 'miss';
+    const g = 48;
+    if (sepX <= g && sepY <= g) return 'graze';
+    return 'miss';
+  }
+
   private updateItems(): void {
     const p = this.playerObj;
     const sht = p.sht;
@@ -1470,6 +1729,7 @@ export class StageScene implements GameHost {
         const rotation = e.ecl.anmRotateWithAngle ? e.ecl.angle : undefined;
         r.drawAnmFrame(frame, ox + e.x, oy + e.y, rotation != null ? { rotation } : {});
       }
+      this.drawLasers(r, ox, oy);
       for (const b of this.enemyBullets) {
         const spawning = b.age < b.spawnDuration;
         r.drawSprite(b.rect.imageKey, b.rect.x, b.rect.y, b.rect.w, b.rect.h, ox + b.x, oy + b.y, {
@@ -1582,7 +1842,10 @@ export class StageScene implements GameHost {
       const txt = num(value);
       r.text(txt, valueEndX - txt.length * 9, y, { size: 14, color });
     };
-    r.text(spaced('Stage Clear'), labelX, oy + 130, { size: 16, color: '#ffcc44' });
+    // "All Clear!" replaces "Stage Clear" on route-final clears (stage 6 /
+    // Extra / Phantasm — exe gate DAT_0062583c >= 6 @ all.c:17063-17067).
+    const heading = this.stageNumber >= 6 ? 'All Clear!' : 'Stage Clear';
+    r.text(spaced(heading), labelX, oy + 130, { size: 16, color: '#ffcc44' });
     const reveal = Math.floor((t - 20) / 12); // rows appear one by one
     const rows: [string, number][] = [
       ['Clear', b.clear],
@@ -1590,14 +1853,21 @@ export class StageScene implements GameHost {
       ['Graze', b.graze],
       ['Cherry', b.cherry]
     ];
+    // Player/Bomb rows only appear on route-final clears (all.c:17081-17094).
+    if (this.stageNumber >= 6) {
+      rows.push(['Player', b.player], ['Bomb', b.bomb]);
+    }
     rows.forEach(([label, value], i) => {
       if (reveal > i) row(label + '  =', value, oy + 168 + i * 22, '#d8d8f8');
     });
     if (reveal > rows.length) {
-      const names = ['Easy', 'Normal', 'Hard', 'Lunatic', 'Extra', 'Phantasm'];
-      const mult = `*${b.mult.toFixed(1)}`;
-      r.text(spaced(`${names[this.difficulty] ?? ''} Rank ${mult}`), labelX, oy + 268, { size: 14, color: '#ff5566' });
-      row('Total  =', b.total, oy + 292, '#ffffff');
+      const names = ['Easy', 'Normal', 'Hard', 'Lunatic', 'Extra'];
+      const y = oy + 176 + rows.length * 22;
+      // Phantasm prints no Rank line at all (no else arm in the exe chain).
+      if (this.difficulty <= 4) {
+        r.text(spaced(`${names[this.difficulty] ?? ''} Rank *${b.mult.toFixed(1)}`), labelX, y, { size: 14, color: '#ff5566' });
+      }
+      row('Total  =', b.total, y + 24, '#ffffff');
     }
   }
 
@@ -2000,18 +2270,15 @@ export class StageScene implements GameHost {
 
   // Stage title card during the opening seconds, using the stage/song names
   // decoded from the STD data.
+  // Vanilla stage intro: play stdNtxt.anm's five scripts verbatim — crest,
+  // vertical JP title, "Stage N", subtitle strip, and the vertical BGM
+  // label — all positioned in screen coordinates by the scripts themselves
+  // (see the constructor note). Runners self-remove around frame 460.
   private drawStageTitle(r: Renderer): void {
-    const f = this.stageFrame;
-    if (f > 360 || this.dialogue) return;
-    const alpha = f < 60 ? f / 60 : f > 280 ? Math.max(0, (360 - f) / 80) : 1;
-    if (alpha <= 0) return;
-    const ctx = r.ctx;
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    r.text('STAGE 1', PLAYFIELD.x + 150, PLAYFIELD.y + 150, { size: 18, color: '#fdd' });
-    r.text(this.runtime.std.stageName, PLAYFIELD.x + 90, PLAYFIELD.y + 180, { size: 16 });
-    r.text(`♪ ${this.runtime.std.songNames[0] ?? ''}`, PLAYFIELD.x + 100, PLAYFIELD.y + 215, { size: 12, color: '#aac' });
-    ctx.restore();
+    for (const runner of this.stageIntroRunners) {
+      if (runner.removed) continue;
+      r.drawAnmFrame(runner.spriteFrame(), 0, 0);
+    }
   }
 
   // PCB right sidebar, rebuilt from the original front.png sprites: the seven
@@ -2033,9 +2300,12 @@ export class StageScene implements GameHost {
     this.blit(r, 'front', FRONT.caption, 448, 336);
 
     label(FRONT.hiscore, 48);
-    this.drawNumber(r, Math.max(this.hiScore, this.score), valueX, 50, 9);
+    // The exe's score HUD prints the internal score with a literal appended
+    // zero ("%8d0" @ FUN_00429446 region) — displayed value = internal x10,
+    // last digit always 0 (the slot vanilla uses for the continue count).
+    this.drawNumber(r, Math.max(this.hiScore, this.score) * 10, valueX, 50, 9);
     label(FRONT.score, 64);
-    this.drawNumber(r, this.score, valueX, 66, 9);
+    this.drawNumber(r, this.score * 10, valueX, 66, 9);
 
     label(FRONT.player, 96);
     for (let i = 0; i < Math.max(0, p.lives); i++) star(FRONT.redStar, valueX + i * 16, 96);

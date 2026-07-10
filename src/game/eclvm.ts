@@ -3,7 +3,7 @@ import { Anm, AnmRunner } from '../formats/anm';
 import { Std } from '../formats/std';
 import { Msg } from '../formats/msg';
 import { normalizeAngle, clamp, TAU } from '../core/util';
-import type { GameHost, Enemy, EclState, EclContext, BulletProps, BulletExSlot, ItemType } from './types';
+import type { GameHost, Enemy, EclState, EclContext, BulletProps, BulletExSlot, ItemType, EnemyLaser } from './types';
 
 // TH07 ECL virtual machine. Opcode semantics were derived by aligning thtk's
 // th07 signature table against the TH06 instruction set (implemented in the
@@ -280,6 +280,13 @@ export class StageRuntime {
       speed: 0,
       acceleration: 0,
       shootOffset: { x: 0, y: 0, z: 0 },
+      laserSlots: new Array(32).fill(null),
+      laserSlotIndex: 0,
+      interpSlots: new Array(8).fill(null),
+      effectArm: null,
+      periodicSub: null,
+      pendingSub: -1,
+      hitbox2: null,
       moveMode: 0,
       interpKind: 0,
       interp: null,
@@ -485,6 +492,28 @@ export class StageRuntime {
     s.frameVx = e.x - prevX;
     s.frameVy = e.y - prevY;
     this.checkCallbacks(game, e);
+    // Exe frame preamble (all.c:7055-7104, 7266-7324), in order: drain the
+    // op145 pending-sub request, run the op122 armed effect, tick the op27
+    // interp slots, then the op144 periodic gosub — all before this frame's
+    // bytecode dispatch.
+    if (s.pendingSub >= 0) {
+      const sub = s.pendingSub;
+      s.pendingSub = -1;
+      s.stack.length = 0;
+      this.enterSub(s, sub);
+    }
+    if (s.effectArm) this.runBulletEffect(game, e, s.effectArm.id, this.getInt(game, e, s.effectArm.paramOff));
+    this.tickInterpSlots(game, e);
+    if (s.periodicSub && s.periodicSub.subId >= 0) {
+      if (++s.periodicSub.elapsed >= s.periodicSub.period) {
+        s.periodicSub.elapsed = 0;
+        // Nested gosub: return resumes the interrupted flow (the exe also
+        // snapshots/restores the FIRE template around it — approximated by
+        // the plain call stack).
+        s.stack.push({ ...s.ctx });
+        this.enterSub(s, s.periodicSub.subId);
+      }
+    }
     if (active) this.runEcl(game, e);
     this.updateAutoShoot(game, e);
     if (s.isBoss && !game.timeStopped) s.bossTimer++;
@@ -616,6 +645,100 @@ export class StageRuntime {
   private enterSub(s: EclState, subId: number, windowShift = 0): void {
     s.ctx = { subId, index: 0, time: 0, windowBase: Math.max(0, s.ctx.windowBase + windowShift) };
   }
+
+  // op27 per-frame tick (exe all.c:7271-7324 + FUN_0040ecd0/FUN_0040ed30):
+  // modes 0-6 = 2-point LERP of f0..f1, mode 7 = cubic Hermite with f2/f3
+  // as start/end tangents; ease curves per spec-op27-effects.md §1.3. The
+  // final-frame write still happens before the slot frees.
+  private tickInterpSlots(game: GameHost, e: Enemy): void {
+    const s = e.ecl;
+    for (let i = 0; i < s.interpSlots.length; i++) {
+      const slot = s.interpSlots[i];
+      if (!slot) continue;
+      slot.elapsed++;
+      const done = slot.elapsed >= slot.duration;
+      let t = done ? 1 : slot.elapsed / Math.max(1, slot.duration);
+      switch (slot.ease) {
+        case 1: t = t * t; break;
+        case 2: t = t * t * t; break;
+        case 3: t = t * t * t * t; break;
+        case 4: t = 1 - (1 - t) * (1 - t); break;
+        case 5: t = 1 - (1 - t) ** 3; break;
+        case 6: t = 1 - (1 - t) ** 4; break;
+      }
+      let value: number;
+      if (slot.mode === 7) {
+        const h00 = (1 + 2 * t) * (1 - t) * (1 - t);
+        const h10 = t * (1 - t) * (1 - t);
+        const h01 = t * t * (3 - 2 * t);
+        const h11 = t * t * (t - 1);
+        value = h00 * slot.f0 + h10 * slot.f2 + h01 * slot.f1 + h11 * slot.f3;
+      } else {
+        value = (slot.f1 - slot.f0) * t + slot.f0;
+      }
+      this.interpWrite(game, e, slot.target, value);
+      if (done) s.interpSlots[i] = null;
+    }
+  }
+
+  // op27 writes go through the exe's FLOAT write path (FUN_0040e560),
+  // which CAN write own-position (unlike the int path our varWrite
+  // models). Position writes also update the heading like the exe's
+  // delta-capture does (all.c:7304-7324, simplified to a direct write per
+  // the spec's port guidance).
+  private interpWrite(game: GameHost, e: Enemy, id: number, value: number): void {
+    switch (id) {
+      case 10018: e.x = value; return;
+      case 10019: e.y = value; return;
+      case 10020: e.z = value; return;
+      case 10045: e.ecl.angle = value; return;
+      default: this.varWrite(game, e, id, value);
+    }
+  }
+
+  // op121/122 bullet-effect table (exe 24 entries @ 0x495148). Gameplay-
+  // relevant ids are implemented; decorative particle ids are no-ops (safe
+  // per spec-op27-effects.md §2.2 port guidance). id 3 is a true no-op in
+  // the exe.
+  private runBulletEffect(game: GameHost, e: Enemy, id: number, param: number): void {
+    switch (id) {
+      case 0: { // attach to tracked enemy: copy its position onto self
+        const t = this.bossSlots[param];
+        if (t) { e.x = t.x; e.y = t.y; e.z = t.z; e.ecl.angle = t.ecl.angle; }
+        return;
+      }
+      case 5: { // copy orbit params from the tracked enemy
+        const t = this.bossSlots[param];
+        if (t) {
+          e.ecl.orbitTarget = { ...t.ecl.orbitTarget };
+          e.ecl.orbitSpeed = t.ecl.orbitSpeed;
+          e.ecl.orbitAngularVelocity = t.ecl.orbitAngularVelocity;
+        }
+        return;
+      }
+      case 10: { // enter bullet-time: slow all live bullets by 1/param
+        const f = param > 0 ? 1 / param : 1;
+        if (this.bulletTimeScale === 1 && f !== 1) {
+          for (const b of game.enemyBullets) { b.vx *= f; b.vy *= f; b.speed *= f; }
+          this.bulletTimeScale = f;
+        }
+        return;
+      }
+      case 11: { // exit bullet-time
+        if (this.bulletTimeScale !== 1) {
+          const f = 1 / this.bulletTimeScale;
+          for (const b of game.enemyBullets) { b.vx *= f; b.vy *= f; b.speed *= f; }
+          this.bulletTimeScale = 1;
+        }
+        return;
+      }
+      case 20: game.playBgmTrack?.('th07_13b'); return; // Yuyuko phase-2 cue
+      case 3: return; // exe stub
+      default: return; // decorative particle/telegraph effects — no-op
+    }
+  }
+
+  private bulletTimeScale = 1;
 
   private updateAutoShoot(game: GameHost, e: Enemy): void {
     const s = e.ecl;
@@ -757,6 +880,50 @@ export class StageRuntime {
       case 24: setVar(Math.trunc(v.f32(a)), Math.sin(gf(4))); return null;
       case 25: setVar(Math.trunc(v.f32(a)), Math.cos(gf(4))); return null;
       case 26: setVar(Math.trunc(v.f32(a)), Math.atan2(gf(16) - gf(8), gf(12) - gf(4))); return null;
+      case 27: { // timed float interp into a special-var target (8 slots,
+        // exe enemy+0x770 stride 0x30; spec-op27-effects.md §1). target
+        // (arg0) is a literal f32-encoded var-id tag, NEVER var-resolved;
+        // duration/mode/ease and f0-f3 are var-resolvable. Same-target
+        // calls override their slot; all-full drops the call silently.
+        const target = Math.trunc(v.f32(a));
+        const slot = {
+          target,
+          duration: gi(4),
+          mode: gi(8),
+          ease: gi(12),
+          f0: gf(16),
+          f1: gf(20),
+          f2: gf(24),
+          f3: gf(28),
+          elapsed: 0
+        };
+        for (let i = 0; i < s.interpSlots.length; i++) {
+          if (!s.interpSlots[i] || s.interpSlots[i]!.target === target) {
+            s.interpSlots[i] = slot;
+            break;
+          }
+        }
+        return null;
+      }
+      case 43: case 44: { // cross-enemy variable read (exe cases 0x2a/0x2b,
+        // objdump-confirmed): when arg1 is a var ref, it is read off the
+        // TRACKED enemy DAT_012f4078[arg2] (our boss slots), not this one;
+        // the result lands in arg0 on THIS enemy. 43 = int path, 44 = float.
+        const destId = op === 43 ? v.i32(a) : Math.trunc(v.f32(a));
+        const rawVal = op === 43 ? v.i32(a + 4) : v.f32(a + 4);
+        const isRef = rawVal >= VAR_BASE && rawVal < VAR_BASE + 100;
+        let value: number;
+        if (isRef) {
+          const idx = gi(8);
+          const ref = this.bossSlots[idx] ?? e;
+          value = this.varRead(game, ref, Math.trunc(rawVal));
+          if (op === 43) value = Math.trunc(value);
+        } else {
+          value = rawVal;
+        }
+        this.varWrite(game, e, destId, value);
+        return null;
+      }
       case 28: case 29: case 30: case 31: case 32: case 33:
       case 34: case 35: case 36: case 37: case 38: case 39: { // compare-and-jump
         const isFloat = (op & 1) === 1;
@@ -878,6 +1045,13 @@ export class StageRuntime {
         s.orbitAngle = gf(0);
         s.orbitAngularVelocity = gf(4);
         return null;
+      case 59: // StartTimedMove(duration) (exe case 0x3a): re-arms the
+        // currently-configured movement mode's countdown. Our movement
+        // modes run continuously, so re-triggering the orbit/move window
+        // is the closest equivalent.
+        s.orbitDuration = gi(0);
+        s.orbitLeft = gi(0);
+        return null;
       case 62: {
         s.lowerMoveLimit = { x: gf(0), y: gf(4) };
         s.upperMoveLimit = { x: gf(8), y: gf(12) };
@@ -937,6 +1111,73 @@ export class StageRuntime {
         // Previously mislabeled as a re-fire — that is op 77.
         game.cancelBulletsToItems();
         return null;
+      case 82: case 83: { // FIRE_LASER (exe cases 0x51/0x52, all.c:8715-8785).
+        // 83 aims the angle at the player once at spawn; unused by any
+        // retail stage but implemented for completeness. Sprite+color pack
+        // the first arg slot as two i16s; width/durations/flags are
+        // literal-only per the dispatcher's paramMask handling.
+        // Post-bomb gate (all.c:15737): no new laser for 10 frames after a
+        // field clear unless flags bit 2 (bomb-immune) is set.
+        const flags = v.i32(a + 48);
+        if ((game.postBombLaserCounter ?? 0) > 0 && !(flags & 4)) return null;
+        const angleRaw = gf(4);
+        const x = e.x + s.shootOffset.x;
+        const y = e.y + s.shootOffset.y;
+        const angle = op === 83 ? angleRaw + Math.atan2(game.player.y - y, game.player.x - x) : angleRaw;
+        const laser: EnemyLaser = {
+          id: game.id++,
+          ownerId: e.id,
+          inUse: true,
+          sprite: v.i16(a),
+          color: v.i16(a + 2),
+          x, y,
+          angle,
+          speed: gf(8),
+          nearDist: gf(12),
+          farDist: gf(16),
+          maxLength: gf(20),
+          width: v.f32(a + 24),
+          displayWidth: 1.2,
+          growDuration: v.i32(a + 28),
+          holdDuration: v.i32(a + 32),
+          shrinkDuration: v.i32(a + 36),
+          telegraphDelay: v.i32(a + 40),
+          shrinkCutoff: v.i32(a + 44),
+          flags,
+          state: 0,
+          phaseFrame: 0,
+          hideTipDuringGrow: false
+        };
+        game.enemyLasers.push(laser);
+        s.laserSlots[Math.min(31, Math.max(0, s.laserSlotIndex))] = laser;
+        return null;
+      }
+      case 84: s.laserSlotIndex = gi(0); return null; // SELECT_LASER_SLOT
+      case 85: { // ADD_LASER_ANGLE (exe FUN_0042fff0: plain add + wrap to ±π)
+        const l = s.laserSlots[gi(0)];
+        if (l) l.angle = normalizeAngle(l.angle + gf(4));
+        return null;
+      }
+      case 86: { // AIM_LASER_AT_PLAYER + offset (absolute set; retail-unused)
+        const l = s.laserSlots[gi(0)];
+        if (l) l.angle = Math.atan2(game.player.y - l.y, game.player.x - l.x) + gf(4);
+        return null;
+      }
+      case 87: { // REPOSITION_LASER: re-base to the enemy's CURRENT pos + offset
+        const l = s.laserSlots[gi(0)];
+        if (l) { l.x = e.x + gf(4); l.y = e.y + gf(8); }
+        return null;
+      }
+      case 88: return null; // IS_LASER_ALIVE writes enemy+0x8f0 — write-only/vestigial in the exe, no-op
+      case 89: { // CANCEL_LASER: graceful shrink from the current display width
+        const l = s.laserSlots[gi(0)];
+        if (l && l.inUse && l.state < 2) {
+          l.state = 2;
+          l.phaseFrame = 0;
+          l.width = l.displayWidth;
+        }
+        return null;
+      }
       case 81: { // bullet fire SFX (id, unknown)
         const sfx = v.i32(a);
         s.bulletSfx = sfx;
@@ -1093,6 +1334,15 @@ export class StageRuntime {
       case 118: game.spawnEffectParticles(v.i32(a), e.x + gf(12), e.y + gf(16), v.i32(a + 4), v.u32(a + 8) >>> 0); return null;
       case 119: this.dropPowerItems(game, e, Math.trunc(this.varRead(game, e, v.i32(a)))); return null;
       case 120: s.anmRotateWithAngle = !!v.i32(a); return null;
+      case 121: // immediate bullet-effect call (table @ 0x495148)
+        this.runBulletEffect(game, e, v.i32(a), gi(4));
+        return null;
+      case 122: { // arm (id>=0) / disarm (id<0) the per-frame effect; the
+        // param is re-resolved from the instruction every frame.
+        const id = v.i32(a);
+        s.effectArm = id < 0 ? null : { id, paramOff: a + 4 };
+        return null;
+      }
       case 123: ctx.time += gi(0); return null;
       case 124: {
         const type = ITEM_TABLE[v.i32(a)];
@@ -1126,8 +1376,10 @@ export class StageRuntime {
         s.bossTimer = 0;
         return null;
       case 134:
-        for (const laser of game.enemyLasers) laser.inUse = false;
-        game.enemyLasers.length = 0;
+        // CLEAR_LASER_HANDLES (exe case 0x85, all.c:9518): zeroes only this
+        // enemy's own 32-slot handle table; the global pool and live lasers
+        // are untouched. (Previously wiped every laser on screen.)
+        s.laserSlots.fill(null);
         return null;
       case 135: s.spellTimeoutFlag = !!v.i32(a); return null;
       // Op 136 (exe case 0x87 -> `+0x2e29` bit5 = arg&1): gates the
@@ -1179,9 +1431,86 @@ export class StageRuntime {
       // op 142: N-frame damage shield (exe case 0x8d writes enemy+0x4f40;
       // gate at FUN_0041ed50 all.c:14245: boss dmg/9, non-boss dmg=0).
       case 142: s.damageShield = v.i32(a); return null;
+      case 143: { // CancelBulletsInRadius (exe case 0x8e = FUN_00423360):
+        // deletes bullets within radius of the enemy, each spawning a
+        // small cherry item (FUN_00430970 type 6, mode 1).
+        const radius = gf(0);
+        const bullets = game.enemyBullets;
+        let w = 0;
+        for (const b of bullets) {
+          const dx = b.x - e.x;
+          const dy = b.y - e.y;
+          if (dx * dx + dy * dy <= radius * radius) {
+            game.spawnItem('cherry', b.x, b.y, { state: 1 });
+          } else {
+            bullets[w++] = b;
+          }
+        }
+        bullets.length = w;
+        return null;
+      }
+      case 144: { // ArmPeriodicSub(period, subId) (exe case 0x8f): every
+        // `period` frames, nested gosub subId; -1 disarms. NOT death-tied.
+        const period = gi(0);
+        const subId = v.i32(a + 4);
+        s.periodicSub = subId < 0 ? null : { period: Math.max(1, period), subId, elapsed: 0 };
+        return null;
+      }
+      case 145: { // SendSubToTrackedEnemy(idx, subId) (exe case 0x90):
+        // remote-command a tracked enemy to gosub subId next frame.
+        const target = this.bossSlots[gi(0)];
+        if (target) target.ecl.pendingSub = v.i32(a + 4);
+        return null;
+      }
+      case 146: // CancelAllBullets (exe case 0x91 = FUN_00422ea0(0)):
+        // plain state-5 fade, NO items; non-immune lasers reset too.
+        game.enemyBullets.length = 0;
+        game.cancelLasers?.(false);
+        return null;
       case 148: { // Th07.exe FUN_0040f6c0 case 0x93: HP-threshold callback slot
         const slot = Math.max(0, Math.min(3, v.i32(a)));
         s.lifeThresholds[slot] = { threshold: v.i32(a + 4), sub: v.i32(a + 8) };
+        return null;
+      }
+      case 149: case 150: // 149 = attached-laser origin follow/detach (the
+        // +0x2eb0 boss-laser object — not modeled); 150 = write to enemy+8
+        // (unidentified, 1 use). Store-and-ignore per spec.
+        return null;
+      case 151: { // PolarToXY (exe case 0x96): arg1-var = cos(angle)*mag,
+        // arg0-var = sin(angle)*mag (angle arg2, magnitude arg3).
+        const angle = gf(8);
+        const mag = gf(12);
+        this.varWrite(game, e, Math.trunc(v.f32(a + 4)), Math.cos(angle) * mag);
+        this.varWrite(game, e, Math.trunc(v.f32(a)), Math.sin(angle) * mag);
+        return null;
+      }
+      case 153: // secondary shot-collision extent triple (exe +0x2b48/4c/50)
+        s.hitbox2 = { x: gf(0), y: gf(4), z: gf(8) };
+        return null;
+      case 155: { // random horizontal shot angle away from the near wall
+        // (exe case 0x9a, constants read from the binary: 96/288/pi/2/
+        // 3pi/4/pi/4): enemy on the right/past x=288 -> angle in
+        // [3pi/4, 5pi/4) (leftward); else [-pi/4, pi/4) (rightward).
+        const x = e.x;
+        const leftward = (x > game.player.x && x > 96) || x > 288;
+        const r = game.rng.range(Math.PI / 2);
+        const angle = leftward ? normalizeAngle(r + (3 * Math.PI) / 4) : r - Math.PI / 4;
+        this.varWrite(game, e, Math.trunc(v.f32(a)), angle);
+        return null;
+      }
+      case 159: { // one-shot lerp: dest = (to - from) * t + from (exe 0x9e)
+        const to = gf(4);
+        const from = gf(8);
+        const t = gf(12);
+        this.varWrite(game, e, Math.trunc(v.f32(a)), (to - from) * t + from);
+        return null;
+      }
+      case 161: return null; // SetScriptPausesDuringSlowmo — slowmo clock not modeled
+      case 152: { // SET_LASER_ANGLE (exe case 0x97, all.c:9813): absolute
+        // store, no wrap — scripts track/wrap their own angle vars and
+        // blind-write them every frame (stage 6 pentagram spinner).
+        const l = s.laserSlots[gi(0)];
+        if (l) l.angle = gf(4);
         return null;
       }
       case 154:
@@ -1189,7 +1518,26 @@ export class StageRuntime {
         // FUN_00430970(pos, 1, 0) -- type 1 = point, NOT cherry), scattered ±64.
         game.dropPointItems?.(e, Math.trunc(this.varRead(game, e, v.i32(a))));
         return null;
-      case 160: game.awardSpellValue?.(v.i32(a)); return null; // TH07-TODO verify
+      case 156: { // SET_LASER_FLAG_E9 (exe case 0x9b): suppress the tip-glow
+        // spark during the grow/telegraph phase (cosmetic).
+        const l = s.laserSlots[gi(0)];
+        if (l) l.hideTipDuringGrow = !!gi(4);
+        return null;
+      }
+      case 157: { // SET_LASER_MAXLENGTH (exe case 0x9c)
+        const l = s.laserSlots[gi(0)];
+        if (l) l.maxLength = gf(4);
+        return null;
+      }
+      case 158: { // SET_LASER_NEARFAR (exe case 0x9d): both set together
+        const l = s.laserSlots[gi(0)];
+        if (l) { l.nearDist = gf(4); l.farDist = gf(8); }
+        return null;
+      }
+      // op 160 (exe case 0x9f) calls FUN_0042dc6f(arg) — the cherry +
+      // cherryPlus accumulator, NOT a spell-value award (spec-lasers.md
+      // §4.13 corrected the old TH07-TODO guess).
+      case 160: game.awardCherry?.(v.i32(a)); return null;
       default:
         warnOnce(`op${op}`, `unhandled ECL op ${op} (sub ${ctx.subId})`);
         return null;

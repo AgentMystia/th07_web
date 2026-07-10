@@ -51,6 +51,15 @@ export interface BulletExSlot {
   f1: number; // accel-angle / angle-change angleDelta / dir-change new-speed
 }
 
+// Th07.exe enemy laser (pool object 0x4ec bytes @ gamestate+0x366628; see
+// scratchpad spec-lasers.md / re-specs exe-enemy-lasers.md). Field mapping:
+// nearDist/farDist = +0x4a8/+0x4ac (live, auto-grown by speed), maxLength =
+// +0x4b0, width = +0x4b4 (full), displayWidth = +0x4b8 (current on-screen),
+// growDuration/holdDuration/shrinkDuration = +0x4c0/c8/cc, telegraphDelay =
+// +0x4c4 (no hit test in grow before this), shrinkCutoff = +0x4d0 (no draw/
+// hit in shrink after this), flags = +0x4e4 (bit0 manual width, bit2
+// bomb-immune), state +0x4e8 (0 grow / 1 hold / 2 shrink), phaseFrame
+// +0x4e0.
 export interface EnemyLaser {
   id: number;
   ownerId: number;
@@ -61,18 +70,20 @@ export interface EnemyLaser {
   y: number;
   angle: number;
   speed: number;
-  startOffset: number;
-  endOffset: number;
-  startLength: number;
+  nearDist: number;
+  farDist: number;
+  maxLength: number;
   width: number;
-  startTime: number;
-  duration: number;
-  despawnDuration: number;
-  hitboxStartTime: number;
-  hitboxEndDelay: number;
+  displayWidth: number;
+  growDuration: number;
+  holdDuration: number;
+  shrinkDuration: number;
+  telegraphDelay: number;
+  shrinkCutoff: number;
   flags: number;
   state: number;
-  timer: number;
+  phaseFrame: number;
+  hideTipDuringGrow: boolean;
 }
 
 export interface ItemEntity {
@@ -140,6 +151,17 @@ export interface GameHost {
   // +0x37a160, FUN_00421a40) with no score popup. Runs at op80, spell
   // declare (op90) and the full-power crossing.
   cancelBulletsToItems(): void;
+  // Frames remaining of the exe's post-field-clear laser-spawn suppression
+  // (gamestate+0x37a12c, set to 10 by every FUN_00422ea0 call; op-82/83
+  // fires are gated on it unless the laser is bomb-immune, all.c:15737).
+  postBombLaserCounter?: number;
+  // ECL op 160 = FUN_0042dc6f(arg): cherry + cherryPlus gain.
+  awardCherry?(v: number): void;
+  // Bullet-effect id 20: hardcoded BGM cue (Yuyuko phase 2, th07_13b).
+  playBgmTrack?(name: string): void;
+  // FUN_00422ea0's laser half: graceful-cancel non-bomb-immune lasers
+  // (unconditional = the bombType-10 spell-timeout variant).
+  cancelLasers?(unconditional: boolean): void;
   // FUN_00423100(8000,1): like cancelBulletsToItems but each bullet also
   // pops an escalating score value (2000, +20 per bullet, capped 8000);
   // returns the summed total for the caller to bank as score/10 (op91
@@ -173,6 +195,26 @@ export interface EclState {
   speed: number;
   acceleration: number;
   shootOffset: { x: number; y: number; z: number };
+  // Per-enemy laser handle table (exe enemy+0x2d8c, 32 slots) + the op-84
+  // "current slot" register (+0x2e0c) that the NEXT op-82/83 fire writes
+  // into. Ops 85-89/152/156-158 take their own index arg.
+  laserSlots: (EnemyLaser | null)[];
+  laserSlotIndex: number;
+  // op27 timed float interpolators (exe enemy+0x770, 8 slots stride 0x30):
+  // target = special-var-id tag, mode 0-6 = 2-point LERP, 7 = cubic Hermite
+  // (f2/f3 = tangents), ease 0-6 per spec-op27-effects.md §1.3.
+  interpSlots: ({ target: number; duration: number; elapsed: number; mode: number; ease: number; f0: number; f1: number; f2: number; f3: number } | null)[];
+  // op122 armed per-frame bullet-effect (exe enemy+0x6f4): param re-resolved
+  // live from the arming instruction each frame (paramOff = absolute byte
+  // offset of arg1 in the ECL image).
+  effectArm: { id: number; paramOff: number } | null;
+  // op144 periodic gosub (exe +0x2f58/+0x2f64/+0x2ee4): every `period`
+  // frames, nested call into subId; -1 disarms.
+  periodicSub: { period: number; subId: number; elapsed: number } | null;
+  // op145 remote pending-sub request (exe +0x2b08), drained at frame top.
+  pendingSub: number;
+  // op153 secondary shot-collision extent triple (exe +0x2b48/4c/50).
+  hitbox2: { x: number; y: number; z: number } | null;
   moveMode: number;
   interpKind: number;
   interp: { start: { x: number; y: number; z: number }; delta: { x: number; y: number; z: number }; duration: number; left: number } | null;

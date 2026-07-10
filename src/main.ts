@@ -47,6 +47,11 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
     timelines: scene.runtime.timelineCursors.map((c) => ({ ...c })),
     bossActive: !!scene.bossActive,
     bossHp: scene.bossActive?.hp ?? null,
+    lasers: scene.enemyLasers.filter((l) => l.inUse).length,
+    laserDump: scene.enemyLasers.filter((l) => l.inUse).slice(0, 6).map((l) => ({
+      x: Math.round(l.x), y: Math.round(l.y), angle: Number(l.angle.toFixed(2)),
+      near: Math.round(l.nearDist), far: Math.round(l.farDist), w: Number(l.displayWidth.toFixed(1)), state: l.state
+    })),
     stageClear: scene.stageClear,
     gameOver: scene.gameOver,
     continueActive: !!scene.continueScreen,
@@ -129,11 +134,12 @@ async function boot(): Promise<void> {
   // way. Track 1 (th07_01) is the title theme, per musiccmt.txt.
   //
   // Per-stage BGM: thbgm track layout is stage theme = 2n, boss theme =
-  // 2n+1 for stages 1-6; Extra (7) = 14/15, Phantasm (8) = 16/17. The
-  // repo only ships tracks 01-03 (the thbgmogg.dat source is absent), so
-  // AudioBus falls back gracefully when a track file is missing.
+  // 2n+1 for stages 1-6; Extra (7) = 16/17, Phantasm (8) = 18/19 (14/15
+  // are the ending/staff-roll themes — musiccmt.txt). The repo only ships
+  // tracks 01-03 (the thbgmogg.dat source is absent), so AudioBus falls
+  // back by parity when a track file is missing.
   function stageTracks(stageNumber: number): [string, string] {
-    const base = stageNumber <= 6 ? stageNumber * 2 : 14 + (stageNumber - 7) * 2;
+    const base = stageNumber <= 6 ? stageNumber * 2 : 16 + (stageNumber - 7) * 2;
     const pad = (n: number) => `th07_${String(n).padStart(2, '0')}`;
     return [pad(base), pad(base + 1)];
   }
