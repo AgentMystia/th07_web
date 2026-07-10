@@ -11,7 +11,7 @@ import type { AudioBus } from '../audio/audio';
 import { CHARACTERS, Player, type CharacterId, type PlayerBullet } from './player';
 import { PlayerEffects } from './player-effects';
 import { CherrySystem, BORDER_DURATION, CHERRY_PLUS_MAX } from './cherry';
-import { BombEngine, BombRunner, type BombContext } from './player-bombs';
+import { BombEngine, BombRunner, type AttackSlot, type BombContext } from './player-bombs';
 import { DialogueRunner, portraitSprite } from './dialogue';
 import { stageBgmTrack } from './bgm';
 
@@ -317,6 +317,7 @@ export class StageScene implements GameHost {
   private prevBombTimer = 0;
   // Moving bomb attack hitboxes (exe player+0x9dc pool; see player-bombs.ts).
   private readonly bombEngine = new BombEngine();
+  private readonly activeBombSlots: AttackSlot[] = [];
   // The active bomb form's decoded state machine (12 forms, player-bombs.ts).
   private bombRunner: BombRunner | null = null;
   // Latched bomb duration (frames) for end-window checks (ReimuA focused's
@@ -1305,6 +1306,11 @@ export class StageScene implements GameHost {
     // functions 0x407840-0x40cbf0 write player+0x9dc slots each frame).
     this.tickBombChoreography();
     this.bombFrame += this.slowRate;
+    // Choreography has fixed active/radius state for the rest of this frame.
+    // Cache the ordered object references instead of restarting the 112-slot
+    // generator for every enemy and every bullet in a dense field.
+    this.activeBombSlots.length = 0;
+    for (const slot of this.bombEngine.activeSlots()) this.activeBombSlots.push(slot);
     // Slot consumption, exe FUN_0043a980 @ 0x43a980: every active slot's
     // AABB (pos ± radius/2) is tested against the enemy box EVERY frame;
     // overlapping slots each apply their damage value per frame (the /5
@@ -1314,7 +1320,7 @@ export class StageScene implements GameHost {
       // test as shots (Th07.exe FUN_0041ed50) — emitters with op104=0 are
       // bomb-immune too.
       if (!e.ecl.canTakeDamage || !e.ecl.interactable || !e.ecl.shotCollision) continue;
-      for (const s of this.bombEngine.activeSlots()) {
+      for (const s of this.activeBombSlots) {
         const hw = (e.ecl.hitbox.x + s.radiusX) / 2;
         const hh = (e.ecl.hitbox.y + s.radiusY) / 2;
         if (Math.abs(e.x - s.x) <= hw && Math.abs(e.y - s.y) <= hh) {
@@ -1325,7 +1331,7 @@ export class StageScene implements GameHost {
     }
     for (const b of this.enemyBullets) {
       if (b.dead || (b.flags & 0x1000) !== 0) continue;
-      for (const s of this.bombEngine.activeSlots()) {
+      for (const s of this.activeBombSlots) {
         if (Math.abs(b.x - s.x) <= s.radiusX / 2 && Math.abs(b.y - s.y) <= s.radiusY / 2) {
           // Bomb attack-slot contact is a spiritual-strike cancel. Normal
           // Bomb zones pass type 6 to FUN_0043e730/e7e0; FUN_0043b040 then
@@ -2426,16 +2432,28 @@ export class StageScene implements GameHost {
         r.drawAnmFrame(frame, ox + e.x, oy + e.y, rotation != null ? { rotation } : {});
       }
       this.drawLasers(r, ox, oy);
+      // Enemy bullets dominate entity draw counts in dense spells. Their
+      // sprites are untinted, so one saved Canvas state can safely cover the
+      // whole batch while each draw assigns its own transform/alpha/blend.
+      r.ctx.save();
       for (const b of this.enemyBullets) {
         if (b.dead) continue;
         const spawning = b.age < b.spawnDuration;
-        r.drawSprite(b.rect.imageKey, b.rect.x, b.rect.y, b.rect.w, b.rect.h, ox + b.x, oy + b.y, {
-          rotation: b.angle + Math.PI / 2,
-          scaleMultiplier: spawning ? 1.6 - 0.6 * (b.age / Math.max(1, b.spawnDuration)) : 1,
-          alpha: spawning ? 0.6 + 0.4 * (b.age / Math.max(1, b.spawnDuration)) : 1,
-          blend: spawning ? 'lighter' : 'source-over'
-        });
+        r.drawSpriteInBatch(
+          b.rect.imageKey,
+          b.rect.x,
+          b.rect.y,
+          b.rect.w,
+          b.rect.h,
+          ox + b.x,
+          oy + b.y,
+          b.angle + Math.PI / 2,
+          spawning ? 1.6 - 0.6 * (b.age / Math.max(1, b.spawnDuration)) : 1,
+          spawning ? 0.6 + 0.4 * (b.age / Math.max(1, b.spawnDuration)) : 1,
+          spawning ? 'lighter' : 'source-over'
+        );
       }
+      r.ctx.restore();
       for (const it of this.items) {
         // Items falling above the top edge peek in as their per-type arrow
         // sprite (original UX; etama2 emb14-21, +10 from the item id).
@@ -2743,7 +2761,12 @@ export class StageScene implements GameHost {
   // (entity semantics); the HUD layout spec's coordinates are all top-left
   // corners (the ANM scripts run ins_22 corner-relative), so convert here.
   private blit(r: Renderer, key: string, rect: readonly number[], x: number, y: number, alpha = 1): void {
-    r.drawSprite(key, rect[0], rect[1], rect[2], rect[3], x + rect[2] / 2, y + rect[3] / 2, alpha === 1 ? {} : { alpha });
+    if (alpha === 1) {
+      const img = r.image(key);
+      if (img) r.ctx.drawImage(img, rect[0], rect[1], rect[2], rect[3], x, y, rect[2], rect[3]);
+      return;
+    }
+    r.drawSprite(key, rect[0], rect[1], rect[2], rect[3], x + rect[2] / 2, y + rect[3] / 2, { alpha });
   }
 
   // Ornate maroon screen frame: tiles front.png's sprite12 (32x32) and

@@ -33,6 +33,7 @@ export class Renderer {
   private tintImageIds = new WeakMap<HTMLImageElement, number>();
   private tintNextImageId = 1;
   private readonly tintCacheLimit = 384;
+  private tintScratch: { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -195,6 +196,37 @@ export class Renderer {
     ctx.restore();
   }
 
+  // Fast path for many untinted entity sprites. The caller must bracket a
+  // batch with one ctx.save()/restore(); every mutable state used here is
+  // assigned per sprite, so adjacent bullets cannot leak state to each other.
+  drawSpriteInBatch(
+    imageKey: string,
+    sx: number,
+    sy: number,
+    sw: number,
+    sh: number,
+    x: number,
+    y: number,
+    rotation: number,
+    scaleMultiplier: number,
+    alpha: number,
+    blend: GlobalCompositeOperation
+  ): void {
+    const img = this.assets[imageKey];
+    if (!img || alpha <= 0) return;
+    const ctx = this.ctx;
+    // Keep Canvas' own rotation path so rasterization stays pixel-identical
+    // to drawSprite(); hand-built sin/cos matrices differ in their last bits.
+    ctx.resetTransform();
+    ctx.globalAlpha = alpha;
+    ctx.globalCompositeOperation = blend;
+    ctx.translate(x, y);
+    ctx.rotate(rotation);
+    const w = Math.max(0.001, Math.abs(sw * scaleMultiplier));
+    const h = Math.max(0.001, Math.abs(sh * scaleMultiplier));
+    ctx.drawImage(img, sx, sy, sw, sh, -w / 2, -h / 2, w, h);
+  }
+
   private tintedSprite(img: HTMLImageElement | HTMLCanvasElement, sx: number, sy: number, sw: number, sh: number, dx: number, dy: number, dw: number, dh: number, color: number): void {
     const cached = this.tintedSpriteCanvas(img, sx, sy, sw, sh, color);
     if (cached) this.ctx.drawImage(cached, 0, 0, cached.width, cached.height, dx, dy, dw, dh);
@@ -218,10 +250,28 @@ export class Renderer {
     }
     const width = Math.max(1, Math.ceil(sw));
     const height = Math.max(1, Math.ceil(sh));
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
+    let canvas: HTMLCanvasElement;
+    let ctx: CanvasRenderingContext2D | null;
+    if (cacheable) {
+      canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      ctx = canvas.getContext('2d');
+    } else {
+      if (!this.tintScratch) {
+        const scratch = document.createElement('canvas');
+        const scratchCtx = scratch.getContext('2d');
+        if (!scratchCtx) return null;
+        this.tintScratch = { canvas: scratch, ctx: scratchCtx };
+      }
+      canvas = this.tintScratch.canvas;
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      ctx = this.tintScratch.ctx;
+      ctx.clearRect(0, 0, width, height);
+    }
     if (!ctx) return null;
     const c = colorParts(color);
     ctx.globalCompositeOperation = 'source-over';

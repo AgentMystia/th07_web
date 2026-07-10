@@ -136,13 +136,19 @@ test('bomb attack slots convert bullets to small cherry even at full power', () 
     { x: 12, y: 34, flags: 0x1000, dead: false }
   );
   scene.tickBombChoreography = () => {};
+  scene.activeBombSlots = [];
+  let slotScans = 0;
   scene.bombEngine = {
-    activeSlots: () => [{ x: 12, y: 34, radiusX: 16, radiusY: 16, damage: 1, hitTally: 0 }]
+    activeSlots: () => {
+      slotScans++;
+      return [{ x: 12, y: 34, radiusX: 16, radiusY: 16, damage: 1, hitTally: 0 }];
+    }
   };
 
   scene.applyBombEffects();
 
   assert.equal(scene.enemyBullets[0].dead, true);
   assert.equal(scene.enemyBullets[1].dead, false);
+  assert.equal(slotScans, 1, 'the fixed attack-slot pool is scanned once per bomb frame');
   assert.deepEqual(scene.items.map((it) => [it.type, it.state]), [['cherry', 1]]);
 });

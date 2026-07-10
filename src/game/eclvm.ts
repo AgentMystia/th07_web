@@ -171,6 +171,11 @@ export class StageRuntime {
   // FUN_00421e90 starts at a retained cursor and scans the 0x400-slot pool
   // circularly for the next free bullet.
   private bulletPoolCursor = 0;
+  // Rebuilt from the live bullet list for each independent volley. A fixed
+  // byte table preserves the exe's 0x400-slot scan order without allocating
+  // and hashing a Set for every ECL fire instruction.
+  private readonly bulletPoolOccupied = new Uint8Array(ENEMY_BULLET_CAP);
+  private readonly bulletRectCache = new Map<string, { x: number; y: number; w: number; h: number; imageKey: string }>();
   bossSlots: (Enemy | null)[] = [];
   // Th07.exe DAT_00495bf4: true while any boss entity is registered.
   private bossRegistered = false;
@@ -776,21 +781,22 @@ export class StageRuntime {
       .sort((a, b) => a.poolSlot - b.poolSlot);
   }
 
-  private occupiedBulletPoolSlots(game: GameHost): Set<number> {
-    const occupied = new Set<number>();
+  private occupiedBulletPoolSlots(game: GameHost): Uint8Array {
+    const occupied = this.bulletPoolOccupied;
+    occupied.fill(0);
     for (const bullet of game.enemyBullets) {
       if (!bullet.dead && bullet.poolSlot >= 0 && bullet.poolSlot < ENEMY_BULLET_CAP) {
-        occupied.add(bullet.poolSlot);
+        occupied[bullet.poolSlot] = 1;
       }
     }
     return occupied;
   }
 
-  private allocateBulletPoolSlot(occupied: Set<number>): number {
+  private allocateBulletPoolSlot(occupied: Uint8Array): number {
     for (let i = 0; i < ENEMY_BULLET_CAP; i++) {
       const slot = (this.bulletPoolCursor + i) % ENEMY_BULLET_CAP;
-      if (occupied.has(slot)) continue;
-      occupied.add(slot);
+      if (occupied[slot]) continue;
+      occupied[slot] = 1;
       this.bulletPoolCursor = (slot + 1) % ENEMY_BULLET_CAP;
       return slot;
     }
@@ -2005,18 +2011,24 @@ export class StageRuntime {
   private badBulletWarned = new Set<string>();
 
   bulletRect(sprite: number, offset: number): { x: number; y: number; w: number; h: number; imageKey: string } {
+    const key = `${sprite}:${offset}`;
+    const cached = this.bulletRectCache.get(key);
+    if (cached) return cached;
     try {
-      return this.bulletRectInEntry0(sprite, offset);
+      const rect = this.bulletRectInEntry0(sprite, offset);
+      this.bulletRectCache.set(key, rect);
+      return rect;
     } catch (err) {
       // Degrade to the plain pellet instead of throwing: an uncaught throw
       // here escapes StageRuntime.update and halts the rAF loop (frozen
       // game). Warn once per combo so bad data stays visible in dev.
-      const key = `${sprite}:${offset}`;
       if (!this.badBulletWarned.has(key)) {
         this.badBulletWarned.add(key);
         console.warn(`bulletRect: fallback for script ${sprite} offset ${offset}: ${err}`);
       }
-      return this.bulletRectInEntry0(0, 0);
+      const rect = this.bulletRectInEntry0(0, 0);
+      this.bulletRectCache.set(key, rect);
+      return rect;
     }
   }
 
@@ -2033,12 +2045,13 @@ export class StageRuntime {
     e: Enemy,
     p: BulletProps,
     origin: { x: number; y: number } | null = null,
-    occupiedPoolSlots: Set<number> | null = null
+    occupiedPoolSlots: Uint8Array | null = null
   ): void {
     const shootX = origin?.x ?? e.x + e.ecl.shootOffset.x;
     const shootY = origin?.y ?? e.y + e.ecl.shootOffset.y;
     const aim = Math.atan2(game.player.y - shootY, game.player.x - shootX);
     const occupied = occupiedPoolSlots ?? this.occupiedBulletPoolSlots(game);
+    let rect: { x: number; y: number; w: number; h: number; imageKey: string } | null = null;
     for (let j = 0; j < p.count2; j++) {
       const speed = p.speed1 - (p.speed1 - p.speed2) * j / p.count2;
       for (let i = 0; i < p.count1; i++) {
@@ -2065,7 +2078,7 @@ export class StageRuntime {
         }
         angle = normalizeAngle(angle);
         const spd = p.aimMode === 7 || p.aimMode === 8 ? game.rng.range(p.speed1 - p.speed2) + p.speed2 : speed;
-        const rect = this.bulletRect(p.sprite, p.offset);
+        if (!rect) rect = this.bulletRect(p.sprite, p.offset);
         const flags = p.flags | 0;
         // Spawn-in effect: bullets ease in at reduced speed while flashing.
         const spawnDuration = flags & 2 ? 8 : flags & 4 ? 11 : flags & 8 ? 14 : 0;
