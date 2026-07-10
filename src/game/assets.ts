@@ -98,6 +98,8 @@ const IMAGE_FILES: Record<string, string> = {
   front: 'assets/th07-img/front.png',
   ename: 'assets/th07-img/ename.png',
   loading: 'assets/th07-img/loading.png',
+  loading2: 'assets/th07-img/loading2.png',
+  loading3: 'assets/th07-img/loading3.png',
   title00: 'assets/th07-img/title00.jpg',
   select00: 'assets/th07-img/select00.jpg',
   th07logo: 'assets/th07-img/th07logo.jpg'

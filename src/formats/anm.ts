@@ -192,6 +192,8 @@ export interface AnmFrame {
   imageKey: string;
   scaleX: number;
   scaleY: number;
+  rotationX: number;
+  rotationY: number;
   rotation: number;
   color: number;
   alpha: number;
@@ -213,6 +215,9 @@ export interface AnmRunnerOptions {
   spriteIndexOffset?: number;
   rng?: Rng;
   color?: number;
+  // Runtime textures such as capture.anm's "@" have no file-backed image
+  // key. Callers provide the renderer asset registered for that surface.
+  imageKey?: string;
   // Disambiguates `scriptId` when the ANM file has multiple entries that
   // reuse overlapping on-disk ids (see Anm.scriptRefInEntry). Index matches
   // Anm.entries (0-based, file order). Omit for the plain flat lookup used
@@ -271,7 +276,7 @@ export class AnmRunner {
     this.scriptId = scriptId;
     const ref = options.entryIndex != null ? anm.scriptRefInEntry(options.entryIndex, scriptId) : anm.scriptRef(scriptId);
     this.scriptStart = ref.start;
-    this.imageKey = ref.imageKey;
+    this.imageKey = options.imageKey ?? ref.imageKey;
     this.ip = ref.start;
     this.spriteIndexOffset = options.spriteIndexOffset ?? 0;
     this.rng = options.rng;
@@ -291,6 +296,13 @@ export class AnmRunner {
   private setVal(rawId: number, value: number): void {
     const idx = Math.round(rawId) - ANM_VAR_BASE;
     if (idx >= 0 && idx < ANM_VAR_COUNT) this.vars[idx] = value;
+  }
+
+  // Native callers can seed ANM VM scratch variables after constructing a
+  // runner. Stage-to-stage capture tiles use variable 8 as their staggered
+  // wait duration (Th07.exe v1.00b @ 0x4275e7-0x42760f).
+  setVariable(index: number, value: number): void {
+    if (index >= 0 && index < ANM_VAR_COUNT) this.vars[index] = value;
   }
 
   interrupt(label: number): boolean {
@@ -394,13 +406,13 @@ export class AnmRunner {
       if (time > this.frame) return;
       const a = this.ip + 8;
       this.ip += length;
-      this.execute(type, a, time);
+      this.execute(type, a);
       if (this.stopped || this.removed || this.waiting) return;
     }
     throw new Error(`${this.anm.name}: ANM script ${this.scriptId} exceeded instruction guard`);
   }
 
-  private execute(type: number, a: number, time: number): void {
+  private execute(type: number, a: number): void {
     const v = this.anm.view;
     switch (type) {
       case 0: // noop
@@ -481,7 +493,7 @@ export class AnmRunner {
         this.scaleSpeedY = v.f32(a + 4);
         break;
       case 15: // fade to alpha over duration
-        this.fadeInterp = { start: time, duration: Math.max(1, v.i32(a + 4)), formula: 0, from: [this.alpha], to: [v.i32(a) & 0xff] };
+        this.fadeInterp = { start: this.frame, duration: Math.max(1, v.i32(a + 4)), formula: 0, from: [this.alpha], to: [v.i32(a) & 0xff] };
         break;
       case 16: // blend mode (bit 0 = additive)
         this.blendAdd = (v.i32(a) & 1) !== 0;
@@ -493,7 +505,7 @@ export class AnmRunner {
         const fromX = this.useOffset ? this.offX : this.x;
         const fromY = this.useOffset ? this.offY : this.y;
         this.moveInterp = {
-          start: time,
+          start: this.frame,
           duration: Math.max(1, v.i32(a + 12)),
           formula,
           from: [fromX, fromY],
@@ -526,14 +538,14 @@ export class AnmRunner {
         this.visible = !!v.i32(a);
         break;
       case 29: // scale over duration (linear)
-        this.scaleInterp = { start: time, duration: Math.max(1, v.i32(a + 8)), formula: 0, from: [this.scaleX, this.scaleY], to: [v.f32(a), v.f32(a + 4)] };
+        this.scaleInterp = { start: this.frame, duration: Math.max(1, v.i32(a + 8)), formula: 0, from: [this.scaleX, this.scaleY], to: [v.f32(a), v.f32(a + 4)] };
         break;
       case 30: // render-state flag (z-buffer related); no effect in Canvas renderer
       case 31: // render-state flag; no effect in Canvas renderer
         break;
       case 32: // move with formula
         this.moveInterp = {
-          start: time,
+          start: this.frame,
           duration: Math.max(1, v.i32(a)),
           formula: v.i32(a + 4),
           from: [this.useOffset ? this.offX : this.x, this.useOffset ? this.offY : this.y],
@@ -543,7 +555,7 @@ export class AnmRunner {
       case 33: { // color transition with formula
         const packed = v.u32(a + 8);
         this.colorInterp = {
-          start: time,
+          start: this.frame,
           duration: Math.max(1, v.i32(a)),
           formula: v.i32(a + 4),
           from: [(this.colorRgb >> 16) & 0xff, (this.colorRgb >> 8) & 0xff, this.colorRgb & 0xff],
@@ -552,11 +564,11 @@ export class AnmRunner {
         break;
       }
       case 34: // fade with formula
-        this.fadeInterp = { start: time, duration: Math.max(1, v.i32(a)), formula: v.i32(a + 4), from: [this.alpha], to: [v.i32(a + 8) & 0xff] };
+        this.fadeInterp = { start: this.frame, duration: Math.max(1, v.i32(a)), formula: v.i32(a + 4), from: [this.alpha], to: [v.i32(a + 8) & 0xff] };
         break;
       case 35: // rotate with formula
         this.rotInterp = {
-          start: time,
+          start: this.frame,
           duration: Math.max(1, v.i32(a)),
           formula: v.i32(a + 4),
           from: [this.rotX, this.rotY, this.rotZ],
@@ -565,7 +577,7 @@ export class AnmRunner {
         break;
       case 36: // scale with formula
         this.scaleInterp = {
-          start: time,
+          start: this.frame,
           duration: Math.max(1, v.i32(a)),
           formula: v.i32(a + 4),
           from: [this.scaleX, this.scaleY],
@@ -603,10 +615,14 @@ export class AnmRunner {
         }
         break;
       }
-      case 79: // wait a fixed number of frames
+      case 79: { // wait a variable-resolved number of frames
+        const duration = Math.max(0, this.getVal(v.i32(a)));
+        // A zero wait falls through on the same VM tick in the executable.
+        if (duration <= 0) break;
         this.waiting = true;
-        this.waitTimeout = this.frame + v.i32(a);
+        this.waitTimeout = this.frame + duration;
         break;
+      }
       default:
         throw new Error(`${this.anm.name}: unhandled ANM v2 opcode ${type} in script ${this.scriptId}`);
     }
@@ -624,6 +640,8 @@ export class AnmRunner {
       imageKey: this.rect.imageKey || this.imageKey || '',
       scaleX: this.mirrored ? -this.scaleX : this.scaleX,
       scaleY: this.flipY ? -this.scaleY : this.scaleY,
+      rotationX: this.rotX,
+      rotationY: this.rotY,
       rotation: this.rotZ,
       color: (((this.alpha & 0xff) << 24) | this.colorRgb) >>> 0,
       alpha: this.alpha,

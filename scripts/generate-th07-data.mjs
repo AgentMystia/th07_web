@@ -84,6 +84,7 @@ const anm = (name) => stripAnmTextures(readFileSync(join(source, name)), name).t
 const ANM_FILES = [
   'etama', 'player00', 'player01', 'player02',
   'ascii', 'text', 'title01', 'capture', 'front',
+  'loading', 'loading2', 'loading3',
   'face_rm00', 'face_mr00', 'face_sk00',
   'stg1enm', 'stg2enm', 'stg3enm', 'stg4enm', 'stg5enm', 'stg6enm', 'stg7enm', 'stg8enm',
   'stg1bg', 'stg2bg', 'stg3bg', 'stg4bg', 'stg4bg2', 'stg4bg3', 'stg4bg4', 'stg4bg5',

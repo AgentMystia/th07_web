@@ -15,6 +15,9 @@ export interface DrawOptions {
   color?: number;
   rotation?: number;
   blend?: GlobalCompositeOperation;
+  sourceOffsetX?: number;
+  sourceOffsetY?: number;
+  project3d?: boolean;
 }
 
 function colorParts(color: number): { r: number; g: number; b: number } {
@@ -24,7 +27,7 @@ function colorParts(color: number): { r: number; g: number; b: number } {
 export class Renderer {
   readonly canvas: HTMLCanvasElement;
   readonly ctx: CanvasRenderingContext2D;
-  assets: Record<string, HTMLImageElement> = {};
+  assets: Record<string, HTMLImageElement | HTMLCanvasElement> = {};
   private tintCache = new Map<string, HTMLCanvasElement>();
   private tintCacheOrder: string[] = [];
   private tintImageIds = new WeakMap<HTMLImageElement, number>();
@@ -44,7 +47,7 @@ export class Renderer {
     this.ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
   }
 
-  image(key: string): HTMLImageElement | null {
+  image(key: string): HTMLImageElement | HTMLCanvasElement | null {
     return this.assets[key] ?? null;
   }
 
@@ -73,6 +76,15 @@ export class Renderer {
     if (alpha <= 0) return false;
     const color = (options.color ?? frame.color) >>> 0;
     const tint = (color & 0x00ffffff) !== 0x00ffffff;
+    const sourceX = frame.x + (options.sourceOffsetX ?? 0);
+    const sourceY = frame.y + (options.sourceOffsetY ?? 0);
+    if (options.project3d && (frame.rotationX !== 0 || frame.rotationY !== 0)) {
+      return this.drawProjectedAnmFrame(
+        img, frame, sourceX, sourceY, drawX, drawY, w, h,
+        options.rotation ?? frame.rotation, alpha, color, tint,
+        options.blend ?? (frame.blendAdd ? 'lighter' : 'source-over')
+      );
+    }
     ctx.save();
     ctx.globalAlpha = alpha;
     ctx.globalCompositeOperation = options.blend ?? (frame.blendAdd ? 'lighter' : 'source-over');
@@ -80,8 +92,80 @@ export class Renderer {
     ctx.rotate(options.rotation ?? frame.rotation);
     if (scaleX < 0 || frame.flipX) ctx.scale(-1, 1);
     if (scaleY < 0 || frame.flipY) ctx.scale(1, -1);
-    if (tint) this.tintedSprite(img, frame.x, frame.y, frame.w, frame.h, -anchorX, -anchorY, w, h, color);
-    else ctx.drawImage(img, frame.x, frame.y, frame.w, frame.h, -anchorX, -anchorY, w, h);
+    if (tint) this.tintedSprite(img, sourceX, sourceY, frame.w, frame.h, -anchorX, -anchorY, w, h, color);
+    else ctx.drawImage(img, sourceX, sourceY, frame.w, frame.h, -anchorX, -anchorY, w, h);
+    ctx.restore();
+    return true;
+  }
+
+  private drawProjectedAnmFrame(
+    img: HTMLImageElement | HTMLCanvasElement,
+    frame: AnmFrame,
+    sourceX: number,
+    sourceY: number,
+    drawX: number,
+    drawY: number,
+    width: number,
+    height: number,
+    rotationZ: number,
+    alpha: number,
+    color: number,
+    tint: boolean,
+    blend: GlobalCompositeOperation
+  ): boolean {
+    let source: CanvasImageSource = img;
+    let sx = sourceX;
+    let sy = sourceY;
+    let sw = frame.w;
+    let sh = frame.h;
+    if (tint) {
+      const tinted = this.tintedSpriteCanvas(img, sourceX, sourceY, frame.w, frame.h, color);
+      if (!tinted) return false;
+      source = tinted;
+      sx = 0;
+      sy = 0;
+      sw = tinted.width;
+      sh = tinted.height;
+    }
+
+    // Th07.exe v1.00b FUN_00449e60 @ 0x449e60 multiplies Scale * RotX *
+    // RotY * RotZ before FUN_0044a170 projects the quad. The default camera
+    // setup @ 0x4330ed uses a 30-degree vertical FOV and positions the target
+    // plane at focal distance 240/tan(15deg), making z=0 exactly 1px:1px.
+    const focal = 240 / Math.tan(Math.PI / 12);
+    const cx = Math.cos(frame.rotationX);
+    const sxRot = Math.sin(frame.rotationX);
+    const cy = Math.cos(frame.rotationY);
+    const syRot = Math.sin(frame.rotationY);
+    const cz = Math.cos(rotationZ);
+    const sz = Math.sin(rotationZ);
+    const project = (x: number, y: number): [number, number] => {
+      // Row-vector rotations in the same X -> Y -> Z order as D3D's matrices.
+      const y1 = y * cx;
+      const z1 = y * sxRot;
+      const x2 = x * cy + z1 * syRot;
+      const z2 = -x * syRot + z1 * cy;
+      const x3 = x2 * cz - y1 * sz;
+      const y3 = x2 * sz + y1 * cz;
+      const perspective = focal / (focal + z2);
+      return [drawX + x3 * perspective, drawY + y3 * perspective];
+    };
+
+    const left = frame.anchorTopLeft ? 0 : -width / 2;
+    const top = frame.anchorTopLeft ? 0 : -height / 2;
+    const right = left + width;
+    const bottom = top + height;
+    const tl = project(left, top);
+    const tr = project(right, top);
+    const bl = project(left, bottom);
+    const br = project(right, bottom);
+
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.globalCompositeOperation = blend;
+    this.drawAffineTriangle(source, sx, sy, tl[0], tl[1], sx + sw, sy, tr[0], tr[1], sx, sy + sh, bl[0], bl[1]);
+    this.drawAffineTriangle(source, sx, sy + sh, bl[0], bl[1], sx + sw, sy, tr[0], tr[1], sx + sw, sy + sh, br[0], br[1]);
     ctx.restore();
     return true;
   }
@@ -111,22 +195,29 @@ export class Renderer {
     ctx.restore();
   }
 
-  private tintedSprite(img: HTMLImageElement, sx: number, sy: number, sw: number, sh: number, dx: number, dy: number, dw: number, dh: number, color: number): void {
+  private tintedSprite(img: HTMLImageElement | HTMLCanvasElement, sx: number, sy: number, sw: number, sh: number, dx: number, dy: number, dw: number, dh: number, color: number): void {
     const cached = this.tintedSpriteCanvas(img, sx, sy, sw, sh, color);
     if (cached) this.ctx.drawImage(cached, 0, 0, cached.width, cached.height, dx, dy, dw, dh);
   }
 
-  private tintedSpriteCanvas(img: HTMLImageElement, sx: number, sy: number, sw: number, sh: number, color: number): HTMLCanvasElement | null {
-    let imageId = this.tintImageIds.get(img);
-    if (!imageId) {
-      imageId = this.tintNextImageId++;
-      this.tintImageIds.set(img, imageId);
+  private tintedSpriteCanvas(img: HTMLImageElement | HTMLCanvasElement, sx: number, sy: number, sw: number, sh: number, color: number): HTMLCanvasElement | null {
+    // Runtime capture canvases are rewritten in-place. Caching their tinted
+    // pixels would show stale stage frames, while capture script 1's 60-frame
+    // color tween would also churn a large entry every frame.
+    const cacheable = img instanceof HTMLImageElement;
+    let key: string | null = null;
+    if (cacheable) {
+      let imageId = this.tintImageIds.get(img);
+      if (!imageId) {
+        imageId = this.tintNextImageId++;
+        this.tintImageIds.set(img, imageId);
+      }
+      key = `${imageId}:${sx}:${sy}:${sw}:${sh}:${color >>> 0}`;
+      const hit = this.tintCache.get(key);
+      if (hit) return hit;
     }
     const width = Math.max(1, Math.ceil(sw));
     const height = Math.max(1, Math.ceil(sh));
-    const key = `${imageId}:${sx}:${sy}:${sw}:${sh}:${color >>> 0}`;
-    const hit = this.tintCache.get(key);
-    if (hit) return hit;
     const canvas = document.createElement('canvas');
     canvas.width = width;
     canvas.height = height;
@@ -141,13 +232,37 @@ export class Renderer {
     ctx.globalCompositeOperation = 'destination-in';
     ctx.drawImage(img, sx, sy, sw, sh, 0, 0, width, height);
     ctx.globalCompositeOperation = 'source-over';
-    this.tintCache.set(key, canvas);
-    this.tintCacheOrder.push(key);
-    while (this.tintCacheOrder.length > this.tintCacheLimit) {
-      const oldKey = this.tintCacheOrder.shift();
-      if (oldKey) this.tintCache.delete(oldKey);
+    if (key) {
+      this.tintCache.set(key, canvas);
+      this.tintCacheOrder.push(key);
+      while (this.tintCacheOrder.length > this.tintCacheLimit) {
+        const oldKey = this.tintCacheOrder.shift();
+        if (oldKey) this.tintCache.delete(oldKey);
+      }
     }
     return canvas;
+  }
+
+  // Th07.exe FUN_00432320 @ 0x432320 -> FUN_0044ead0 @ 0x44ead0:
+  // stage-clear capture copies the previous backbuffer's playfield 1:1 into
+  // capture.anm sprite 1's runtime "@" texture rect (128,0,384,448).
+  capturePlayfield(key = 'capture:@'): void {
+    let surface = this.assets[key];
+    if (!(surface instanceof HTMLCanvasElement)) {
+      surface = document.createElement('canvas');
+      surface.width = 512;
+      surface.height = 512;
+      this.assets[key] = surface;
+    }
+    const ctx = surface.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, surface.width, surface.height);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(
+      this.canvas,
+      PLAYFIELD.x, PLAYFIELD.y, PLAYFIELD.width, PLAYFIELD.height,
+      128, 0, PLAYFIELD.width, PLAYFIELD.height
+    );
   }
 
   text(str: string, x: number, y: number, options: { size?: number; color?: string; align?: CanvasTextAlign; stroke?: boolean; font?: string } = {}): void {

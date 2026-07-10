@@ -78,6 +78,7 @@ try {
     }
   });
   const before = await page.evaluate(() => window.__TH07_TEST__.snapshot());
+  const outgoingPixel = await page.evaluate(() => window.__TH07_TEST__.pixelAt(200, 200));
   assert.equal(before.stageNumber, 1);
   assert.equal(before.stageClear, true);
 
@@ -92,6 +93,17 @@ try {
   assert.equal(after.mode, 'arcade');
   assert.equal(after.difficulty, before.difficulty);
   assert.equal(after.character, before.character);
+  assert.deepEqual(after.stageTransition, {
+    timer: 0,
+    total: 168,
+    live: 168,
+    first: { script: 2, frame: 0, delay: 0 },
+    last: { script: 2, frame: 0, delay: 35 }
+  });
+  // New-stage init captures the outgoing Stage Clear backbuffer before it
+  // clears the canvas. Runtime texture (128,0) corresponds to screen (32,16).
+  const capturedPixel = await page.evaluate(() => window.__TH07_TEST__.capturePixel(296, 184));
+  assert.deepEqual(capturedPixel, outgoingPixel);
 
   const carried = {
     score: after.score,
@@ -123,11 +135,33 @@ try {
   assert.equal(bgm.active, 'th07_04');
   assert.deepEqual(errors, []);
 
-  await page.screenshot({ path: '/tmp/arcade-stage2-intro.png' });
+  await page.screenshot({ path: '/tmp/arcade-transition-000.png' });
+  const transition = [{ timer: 0, live: after.stageTransition.live }];
+  let advanced = 0;
+  for (const target of [20, 40, 60, 80, 100]) {
+    await page.evaluate((frames) => {
+      for (let i = 0; i < frames; i++) {
+        window.__TH07_TEST__.setInvuln(300);
+        window.__TH07_TEST__.inject([], []);
+        window.__TH07_TEST__.advance(1);
+      }
+    }, target - advanced);
+    advanced = target;
+    const state = await page.evaluate(() => window.__TH07_TEST__.snapshot());
+    assert.equal(state.stageNumber, 2);
+    assert.equal(state.stageClear, false);
+    transition.push({ timer: state.stageTransition.timer, live: state.stageTransition.live });
+    await page.screenshot({ path: `/tmp/arcade-transition-${String(target).padStart(3, '0')}.png` });
+  }
+  assert.equal(transition[3].live, 168, 'capture cells remain live through script frame 60');
+  assert.equal(transition[4].live, 0, 'all capture cells retire immediately after script frame 61');
+  assert.equal(transition.at(-1).live, 0, 'all 168 capture cells must retire by transition frame 100');
   console.log(JSON.stringify({
     clearFrame: clear.frame,
     fromStage: before.stageNumber,
     toStage: after.stageNumber,
+    captureMatchesOutgoing: true,
+    transition,
     carried,
     bgm: bgm.active,
     pageErrors: errors.length

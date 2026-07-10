@@ -16,6 +16,7 @@ interface TestHook {
   setInvuln(frames: number): void;
   snapshot(): Record<string, unknown>;
   pixelAt(x: number, y: number): number[];
+  capturePixel(x: number, y: number): number[];
   setPlayer(x: number, y: number): void;
   setPower(v: number): void;
   inject(held: string[], pressed: string[]): void;
@@ -63,6 +64,38 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
       near: Math.round(l.nearDist), far: Math.round(l.farDist), w: Number(l.displayWidth.toFixed(1)), state: l.state
     })),
     stageClear: scene.stageClear,
+    stageClearTimer: scene.stageClearTimer,
+    clearPresentation: {
+      loadingKey: scene.clearLoadingKey,
+      loading: scene.clearLoadingRunner ? {
+        id: scene.clearLoadingRunner.scriptId,
+        frame: Math.round(scene.clearLoadingRunner.frame),
+        removed: scene.clearLoadingRunner.removed,
+        visible: scene.clearLoadingRunner.visible
+      } : null,
+      capture: scene.clearCaptureRunner ? {
+        id: scene.clearCaptureRunner.scriptId,
+        frame: Math.round(scene.clearCaptureRunner.frame),
+        removed: scene.clearCaptureRunner.removed,
+        visible: scene.clearCaptureRunner.visible,
+        waiting: scene.clearCaptureRunner.waiting
+      } : null
+    },
+    stageTransition: {
+      timer: scene.stageTransitionTimer,
+      total: scene.stageTransitionTiles.length,
+      live: scene.stageTransitionTiles.filter((tile) => !tile.runner.removed).length,
+      first: scene.stageTransitionTiles[0] ? {
+        script: scene.stageTransitionTiles[0].runner.scriptId,
+        frame: Math.round(scene.stageTransitionTiles[0].runner.frame),
+        delay: scene.stageTransitionTiles[0].delay
+      } : null,
+      last: scene.stageTransitionTiles.length ? {
+        script: scene.stageTransitionTiles[scene.stageTransitionTiles.length - 1].runner.scriptId,
+        frame: Math.round(scene.stageTransitionTiles[scene.stageTransitionTiles.length - 1].runner.frame),
+        delay: scene.stageTransitionTiles[scene.stageTransitionTiles.length - 1].delay
+      } : null
+    },
     gameOver: scene.gameOver,
     continueActive: !!scene.continueScreen,
     spellName: scene.spellName,
@@ -264,6 +297,12 @@ async function boot(): Promise<void> {
       advance: (n: number) => loop.advance(n),
       snapshot: () => (menu ? menu.snapshot() : stageSnapshot(stage!)),
       pixelAt: (x: number, y: number) => Array.from(renderer.ctx.getImageData(x, y, 1, 1).data),
+      capturePixel: (x: number, y: number) => {
+        const surface = renderer.image('capture:@');
+        if (!(surface instanceof HTMLCanvasElement)) return [0, 0, 0, 0];
+        const ctx = surface.getContext('2d');
+        return ctx ? Array.from(ctx.getImageData(x, y, 1, 1).data) : [0, 0, 0, 0];
+      },
       setPlayer: (x: number, y: number) => {
         if (!stage) return;
         stage.playerObj.x = x;

@@ -53,6 +53,7 @@ const ITEM_SPRITES: Record<ItemType, number> = {
 // Per-type offscreen indicator arrows sit 10 embedded ids after their item
 // (emb14-21, same order) — drawn while an item is still above the top edge.
 const ITEM_ARROW_OFFSET = 10;
+const CLEAR_LOADING_ANM = ['loading', 'loading2', 'loading3'] as const;
 
 // SE slot table, Th07.exe @ 0x494a78 (38 entries × 8 bytes: {i32 wavIndex,
 // i16 volume_millibels, i16 priority}), read from the exe binary. Sound ids
@@ -109,6 +110,17 @@ interface ScorePopup {
   timer: number;
   timerFrac: number;
   active: boolean;
+}
+
+interface StageTransitionTile {
+  runner: AnmRunner;
+  row: number;
+  column: number;
+  delay: number;
+  x: number;
+  y: number;
+  sourceX: number;
+  sourceY: number;
 }
 
 const makeScorePopup = (): ScorePopup => ({
@@ -225,7 +237,7 @@ export class StageScene implements GameHost {
   continueScreen: { cursor: number } | null = null;
   continuesUsed = 0;
   private gameOverTimer = 0;
-  private stageClearTimer = 0;
+  stageClearTimer = 0;
   private exitFired = false;
   private stageCompleteFired = false;
   cherry: CherrySystem;
@@ -235,6 +247,13 @@ export class StageScene implements GameHost {
   stageFrame = 0;
   stageClear = false;
   private clearTimer = 0;
+  clearLoadingRunner: AnmRunner | null = null;
+  clearCaptureRunner: AnmRunner | null = null;
+  clearLoadingKey: string | null = null;
+  private clearCaptureArmed = false;
+  stageTransitionTimer = 0;
+  stageTransitionTiles: StageTransitionTile[] = [];
+  private stageTransitionCaptureArmed = false;
   readonly stageNumber: number;
   private stageIntroRunners: AnmRunner[] = [];
   private readonly bgScripts = new Map<number, { anm: Anm; entryIndex: number; localId: number; spriteBase: number }>();
@@ -435,6 +454,7 @@ export class StageScene implements GameHost {
       this.cherry.cherryPlus = carry.cherryPlus;
       this.cherry.spellsCaptured = carry.spellsCaptured;
       this.extendLevel = carry.extendLevel;
+      this.startStageTransition();
     }
   }
 
@@ -993,14 +1013,16 @@ export class StageScene implements GameHost {
     if (this.gameOver && this.mode === 'arcade') {
       if (++this.gameOverTimer > 240) this.exitToTitle();
     }
-    if (this.stageClear && this.mode === 'arcade') {
+    if (this.stageClear) {
       this.stageClearTimer++;
+      this.clearLoadingRunner?.update(this.slowRate);
+      this.clearCaptureRunner?.update(this.slowRate);
       // Advance on Z once the tally has been visible for a beat, or after
       // the timeout. Stages 1-5 hand the run to the next stage; stage 6 /
       // Extra / Phantasm end the credit back at the title.
       const advance =
         (this.stageClearTimer > 90 && input.pressed.has('shoot')) || this.stageClearTimer > 900;
-      if (advance && !this.stageCompleteFired) {
+      if (this.mode === 'arcade' && advance && !this.stageCompleteFired) {
         this.stageCompleteFired = true;
         if (this.stageNumber < 6 && this.onStageComplete) {
           this.onStageComplete(this.carryState());
@@ -1074,6 +1096,10 @@ export class StageScene implements GameHost {
     for (const runner of this.stageIntroRunners) {
       if (!runner.removed) runner.update(this.slowRate);
     }
+    if (this.stageTransitionTiles.some((tile) => !tile.runner.removed)) {
+      this.stageTransitionTimer++;
+      for (const tile of this.stageTransitionTiles) tile.runner.update(this.slowRate);
+    }
     if (this.dialogue) {
       this.dialogueSeen = true;
       this.dialogue.update(input.pressed.has('shoot'), input.held.has('skip'));
@@ -1107,6 +1133,7 @@ export class StageScene implements GameHost {
         this.stageClear = true;
         this.audio.fadeOutBgm(4);
         this.computeClearBonus();
+        this.startStageClearPresentation();
       }
     }
     if (!frozen) {
@@ -2364,6 +2391,14 @@ export class StageScene implements GameHost {
   // -- draw ------------------------------------------------------------------
 
   draw(r: Renderer): void {
+    // The native one-shot capture flush runs before the next render, while
+    // the backbuffer still holds the final live playfield. Capturing after
+    // clear() would record the presentation itself instead.
+    if (this.clearCaptureArmed || this.stageTransitionCaptureArmed) {
+      r.capturePlayfield();
+      this.clearCaptureArmed = false;
+      this.stageTransitionCaptureArmed = false;
+    }
     r.clear('#101018');
     r.ctx.fillStyle = '#04040c';
     r.ctx.fillRect(PLAYFIELD.x, PLAYFIELD.y, PLAYFIELD.width, PLAYFIELD.height);
@@ -2497,6 +2532,7 @@ export class StageScene implements GameHost {
     });
     this.drawFrame(r);
     this.drawSidebar(r);
+    if (this.stageClear) this.drawStageClearPresentation(r);
     this.drawSpellOverlay(r);
     this.drawDialogue(r);
     this.drawStageTitle(r);
@@ -2504,8 +2540,77 @@ export class StageScene implements GameHost {
     if (this.bonusPopup) this.drawSpellBonusPopup(r);
     if (this.bossActive) this.drawBossMarker(r);
     if (this.stageClear) this.drawStageClear(r);
+    this.drawStageTransition(r);
     if (this.continueScreen) this.drawContinueScreen(r);
     else if (this.gameOver) r.text('GAME OVER', PLAYFIELD.x + 140, PLAYFIELD.y + 200, { size: 20, color: '#f66' });
+  }
+
+  private startStageClearPresentation(): void {
+    // Th07.exe stage-clear case 9 @ all.c:17916-17936: stages 1-5 pair the
+    // selected character's loading ANM script 0 (global 0x61e) with only
+    // capture.anm script 1 (global 0x725). Capture scripts 0/2/3 belong to
+    // separate transitions and are intentionally not created here.
+    if (this.stageNumber >= 6) return;
+    const family = CHARACTERS[this.playerObj.character].family;
+    const loadingKey = CLEAR_LOADING_ANM[family] ?? CLEAR_LOADING_ANM[0];
+    this.clearLoadingKey = loadingKey;
+    this.clearLoadingRunner = new AnmRunner(this.assets.anms[loadingKey], 0);
+    this.clearCaptureRunner = new AnmRunner(this.assets.anms.capture, 1, { imageKey: 'capture:@' });
+    this.clearCaptureArmed = true;
+  }
+
+  private drawStageClearPresentation(r: Renderer): void {
+    // Native draw order @ all.c:18798-18800: full-playfield loading art,
+    // then the rotating/shrinking captured frame. Both ANMs contain absolute
+    // 640x480 screen coordinates, so the caller contributes no playfield base.
+    r.drawAnmFrame(this.clearLoadingRunner?.spriteFrame() ?? null, 0, 0);
+    r.drawAnmFrame(this.clearCaptureRunner?.spriteFrame() ?? null, 0, 0);
+  }
+
+  private startStageTransition(): void {
+    // Th07.exe FUN_00427269 @ 0x42740a-0x42770e, entered for game state 3:
+    // capture the outgoing playfield, split it into 12x14 32px cells, then
+    // seed capture.anm scripts 2/3 with var8 = row + 2*column. Their original
+    // ANM bytecode staggers a 60-frame quadratic shrink/fade/rotation, which
+    // reveals the already-running next stage beneath the old clear screen.
+    const capture = this.assets.anms.capture;
+    this.stageTransitionTiles.length = 0;
+    for (let row = 0; row < 14; row++) {
+      for (let column = 0; column < 12; column++) {
+        const script = 2 + ((row + column) & 1);
+        const delay = row + column * 2;
+        const runner = new AnmRunner(capture, script, { imageKey: 'capture:@' });
+        runner.setVariable(8, delay);
+        this.stageTransitionTiles.push({
+          runner,
+          row,
+          column,
+          delay,
+          // Exe coordinates are cell*32 - 0.5 + 16 (center semantics).
+          x: column * 32 + 15.5,
+          y: row * 32 + 15.5,
+          sourceX: column * 32,
+          sourceY: row * 32
+        });
+      }
+    }
+    this.stageTransitionTimer = 0;
+    this.stageTransitionCaptureArmed = true;
+  }
+
+  private drawStageTransition(r: Renderer): void {
+    if (!this.stageTransitionTiles.some((tile) => !tile.runner.removed)) return;
+    r.clipPlayfield(() => {
+      for (const tile of this.stageTransitionTiles) {
+        if (tile.runner.removed) continue;
+        r.drawAnmFrame(
+          tile.runner.spriteFrame(),
+          PLAYFIELD.x + tile.x,
+          PLAYFIELD.y + tile.y,
+          { sourceOffsetX: tile.sourceX, sourceOffsetY: tile.sourceY, project3d: true }
+        );
+      }
+    });
   }
 
   // Shared Full-Power/Border message slot, exact text/timing/slide from
