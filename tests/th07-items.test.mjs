@@ -30,8 +30,9 @@ test('item sprites resolve to 16x16 etama2 rects in the item row', () => {
     7: [48, 64], // bomb (green B)
     8: [64, 64], // fullPower (yellow F)
     9: [80, 64], // life (1up)
-    10: [96, 64], // pointBullet (star box)
-    11: [112, 64] // cherry (boxed petal)
+    10: [96, 64], // cherry / type-6 cancel item (grey box)
+    11: [112, 64], // bigCherry / type 7 (boxed petal)
+    12: [0, 80] // pointBullet / type 8 (retail-unused)
   };
   for (const [emb, [x, y]] of Object.entries(expected)) {
     const s = etama.sprites.get(base + Number(emb));
@@ -43,7 +44,7 @@ test('item sprites resolve to 16x16 etama2 rects in the item row', () => {
 
 test('offscreen arrow variants sit +10 embedded ids after each item', () => {
   const base = etama.entries[1].spriteBase;
-  for (const emb of [4, 5, 6, 7, 8, 9, 10, 11]) {
+  for (const emb of [4, 5, 6, 7, 8, 9, 10, 11, 12]) {
     const arrow = etama.sprites.get(base + emb + 10);
     assert.ok(arrow, `arrow for emb${emb}`);
     assert.equal(arrow.imageKey, 'etama2');

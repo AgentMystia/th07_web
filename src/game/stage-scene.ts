@@ -46,9 +46,9 @@ const ITEM_SPRITES: Record<ItemType, number> = {
   bomb: 7,
   fullPower: 8,
   life: 9,
-  pointBullet: 10, // grey star box (bullet-cancel item)
-  cherry: 11, // boxed pink petal
-  bigCherry: 11 // TH07-TODO: distinct big-cherry art unconfirmed; shares the box
+  cherry: 10, // type 6: grey cancel-item box (FUN_00421a40 writes type 6)
+  bigCherry: 11, // type 7: boxed pink petal
+  pointBullet: 12 // type 8: retail-unused second petal row
 };
 // Per-type offscreen indicator arrows sit 10 embedded ids after their item
 // (emb14-21, same order) — drawn while an item is still above the top edge.
@@ -100,6 +100,20 @@ const FRONT = {
 const DIGIT_W = 8;
 const DIGIT_H = 12;
 const DIGIT_Y = 208;
+
+interface ScorePopup {
+  digits: number[];
+  color: number;
+  x: number;
+  y: number;
+  timer: number;
+  timerFrac: number;
+  active: boolean;
+}
+
+const makeScorePopup = (): ScorePopup => ({
+  digits: [0], color: 0, x: 0, y: 0, timer: 0, timerFrac: 0, active: false
+});
 
 // Per-quad cap on subdivided cells for perspective-correct-enough texture
 // mapping (see drawBackground); not a shared budget — stage 1 only has ~31
@@ -294,15 +308,11 @@ export class StageScene implements GameHost {
   // Player-wide hit tally (exe player+0x240c): beams/attack slots pop a
   // spark on every 8th (lasers) / 4th (bomb slots) accumulated hit.
   private playerHitTally = 0;
-  // Floating number popups (spec-popups.md): two ring pools (720 large,
-  // 3 small — the small one serves the bullet-cancel star pickups), no
-  // per-frame update at all — entries never move or expire, they live until
-  // their ring slot is overwritten. The visible variation is a distance-
-  // from-player alpha pulse recomputed at draw time.
-  private popupsLarge: { digits: number[]; color: number; x: number; y: number; active: boolean }[] =
-    Array.from({ length: 720 }, () => ({ digits: [0], color: 0, x: 0, y: 0, active: false }));
-  private popupsSmall: { digits: number[]; color: number; x: number; y: number; active: boolean }[] =
-    Array.from({ length: 3 }, () => ({ digits: [0], color: 0, x: 0, y: 0, active: false }));
+  // Floating number popups: two contiguous ring pools in the exe (720 large,
+  // 3 small — the latter serves small cherry pickups). FUN_00401ad0 updates
+  // all 723 slots: rise 0.5 px per rate-scaled frame and retire after 60.
+  private popupsLarge: ScorePopup[] = Array.from({ length: 720 }, makeScorePopup);
+  private popupsSmall: ScorePopup[] = Array.from({ length: 3 }, makeScorePopup);
   private popupCursorLarge = 0;
   private popupCursorSmall = 0;
 
@@ -314,6 +324,10 @@ export class StageScene implements GameHost {
     stageNumber = 1,
     carry: RunCarry | null = null
   ) {
+    // The native game loads every SE buffer before play. Web Audio otherwise
+    // drops the first request while fetching it; se_pldead00 is normally used
+    // only on the first miss, so without this preload that miss is silent.
+    this.audio.preloadSfx(SFX_SLOTS.map(([file]) => file));
     this.difficulty = difficulty;
     this.stageNumber = stageNumber;
     const stageData = (TH07_DATA.stages as unknown as Record<number, StageData>)[stageNumber];
@@ -574,6 +588,8 @@ export class StageScene implements GameHost {
     entry.x = x;
     entry.y = y;
     entry.color = color >>> 0;
+    entry.timer = 0;
+    entry.timerFrac = 0;
     entry.digits.length = 0;
     let v = Math.trunc(value);
     if (v < 0) {
@@ -588,23 +604,67 @@ export class StageScene implements GameHost {
     }
   }
 
-  // Draw pass (exe FUN_00403770 @ all.c:1684-1758): 8x12 ascii glyphs at
-  // 8px pitch, x-centered by digitCount*4, most-significant first; alpha is
-  // a distance-from-player pulse — 80/255 within 32px of the player,
-  // linearly rising to 208/255 at 64px, flat beyond. No motion, no fade.
-  private drawPopups(r: Renderer, ox: number, oy: number): void {
-    const p = this.playerObj;
-    const drawPool = (pool: { digits: number[]; color: number; x: number; y: number; active: boolean }[]) => {
+  // Th07.exe (v1.00b) FUN_00401ad0 @ 0x401ad0: the loop starts from each
+  // entry's timer sub-structure (which hid it from the earlier pool-base
+  // search), moves y by -0.5*slowRate, advances the standard split counter,
+  // and clears active once its integer part is > 60.
+  private updatePopups(): void {
+    const updatePool = (pool: ScorePopup[]) => {
       for (const pop of pool) {
         if (!pop.active) continue;
-        const dist = Math.hypot(pop.x - p.x, pop.y - p.y);
-        const alpha = (dist <= 32 ? 80 : dist >= 64 ? 208 : 80 + ((dist - 32) / 32) * 128) / 255;
+        pop.y -= 0.5 * this.slowRate;
+        if (this.slowRate > 0.99) {
+          pop.timer++;
+        } else {
+          pop.timerFrac += this.slowRate;
+          if (pop.timerFrac >= 1) {
+            pop.timer++;
+            pop.timerFrac -= 1;
+          }
+        }
+        if (pop.timer > 60) pop.active = false;
+      }
+    };
+    updatePool(this.popupsLarge);
+    updatePool(this.popupsSmall);
+  }
+
+  // Draw pass (exe FUN_00403770 @ all.c:1684-1758): 8px-pitch glyphs, with
+  // the first glyph center at x-digitCount*4. The popup
+  // renderer indexes ascii.anm sprites 0..30 — the dedicated 8x8 Japanese-
+  // styled number row, NOT the HUD's 8x12 sprites 132..141. At timer 52/56
+  // it switches to the two authored decay rows. Script 3 has no ins_22, so
+  // these VM coordinates retain center anchoring. Alpha is a squared-
+  // distance-from-player pulse — 80/255 within 32px, an integer ramp to
+  // 208/255 at 64px, flat beyond.
+  private drawPopups(r: Renderer, ox: number, oy: number): void {
+    const p = this.playerObj;
+    const drawPool = (pool: ScorePopup[]) => {
+      for (const pop of pool) {
+        if (!pop.active) continue;
+        const dx = pop.x - p.x;
+        const dy = pop.y - p.y;
+        const distSq = Math.round(dx * dx + dy * dy);
+        const alphaByte = distSq <= 1024 ? 80
+          : distSq >= 4096 ? 208
+            : 80 + Math.trunc(((distSq - 1024) * 128) / 3072);
         const n = pop.digits.length;
         const startX = pop.x - n * 4;
         for (let i = 0; i < n; i++) {
           const glyph = pop.digits[n - 1 - i];
-          r.drawSprite('ascii', glyph * DIGIT_W, DIGIT_Y, DIGIT_W, DIGIT_H,
-            ox + startX + i * 8 + DIGIT_W / 2, oy + pop.y, { alpha, color: pop.color });
+          // Th07.exe FUN_00403770 @ 0x40387b: the 48x8 PowerUp sentinel
+          // (sprite 10) never changes bank; numeric glyphs use sprites
+          // 11..20 at timer 52 and 21..30 at timer 56.
+          const sprite = glyph === 10 ? 10
+            : pop.timer >= 56 ? glyph + 21
+              : pop.timer >= 52 ? glyph + 11 : glyph;
+          const sx = sprite <= 9 ? sprite * 8
+            : sprite === 10 ? 80 : 128 + ((sprite - 11) % 10) * 8;
+          const sy = sprite >= 21 ? 8 : 0;
+          const sw = sprite === 10 ? 48 : 8;
+          r.drawSprite('ascii', sx, sy, sw, 8,
+            ox + startX + i * 8, oy + pop.y,
+            { alpha: alphaByte / 255, color: pop.color });
         }
       }
     };
@@ -803,10 +863,13 @@ export class StageScene implements GameHost {
   // sets the item's autocollect byte +0x27f). No score popups on this path.
   cancelBulletsToItems(): void {
     for (const b of this.enemyBullets) {
+      if (b.dead) continue;
       this.spawnItem('cherry', b.x, b.y, { state: 1 });
     }
     this.enemyBullets.length = 0;
-    this.cancelLasers(false);
+    // FUN_00422ea0(1) also converts each non-immune live laser at its
+    // origin and every 32 px along [nearDist, farDist).
+    this.cancelLaserField(false, true);
   }
 
   // Th07.exe FUN_00423100(8000,1) (op91 spell end, boss nonspell death):
@@ -817,6 +880,7 @@ export class StageScene implements GameHost {
     let total = 0;
     let value = 2000;
     for (const b of this.enemyBullets) {
+      if (b.dead) continue;
       this.spawnItem('cherry', b.x, b.y, { state: 1 });
       // FUN_00423100 @ all.c:15624: escalating popup per bullet — white
       // while ramping, yellow once the 8000 cap is reached.
@@ -825,7 +889,9 @@ export class StageScene implements GameHost {
       value = Math.min(8000, value + 20);
     }
     this.enemyBullets.length = 0;
-    this.cancelLasers(false);
+    // FUN_00423100 does not apply the bomb-immunity flag to lasers. Their
+    // converted items do not contribute to the escalating score total.
+    this.cancelLaserField(true, true);
     return total;
   }
 
@@ -836,6 +902,10 @@ export class StageScene implements GameHost {
   // clear also arms the exe's 10-frame new-laser suppression counter
   // (gamestate+0x37a12c).
   cancelLasers(unconditional: boolean): void {
+    this.cancelLaserField(unconditional, false);
+  }
+
+  private cancelLaserField(unconditional: boolean, spawnItems: boolean): void {
     for (const l of this.enemyLasers) {
       if (!l.inUse) continue;
       if ((l.flags & 4) !== 0 && !unconditional) continue;
@@ -843,6 +913,16 @@ export class StageScene implements GameHost {
         l.state = 2;
         l.phaseFrame = 0;
         l.width = l.displayWidth;
+        if (spawnItems) {
+          this.spawnItem('cherry', l.x, l.y, { state: 1 });
+          const cos = Math.cos(l.angle);
+          const sin = Math.sin(l.angle);
+          // Th07.exe (v1.00b) FUN_00422ea0 @ 0x422ea0 and
+          // FUN_00423100 @ 0x423100; DAT_0048ead4 = 32.0f.
+          for (let d = l.nearDist; d < l.farDist; d += 32) {
+            this.spawnItem('cherry', l.x + cos * d, l.y + sin * d, { state: 1 });
+          }
+        }
       }
       l.shrinkCutoff = 0;
     }
@@ -1047,6 +1127,10 @@ export class StageScene implements GameHost {
       // damage are suspended). collide=false skips the enemy hit tests.
       this.updatePlayerBullets(false);
     }
+    // The popup manager is rate-scaled but is not part of the dialogue-frozen
+    // gameplay managers; update existing entries before this frame's item
+    // collections create fresh entries at their exact pickup coordinates.
+    this.updatePopups();
     this.updateItems();
     this.updateParticles();
     // Bomb damage / bullet-cancel is suspended while a dialogue box is up

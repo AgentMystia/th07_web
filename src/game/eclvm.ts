@@ -1828,6 +1828,7 @@ export class StageRuntime {
         const bullets = game.enemyBullets;
         let w = 0;
         for (const b of bullets) {
+          if (b.dead) continue;
           const dx = b.x - e.x;
           const dy = b.y - e.y;
           if (dx * dx + dy * dy <= radius * radius) {

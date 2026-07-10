@@ -162,14 +162,15 @@ export interface GameHost {
   dropPointItems?(e: Enemy, count: number): void;
   awardSpellValue?(value: number): void;
   spawnEnemyDeathEffect?(e: Enemy): void;
-  // FUN_00422ea0(1): every live enemy bullet becomes an auto-collecting
-  // small cherry item (type 6 — the constructor-set cancel type at
-  // +0x37a160, FUN_00421a40) with no score popup. Runs at op80, spell
+  // FUN_00422ea0(1): every live enemy bullet, plus samples along each
+  // non-immune live laser, becomes an auto-collecting small cherry item
+  // (type 6 — the constructor-set cancel type at +0x37a160,
+  // FUN_00421a40) with no immediate score popup. Runs at op80, spell
   // declare (op90) and the full-power crossing.
   cancelBulletsToItems(): void;
   // Floating score/cherry number popup (spec-popups.md): value < 0 draws
-  // the single sentinel glyph; color is D3D ARGB. Popups never move or
-  // expire — they live until their ring slot is reused.
+  // the single sentinel glyph; color is D3D ARGB. The shared popup updater
+  // moves entries upward and retires them after 60 rate-scaled frames.
   spawnScorePopup?(value: number, x: number, y: number, color: number): void;
   // Frames remaining of the exe's post-field-clear laser-spawn suppression
   // (gamestate+0x37a12c, set to 10 by every FUN_00422ea0 call; op-82/83
