@@ -169,17 +169,17 @@ class TitleMenu {
     const n = MAIN_MENU_ITEMS.length;
     if (this.repeat.poll(input, 'down')) {
       this.cursor = (this.cursor + 1) % n;
-      audio.sfx('se_select00');
+      audio.sfx('se_select00', 0.141, 12);
     } else if (this.repeat.poll(input, 'up')) {
       this.cursor = (this.cursor - 1 + n) % n;
-      audio.sfx('se_select00');
+      audio.sfx('se_select00', 0.141, 12);
     }
     if (input.pressed.has('confirm')) {
       if (MAIN_MENU_ITEMS[this.cursor].enabled) {
-        audio.sfx('se_ok00');
+        audio.sfx('se_ok00', 0.316, 10);
         return 'confirm';
       }
-      audio.sfx('se_cancel00');
+      audio.sfx('se_cancel00', 0.316, 11);
     }
     return null;
   }
@@ -229,17 +229,17 @@ class DifficultyMenu {
     const n = DIFFICULTY_IDS.length;
     if (this.repeat.poll(input, 'down')) {
       this.cursor = (this.cursor + 1) % n;
-      audio.sfx('se_select00');
+      audio.sfx('se_select00', 0.141, 12);
     } else if (this.repeat.poll(input, 'up')) {
       this.cursor = (this.cursor - 1 + n) % n;
-      audio.sfx('se_select00');
+      audio.sfx('se_select00', 0.141, 12);
     }
     if (input.pressed.has('confirm')) {
-      audio.sfx('se_ok00');
+      audio.sfx('se_ok00', 0.316, 10);
       return 'confirm';
     }
     if (input.pressed.has('back')) {
-      audio.sfx('se_cancel00');
+      audio.sfx('se_cancel00', 0.316, 11);
       return 'back';
     }
     return null;
@@ -325,15 +325,15 @@ class PlayerSelectMenu {
       const n = FAMILY_NAMES.length;
       if (this.repeat.poll(input, 'right')) {
         this.charCursor = (this.charCursor + 1) % n;
-        audio.sfx('se_select00');
+        audio.sfx('se_select00', 0.141, 12);
         this.enterCharacter(this.charCursor);
       } else if (this.repeat.poll(input, 'left')) {
         this.charCursor = (this.charCursor - 1 + n) % n;
-        audio.sfx('se_select00');
+        audio.sfx('se_select00', 0.141, 12);
         this.enterCharacter(this.charCursor);
       }
       if (input.pressed.has('confirm')) {
-        audio.sfx('se_ok00');
+        audio.sfx('se_ok00', 0.316, 10);
         this.step = 'shotType';
         this.header = makeHeader(this.anm, 2);
         // Script label 10 = "character confirmed": dims the portrait to
@@ -343,21 +343,21 @@ class PlayerSelectMenu {
         return null;
       }
       if (input.pressed.has('back')) {
-        audio.sfx('se_cancel00');
+        audio.sfx('se_cancel00', 0.316, 11);
         return 'back-to-difficulty';
       }
     } else {
       if (input.pressed.has('up') || input.pressed.has('down') || input.pressed.has('left') || input.pressed.has('right')) {
         this.shotCursor = this.shotCursor === 0 ? 1 : 0;
-        audio.sfx('se_select00');
+        audio.sfx('se_select00', 0.141, 12);
         this.showShotDesc();
       }
       if (input.pressed.has('confirm')) {
-        audio.sfx('se_ok00');
+        audio.sfx('se_ok00', 0.316, 10);
         return 'confirm';
       }
       if (input.pressed.has('back')) {
-        audio.sfx('se_cancel00');
+        audio.sfx('se_cancel00', 0.316, 11);
         this.step = 'character';
         this.header = makeHeader(this.anm, 1);
         // Re-enter the character step: rebuild the portrait/nameplate in

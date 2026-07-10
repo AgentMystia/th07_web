@@ -198,8 +198,14 @@ export class AudioBus {
     for (const file of files) void this.loadSfx(file);
   }
 
+  // One active voice per SE slot: Th07.exe duplicates one DirectSound
+  // buffer per slot at init (@ 0x4468xx, IDirectSound::DuplicateSoundBuffer)
+  // and re-Plays it, which RESTARTS the sound — a slot never stacks with
+  // itself. Keyed by the caller's slot id (falls back to the file stem).
+  private slotVoices = new Map<number | string, AudioBufferSourceNode>();
+
   // Plays an original SFX by file stem (e.g. "se_tan00" → assets/sfx/th07/se_tan00.wav).
-  sfx(file: string, volume = 1): void {
+  sfx(file: string, volume = 1, slot?: number | string): void {
     if (!this.unlocked || this.muted) {
       void this.loadSfx(file);
       return;
@@ -211,6 +217,11 @@ export class AudioBus {
     }
     const ctx = this.ensureCtx();
     if (!ctx || !this.sfxGain) return;
+    const key = slot ?? file;
+    const prev = this.slotVoices.get(key);
+    if (prev) {
+      try { prev.stop(); } catch { /* already ended */ }
+    }
     const src = ctx.createBufferSource();
     src.buffer = buffer;
     if (volume >= 1) {
@@ -221,6 +232,10 @@ export class AudioBus {
       src.connect(gain);
       gain.connect(this.sfxGain);
     }
+    this.slotVoices.set(key, src);
+    src.onended = () => {
+      if (this.slotVoices.get(key) === src) this.slotVoices.delete(key);
+    };
     src.start();
   }
 }
