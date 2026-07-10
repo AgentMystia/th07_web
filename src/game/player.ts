@@ -24,6 +24,19 @@ export const CHARACTERS: Record<CharacterId, { family: 0 | 1 | 2; name: string; 
   sakuyaB: { family: 2, name: 'Sakuya B', shtBase: 'ply02b', anmKey: 'player02' }
 };
 
+// Th07.exe per-character bomb functions (exe-bombs.md §2, addresses
+// 0x407840-0x40cbf0): [duration, invulnTotal, speedMult] keyed by
+// character and focus-state AT CAST. invulnTotal = the exe's invuln
+// seed (already includes the grace beyond the bomb's own duration).
+const BOMB_PARAMS: Record<CharacterId, { unfocused: [number, number, number]; focused: [number, number, number] }> = {
+  reimuA:  { unfocused: [140, 200, 1.0], focused: [300, 360, 0.6] },
+  reimuB:  { unfocused: [140, 200, 1.0], focused: [190, 250, 0.4] },
+  marisaA: { unfocused: [200, 250, 1.0], focused: [260, 310, 0.4] },
+  marisaB: { unfocused: [300, 300, 0.2], focused: [340, 390, 0.2] },
+  sakuyaA: { unfocused: [160, 210, 1.0], focused: [250, 290, 0.3] },
+  sakuyaB: { unfocused: [160, 260, 2.0], focused: [300, 420, 1.5] }
+};
+
 // The game assigns the player ANM a sprite-id base of 1024; SHT sprite
 // fields are global ids (1088+ = local sprite 64+).
 export const PLAYER_SPRITE_BASE = 1024;
@@ -51,25 +64,15 @@ export interface PlayerBullet {
 }
 
 // Option (orb) offsets relative to the player; fire origins for orb shots.
-//
-// Th07.exe (v1.00b) Player::Update (fcn.0043be00 @ 0x43be00) drives a glide
-// state machine at player+0x2410. Unfocused (settled) offsets are CONFIRMED
-// exe-hardcoded immediates from that machine's terminal "case 3" state:
-// orb 1 x=-32.0 @ 0x43cb30, y=8.0 @ 0x43cb29; orb 2 mirrors orb 1 across x
-// (this codebase's existing left/right symmetry convention). Note the y
-// sign: +8 (below the player), not -8 as previously guessed here.
-//
-// The exe's focused layout is NOT a static offset at all: options
-// continuously orbit the player on a radius-24.0 circle (fmul by 0x48ec78
-// = 24.0 @ 0x43ce2d and 0x43ce59, confirmed), phase-shifted by pi/2 (fadd
-// 0x48eaec = 1.5708 @ 0x43ce16 and 0x43ce42, confirmed), driven by a
-// per-frame angle (player+0xb7e58) whose increment site was not located
-// within this function -- so the rotation rate and orb 2's phase offset
-// are NOT confirmed. We keep a static focused approximation below pending
-// that follow-up (see ghidra-re-notes.md, Target A).
+// Th07.exe FUN_0043be00 option state machine (per-state constants re-read
+// 2026-07: settled unfocused = (∓24, 0), settled focused = (∓8, −32);
+// cross-validated vs the MarisaB laser gates (state 1 vs 3) and SakuyaB's
+// orbit rest point. Overturns the earlier 0x43cb30 (∓32,+8) misread —
+// see reference/re-specs/exe-player-shot.md §4. Tween stays 8f, x linear,
+// y quadratic.
 const ORB_OFFSETS = {
-  unfocused: { 1: { x: -32, y: 8 }, 2: { x: 32, y: 8 } },
-  focused: { 1: { x: -16, y: -24 }, 2: { x: 16, y: -24 } }
+  unfocused: { 1: { x: -24, y: 0 }, 2: { x: 24, y: 0 } },
+  focused: { 1: { x: -8, y: -32 }, 2: { x: 8, y: -32 } }
 } as const;
 
 // Frames to glide between the unfocused/focused layouts on a focus-state
@@ -85,16 +88,42 @@ const ORB_OFFSETS = {
 // lerp(fromY,toY,t*t) in general.
 const GLIDE_FRAMES = 8;
 
-// PCB's shot cadence runs on a 60-frame cycle (Priw8's sht-webedit docs:
-// "PCB - shooting uses a 60-frame timer. For bullets to fire consistently,
-// choose a fire_rate that is a factor of 60"), not the 30-frame cycle used
-// by the TH06 engine family. shot.interval/shot.delay are frame counts
-// within that cycle.
-const SHOT_CYCLE = 60;
+// Th07.exe FUN_0043a820 @ 0x43a820: the shot-cadence counter is hard-
+// capped at 30 (CMP 0x1e @ 0x43a8d5) and re-armed to 0 while shoot is
+// held — a 30-frame cycle. (Priw8's external doc said 60; direct exe
+// disassembly outranks it per AGENTS.md §2. Max data delay is 20.)
+const SHOT_CYCLE = 30;
+
+// Player spawn / lifecycle, decoded from Th07.exe (v1.00b). The exe drives
+// the player through a state byte at player+0x2408 (dispatcher fcn.0043eef0):
+//   0 normal       controllable, vulnerable.
+//   1 materialize  30-frame respawn-in (fcn.0043e170): scaleX 0->1, scaleY
+//                  3->1, alpha 0->255, input locked; exits to state 3.
+//   2 dying        deathbomb window + 30-frame death clock (fcn.0043dca0).
+//   3 invuln       countdown (fcn.0043e2e0); sprite dark-tinted 0x404040 on
+//                  frames where (timer & 7) < 2.
+// Player::Init (fcn.0043f320 @ 0x43f320) spawns directly at the spawn point
+// and preloads the materialize timer past its 0x1d threshold, so stage start
+// SKIPS the materialize and enters a 240-frame (0xf0) invulnerability window.
+// There is NO entrance fly-in in the original: the player is simply present,
+// invulnerable. Respawn after death (die()) DOES run the materialize in place.
+export const SPAWN_X = 192;
+// y = fieldH - 64 (Init: DAT_00625850 - 64.0 @ 0x43f38a, 64.0 = rdata
+// 0x48eb68); fieldH = 448 -> 384.
+export const SPAWN_Y = 384;
+// fcn.0043e170: materialize ramps over 30 frames (threshold 0x1d, divisor
+// 30.0 = rdata 0x48eb60); at frame 30 it hands off to a 240-frame (0xf0)
+// invuln window (fcn.0043e2e0).
+const MATERIALIZE_FRAMES = 30;
+const SPAWN_INVULN_FRAMES = 240;
+// fcn.0043dca0 (+0x23f8==0 branch): after the deathbomb window lapses, a
+// 30-frame in-place death squish (scaleX 1->0, scaleY 1->4) plays BEFORE the
+// respawn teleport + materialize.
+const DEATH_SQUISH_FRAMES = 30;
 
 export class Player {
-  x = 192;
-  y = 432;
+  x = SPAWN_X;
+  y = SPAWN_Y;
   readonly character: CharacterId;
   readonly unfocused: Sht;
   readonly focused: Sht;
@@ -103,6 +132,14 @@ export class Player {
   // Frames elapsed since the last focus-state toggle, saturating at
   // GLIDE_FRAMES once the orb glide has settled; see orbOffset().
   private focusGlideFrame = GLIDE_FRAMES;
+  // Th07.exe SakuyaB-only option orbit (exe-player-shot.md §7): accumulator
+  // at player+0xb7e58; rest = -PI/2; strafe steers by vx*PI/200 per frame;
+  // idle returns at 2*PI/100 per frame with snap inside PI/100; clamped to
+  // [-7*PI/10, -3*PI/10] (±36° around straight up).
+  orbitAngle = -Math.PI / 2;
+  // This frame's horizontal displacement (dx*speed from move()); 0 when not
+  // strafing. Feeds the SakuyaB orbit steer.
+  private lastVx = 0;
   shooting = false;
   // -1 while not shooting so that the first held frame lands on fireFrame 0
   // (see update()): a shot with delay 0 must fire on the very press frame,
@@ -114,9 +151,17 @@ export class Player {
   power = 0;
   invulnFrames = 0;
   deathTimer = -1; // counts down the deathbomb window when hit
-  respawnTimer = 0;
+  // -1 when idle; 0..DEATH_SQUISH_FRAMES during the post-death squish (exe
+  // state 2, fcn.0043dca0): scaleX=1-t, scaleY=1+3t, in place at the death loc.
+  dyingFrame = -1;
+  // -1 when idle; 0..MATERIALIZE_FRAMES during the respawn materialize (exe
+  // state 1, fcn.0043e170): scaleX=t, scaleY=3-2t, alpha=t, t=frame/30.
+  materializeFrame = -1;
   bombTimer = 0;
   bombInvuln = 0;
+  // Latched from BOMB_PARAMS at cast; multiplies move speed while bombTimer>0.
+  // SakuyaB legitimately exceeds 1.0. Reset to 1.0 when the bomb ends.
+  bombSpeedMult = 1.0;
   runner: AnmRunner;
   private poseState: 'idle' | 'left' | 'right' = 'idle';
 
@@ -129,6 +174,10 @@ export class Player {
     this.anm = anms[spec.anmKey];
     this.bombs = Math.trunc(this.unfocused.bombs);
     this.runner = new AnmRunner(this.anm, 0);
+    // Stage start skips materialize (Init preloads its timer past threshold)
+    // and enters the 240-frame spawn invulnerability directly
+    // (fcn.0043f320 -> fcn.0043e2e0). The player is simply present, not flying in.
+    this.invulnFrames = SPAWN_INVULN_FRAMES;
   }
 
   get sht(): Sht {
@@ -136,19 +185,44 @@ export class Player {
   }
 
   get hitboxHalf(): number {
-    return this.sht.hitbox;
+    // sht hitbox/grazebox are FULL widths; the exe halves them at point of use
+    // (rdata 2.0 @ 0x48eac0). Reimu hitbox 1.65 full => 0.825 half.
+    return this.sht.hitbox / 2;
   }
 
   get grazeboxHalf(): number {
-    return this.sht.grazebox;
+    return this.sht.grazebox / 2;
   }
 
   get alive(): boolean {
-    return this.deathTimer < 0 && this.respawnTimer <= 0;
+    // Not hittable/firable during the deathbomb window, the death squish, or
+    // the respawn materialize (exe states 2/1); the invuln window (state 3) IS
+    // alive.
+    return this.deathTimer < 0 && this.dyingFrame < 0 && this.materializeFrame < 0;
   }
 
   get controllable(): boolean {
-    return this.deathTimer < 0;
+    // Input is locked during the deathbomb window, the death squish, and the
+    // respawn materialize; the spawn/respawn invuln window itself is
+    // controllable.
+    return this.deathTimer < 0 && this.dyingFrame < 0 && this.materializeFrame < 0;
+  }
+
+  // Render transform for the death squish (exe state 2). null when not dying;
+  // otherwise scaleX=1-t, scaleY=1+3t (fcn.0043dca0), t=frame/30.
+  dyingTransform(): { scaleX: number; scaleY: number } | null {
+    if (this.dyingFrame < 0) return null;
+    const t = this.dyingFrame / DEATH_SQUISH_FRAMES;
+    return { scaleX: 1 - t, scaleY: 1 + 3 * t };
+  }
+
+  // Render transform for the respawn materialize (exe state 1). null when not
+  // materializing; otherwise the exe's ramps (fcn.0043e170: t=frame/30,
+  // scaleX=t, scaleY=3-2t, alpha=t).
+  materializeTransform(): { scaleX: number; scaleY: number; alpha: number } | null {
+    if (this.materializeFrame < 0) return null;
+    const t = this.materializeFrame / MATERIALIZE_FRAMES;
+    return { scaleX: t, scaleY: 3 - 2 * t, alpha: t };
   }
 
   update(input: InputFrame): void {
@@ -161,12 +235,20 @@ export class Player {
     }
     if (this.invulnFrames > 0) this.invulnFrames--;
     if (this.bombInvuln > 0) this.bombInvuln--;
-    if (this.bombTimer > 0) this.bombTimer--;
-    if (this.respawnTimer > 0) {
-      this.respawnTimer--;
-      this.y = Math.min(432, this.y - 1.5); // fly in from the bottom
+    if (this.bombTimer > 0) {
+      this.bombTimer--;
+      if (this.bombTimer === 0) this.bombSpeedMult = 1.0;
     }
-    if (this.controllable && this.respawnTimer <= 0) this.move(input);
+    if (this.materializeFrame >= 0) {
+      // Respawn materialize (fcn.0043e170): ramp scale/alpha IN PLACE over 30
+      // frames, then enter the 240-frame invuln window. No movement/firing.
+      if (++this.materializeFrame >= MATERIALIZE_FRAMES) {
+        this.materializeFrame = -1;
+        this.invulnFrames = SPAWN_INVULN_FRAMES;
+      }
+    }
+    if (this.controllable) this.move(input);
+    else this.lastVx = 0;
     this.shooting = input.held.has('shoot') && this.controllable;
     if (this.shooting) {
       this.fireFrame = (this.fireFrame + 1) % SHOT_CYCLE;
@@ -175,6 +257,14 @@ export class Player {
     }
     this.updatePose(input);
     this.runner.update();
+    const vx = this.lastVx;
+    if (vx === 0) {
+      if (Math.abs(this.orbitAngle - -Math.PI / 2) <= Math.PI / 100) this.orbitAngle = -Math.PI / 2;
+      else this.orbitAngle += (this.orbitAngle < -Math.PI / 2 ? 1 : -1) * (2 * Math.PI / 100);
+    } else {
+      this.orbitAngle += vx * Math.PI / 200;
+      this.orbitAngle = Math.min(-3 * Math.PI / 10, Math.max(-7 * Math.PI / 10, this.orbitAngle));
+    }
   }
 
   private move(input: InputFrame): void {
@@ -186,11 +276,18 @@ export class Player {
     if (input.held.has('up')) dy -= 1;
     if (input.held.has('down')) dy += 1;
     const diagonal = dx !== 0 && dy !== 0;
-    const speed = diagonal
+    const baseSpeed = diagonal
       ? (this.focusHeld ? sht.diagFocusedSpeed : sht.diagSpeed)
       : (this.focusHeld ? sht.focusedSpeed : sht.speed);
-    this.x = clamp(this.x + dx * speed, 8, 376);
-    this.y = clamp(this.y + dy * speed, 16, 432);
+    // Bombs latch a per-character speed multiplier (BOMB_PARAMS); SakuyaB
+    // legitimately exceeds 1.0 — NOT clamped (exe-bombs.md §2).
+    const speed = baseSpeed * (this.bombTimer > 0 ? this.bombSpeedMult : 1);
+    // Th07.exe (v1.00b) Player::Update clamp @ 0x43c3cc / 0x43c430: field-local
+    // x∈[0,384], y∈[0,448] (full playfield). Mins DAT_00625854/858 = 0; ranges
+    // DAT_0062585c/860 = 384/448 (confirmed via FUN_0041de20 @ 0x41dfeb/0x41e016).
+    this.x = clamp(this.x + dx * speed, 0, 384);
+    this.y = clamp(this.y + dy * speed, 0, 448);
+    this.lastVx = dx * speed;
   }
 
   private updatePose(input: InputFrame): void {
@@ -207,6 +304,24 @@ export class Player {
   // Fires shooter entries whose cadence matches this frame; called once per
   // frame while the shoot button is held.
   orbOffset(orb: 1 | 2): { x: number; y: number } {
+    if (this.character === 'sakuyaB') {
+      // exe: unfocused = diametric pair on r=24 at φ=orbitAngle+π/2;
+      // focused = tight cluster at orbitAngle ∓ π/14; 8f linear glide between.
+      const a = this.orbitAngle;
+      const unf = orb === 1
+        ? { x: -24 * Math.cos(a + Math.PI / 2), y: -24 * Math.sin(a + Math.PI / 2) }
+        : { x: 24 * Math.cos(a + Math.PI / 2), y: 24 * Math.sin(a + Math.PI / 2) };
+      const foc = {
+        x: 24 * Math.cos(a + (orb === 1 ? -1 : 1) * Math.PI / 14),
+        y: 24 * Math.sin(a + (orb === 1 ? -1 : 1) * Math.PI / 14)
+      };
+      const to = this.focusHeld ? foc : unf;
+      if (this.focusGlideFrame >= GLIDE_FRAMES) return to;
+      const from = this.focusHeld ? unf : foc;
+      const t = this.focusGlideFrame / GLIDE_FRAMES;
+      // simplified straight lerp, exe uses target-endpoint forms; visual nicety only
+      return { x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t };
+    }
     const to = ORB_OFFSETS[this.focusHeld ? 'focused' : 'unfocused'][orb];
     if (this.focusGlideFrame >= GLIDE_FRAMES) return to;
     const from = ORB_OFFSETS[this.focusHeld ? 'unfocused' : 'focused'][orb];
@@ -251,23 +366,40 @@ export class Player {
     return 'deathbomb-window';
   }
 
-  // Returns 'died' when the deathbomb window expires without a bomb.
-  tickDeath(): 'died' | 'pending' | 'none' {
-    if (this.deathTimer < 0) return 'none';
-    this.deathTimer--;
-    if (this.deathTimer < 0) return 'died';
-    return 'pending';
+  // Death sequence (exe state 2, fcn.0043dca0). The deathbomb window counts
+  // down first ('pending'); when it lapses, returns 'effects' once and starts
+  // the 30-frame death squish; the squish then counts down ('pending'); when
+  // it finishes, returns 'respawn' once. 'none' when no death is in progress.
+  // Bombing during the deathbomb window (tryBomb) clears deathTimer and
+  // cancels the whole sequence.
+  tickDeath(): 'effects' | 'respawn' | 'pending' | 'none' {
+    if (this.deathTimer >= 0) {
+      this.deathTimer--;
+      if (this.deathTimer < 0) {
+        this.dyingFrame = 0; // begin the death squish
+        return 'effects';
+      }
+      return 'pending';
+    }
+    if (this.dyingFrame >= 0) {
+      if (++this.dyingFrame >= DEATH_SQUISH_FRAMES) {
+        this.dyingFrame = -1;
+        return 'respawn';
+      }
+      return 'pending';
+    }
+    return 'none';
   }
 
   tryBomb(): boolean {
     if (this.bombs <= 0 || this.bombTimer > 0) return false;
     this.bombs--;
     this.deathTimer = -1; // deathbomb rescue
-    // Functional first pass: family-appropriate duration and invulnerability.
-    const family = CHARACTERS[this.character].family;
-    const duration = family === 1 ? 300 : 250;
+    // Th07.exe per-character bomb params selected by (character, focus-state) at cast.
+    const [duration, invulnTotal, speedMult] = BOMB_PARAMS[this.character][this.focusHeld ? 'focused' : 'unfocused'];
     this.bombTimer = duration;
-    this.bombInvuln = duration + 60;
+    this.bombInvuln = invulnTotal;
+    this.bombSpeedMult = speedMult;
     return true;
   }
 
@@ -276,10 +408,14 @@ export class Player {
     this.lives--;
     this.bombs = Math.trunc(this.unfocused.bombs);
     this.power = Math.max(0, this.power - 16);
-    this.invulnFrames = 240;
-    this.respawnTimer = 30;
-    this.x = 192;
-    this.y = 448 + 16;
+    // Respawn (fcn.0043dca0 at the death-clock lapse): teleport to the spawn
+    // point and enter the materialize state (fcn.0043e170) -- a 30-frame
+    // in-place scale/alpha ramp, NOT a fly-in -- followed by 240f invuln
+    // (set in update() when the materialize ends).
+    this.x = SPAWN_X;
+    this.y = SPAWN_Y;
+    this.materializeFrame = 0;
+    this.invulnFrames = 0;
     this.bullets.length = 0;
   }
 }

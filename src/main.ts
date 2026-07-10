@@ -10,6 +10,8 @@ import type { CharacterId } from './game/player';
 interface TestHook {
   ready: boolean;
   advance(n: number): void;
+  setLives(n: number): void;
+  setInvuln(frames: number): void;
   snapshot(): Record<string, unknown>;
   pixelAt(x: number, y: number): number[];
   setPlayer(x: number, y: number): void;
@@ -18,6 +20,7 @@ interface TestHook {
   damageBoss(n: number): void;
   addCherry(n: number): void;
   spawnLog(): { t: number; time: number; sub: number }[];
+  bgm(): { active: string | null; decoded: string[] };
 }
 
 declare global {
@@ -44,6 +47,11 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
     timelines: scene.runtime.timelineCursors.map((c) => ({ ...c })),
     bossActive: !!scene.bossActive,
     bossHp: scene.bossActive?.hp ?? null,
+    lasers: scene.enemyLasers.filter((l) => l.inUse).length,
+    laserDump: scene.enemyLasers.filter((l) => l.inUse).slice(0, 6).map((l) => ({
+      x: Math.round(l.x), y: Math.round(l.y), angle: Number(l.angle.toFixed(2)),
+      near: Math.round(l.nearDist), far: Math.round(l.farDist), w: Number(l.displayWidth.toFixed(1)), state: l.state
+    })),
     stageClear: scene.stageClear,
     gameOver: scene.gameOver,
     continueActive: !!scene.continueScreen,
@@ -97,6 +105,15 @@ async function boot(): Promise<void> {
   renderer.assets = assets.images;
   const input = new Input();
   const audio = new AudioBus();
+  // Eager-preload every BGM track stage 1 can need (title + stage + boss) as
+  // soon as the AudioBus exists, so decodeAudioData has already finished by
+  // the time playBgm() is actually called for it (title on first
+  // interaction; stage/boss at stage start). Without this, the stage track
+  // was measured starting 138.9ms (~8 frames) after stage frame 0 on a
+  // zero-latency local server, and 8.9s/26.2s (~533/~1573 frames) under
+  // throttled Slow-4G/Fast-3G — with the title theme still audibly looping
+  // for the entire gap (bug 5, measurements in reference/re-specs/bgm-audit.md).
+  audio.preloadBgm(['th07_01', 'th07_02', 'th07_03']);
   const params = new URLSearchParams(location.search);
 
   // ?test=1 alone must still boot directly into the stage exactly as before
@@ -114,10 +131,26 @@ async function boot(): Promise<void> {
 
   // Shared by both the menu's "confirm" callback and the direct (?test=1,
   // no ?menu=1) boot path below, so BGM/preload behavior is identical either
-  // way. Track 1 (th07_01) is the title theme, per musiccmt.txt; the stage
-  // tracks were already wired up as-is.
-  function startStage(difficulty: number, character: CharacterId): StageScene {
-    const s = new StageScene(assets, audio, difficulty, character);
+  // way. Track 1 (th07_01) is the title theme, per musiccmt.txt.
+  //
+  // Per-stage BGM: thbgm track layout is stage theme = 2n, boss theme =
+  // 2n+1 for stages 1-6; Extra (7) = 16/17, Phantasm (8) = 18/19 (14/15
+  // are the ending/staff-roll themes — musiccmt.txt). The repo only ships
+  // tracks 01-03 (the thbgmogg.dat source is absent), so AudioBus falls
+  // back by parity when a track file is missing.
+  function stageTracks(stageNumber: number): [string, string] {
+    const base = stageNumber <= 6 ? stageNumber * 2 : 16 + (stageNumber - 7) * 2;
+    const pad = (n: number) => `th07_${String(n).padStart(2, '0')}`;
+    return [pad(base), pad(base + 1)];
+  }
+
+  function startStage(
+    difficulty: number,
+    character: CharacterId,
+    stageNumber = 1,
+    carry: import('./game/stage-scene').RunCarry | null = null
+  ): StageScene {
+    const s = new StageScene(assets, audio, difficulty, character, stageNumber, carry);
     // Headless probes (?test=1 without ?menu=1) keep the scene alive forever;
     // real play gets the arcade flow: continue screen + return to title.
     s.mode = useMenu ? 'arcade' : 'test';
@@ -125,25 +158,39 @@ async function boot(): Promise<void> {
     s.onExitToTitle = () => {
       sessionHiScore = Math.max(sessionHiScore, s.hiScore);
       stage = null;
-      menu = new MenuFlow(assets, audio, startStage);
+      menu = new MenuFlow(assets, audio, startFromMenu);
       audio.preloadBgm(['th07_01']);
       audio.playBgm('th07_01');
     };
+    // Stage clear tally advanced -> tear down and enter the next stage with
+    // the run state carried over (score/lives/bombs/power/graze/cherry).
+    s.onStageComplete = (c) => {
+      sessionHiScore = Math.max(sessionHiScore, c.hiScore);
+      startStage(difficulty, character, stageNumber + 1, c);
+    };
     stage = s;
     menu = null;
-    audio.preloadBgm(['th07_02', 'th07_03']);
-    audio.playBgm('th07_02');
+    const [stageTrack, bossTrack] = stageTracks(stageNumber);
+    audio.preloadBgm([stageTrack, bossTrack]);
+    audio.playBgm(stageTrack);
     return s;
   }
 
+  // Menu-initiated runs: difficulty 4 = Extra -> stage 7, 5 = Phantasm ->
+  // stage 8; main difficulties start at stage 1.
+  const startFromMenu = (difficulty: number, character: CharacterId) =>
+    startStage(difficulty, character, difficulty >= 4 ? difficulty + 3 : 1);
+
   if (useMenu) {
-    menu = new MenuFlow(assets, audio, startStage);
+    menu = new MenuFlow(assets, audio, startFromMenu);
     audio.preloadBgm(['th07_01']);
     audio.playBgm('th07_01');
   } else {
-    const difficulty = Math.min(3, Math.max(0, Number(params.get('difficulty') ?? 1)));
+    // ?difficulty=0..5 (4 = Extra, 5 = Phantasm), ?stage=1..8 for probes.
+    const difficulty = Math.min(5, Math.max(0, Number(params.get('difficulty') ?? 1)));
     const character = (params.get('shot') ?? 'reimuA') as CharacterId;
-    const s = startStage(difficulty, character);
+    const stageNumber = Math.min(8, Math.max(1, Number(params.get('stage') ?? 1)));
+    const s = startStage(difficulty, character, stageNumber);
     // Test-only override so scripts/dev-shot.mjs can snapshot a shot pattern
     // at an arbitrary power bracket without needing to grind for it in-game.
     if (params.has('power')) s.playerObj.power = Number(params.get('power'));
@@ -187,8 +234,18 @@ async function boot(): Promise<void> {
       },
       addCherry: (n: number) => {
         if (!stage) return;
-        for (let i = 0; i < n / 2; i++) stage.cherry.onShotHit(false);
-      }
+        stage.cherry.debugAddCherry(n);
+      },
+      // Test-only: force the life count so probes can reach and observe
+      // late-stage content (boss spells, the Supernatural Border) that a
+      // no-dodge headless run would otherwise die before reaching. Same
+      // spirit as setPower/addCherry above.
+      setLives: (n: number) => { if (stage) stage.playerObj.lives = n; },
+      // Test-only, same spirit as setLives: hold spawn-invulnerability so
+      // probes can observe full bullet patterns without death-wipes
+      // (player death clears all enemy bullets) resetting the field.
+      setInvuln: (frames: number) => { if (stage) stage.playerObj.invulnFrames = frames; },
+      bgm: () => ({ active: audio.active, decoded: audio.decodedTracks })
     };
   }
   loop.start();

@@ -27,6 +27,13 @@ export class AudioBus {
   unlocked = false;
   muted = false;
 
+  // Test-only observability: which track names are currently resolved in
+  // the decoded BGM cache, so a headless check can assert preload state
+  // (see window.__TH07_TEST__.bgm() in main.ts).
+  get decodedTracks(): string[] {
+    return Array.from(this.bgmBuffers.keys());
+  }
+
   constructor() {
     const unlock = () => {
       this.unlock();
@@ -102,11 +109,28 @@ export class AudioBus {
       return;
     }
     this.active = name;
+    // Stop the previous track immediately rather than waiting for the new
+    // one's decode to resolve: any residual load gap then plays silence
+    // instead of the old track hard-cutting away later, off by however long
+    // the new track's fetch+decode took (bug 5).
+    this.stopSourceOnly();
     void this.loadBgm(name).then((buffer) => {
+      if (!buffer && this.active === name) {
+        // Track file missing (the repo ships only tracks 01-03; the thbgm
+        // PCM source for the rest is not in reference/). Fall back to the
+        // stage-1 pair by parity — even track numbers are stage themes,
+        // odd are boss themes — instead of going silent.
+        const m = /^th07_(\d+)$/.exec(name);
+        const fallback = m && Number(m[1]) > 3 ? (Number(m[1]) % 2 === 0 ? 'th07_02' : 'th07_03') : null;
+        if (fallback) {
+          this.active = null;
+          this.playBgm(fallback, options);
+        }
+        return;
+      }
       if (!buffer || this.active !== name) return;
       const ctx = this.ensureCtx();
       if (!ctx || !this.bgmGain) return;
-      this.stopSourceOnly();
       const src = ctx.createBufferSource();
       src.buffer = buffer;
       const info = this.trackInfo(name);
@@ -187,8 +211,14 @@ export class AudioBus {
     for (const file of files) void this.loadSfx(file);
   }
 
+  // One active voice per SE slot: Th07.exe duplicates one DirectSound
+  // buffer per slot at init (@ 0x4468xx, IDirectSound::DuplicateSoundBuffer)
+  // and re-Plays it, which RESTARTS the sound — a slot never stacks with
+  // itself. Keyed by the caller's slot id (falls back to the file stem).
+  private slotVoices = new Map<number | string, AudioBufferSourceNode>();
+
   // Plays an original SFX by file stem (e.g. "se_tan00" → assets/sfx/th07/se_tan00.wav).
-  sfx(file: string, volume = 1): void {
+  sfx(file: string, volume = 1, slot?: number | string): void {
     if (!this.unlocked || this.muted) {
       void this.loadSfx(file);
       return;
@@ -200,6 +230,11 @@ export class AudioBus {
     }
     const ctx = this.ensureCtx();
     if (!ctx || !this.sfxGain) return;
+    const key = slot ?? file;
+    const prev = this.slotVoices.get(key);
+    if (prev) {
+      try { prev.stop(); } catch { /* already ended */ }
+    }
     const src = ctx.createBufferSource();
     src.buffer = buffer;
     if (volume >= 1) {
@@ -210,6 +245,10 @@ export class AudioBus {
       src.connect(gain);
       gain.connect(this.sfxGain);
     }
+    this.slotVoices.set(key, src);
+    src.onended = () => {
+      if (this.slotVoices.get(key) === src) this.slotVoices.delete(key);
+    };
     src.start();
   }
 }

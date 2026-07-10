@@ -30,7 +30,7 @@ const STANDARD = [
   '504,48,80,32:hud-digits',
   '480,240,128,96:logo',
   '32,448,96,16:cherry-banner',
-  '176,400,32,40:player-zone'
+  '176,360,32,40:player-zone'
 ];
 
 const specs = regionArgs.length ? regionArgs : STANDARD;

@@ -47,6 +47,13 @@ otherwise, the implementation is wrong.
 - Web Audio BGM looping via `loopStart/loopEnd` sample frames from
   `thbgm.fmt` instead of whole-file loops.
 - Plain-text control hints on menu screens.
+- Stage-start player fly-in: the original places the player in-residence at
+  the spawn point with a 240-frame invuln window and no entrance animation
+  (its init preloads the materialize timer past its threshold). On stage
+  start we instead fly the player up from below the playfield over 60
+  frames (input/firing locked, invulnerable), then hand off to that
+  240-frame invuln. Respawn after death is unchanged. Player-only visual;
+  no gameplay, timing, or collision semantics change once landed.
 
 Nothing else. In particular: **no invented visual content**. If the data
 has no moon, there is no moon. Absence of data gets a flagged fallback and
@@ -219,18 +226,33 @@ pocLine/speed/focusedSpeed/diag×2}` then `{u32 offset, u32 powerThreshold}`
 pairs (brackets 8/16/32/48/64/80/96/128/999). Shooter record 52 bytes:
 `{u16 interval, u16 delay, f32 x,y,hitboxW,hitboxH,angle,speed, i16 damage,
 u8 orb, u8 shotType, i16 sprite, i16 sfxId, i32×4 funcs}`. **PCB's shot
-timer runs a 60-frame cycle** (not TH06's 30); a delay-0 shooter fires on
-the press frame itself. Player sprite ids are SHT sprite + 1024 base.
+timer runs a 30-frame cycle** (Th07.exe FUN_0043a820, counter capped at
+0x1e and re-armed while held; external docs claiming 60 were overruled by
+disassembly); a delay-0 shooter fires on the press frame itself. Player
+sprite ids are SHT sprite + 1024 base.
 Bullet hitboxW/H are full widths; enemy-vs-player-bullet AABB is
 `(enemyW + bulletW)/2`.
 
 **Exe-recovered constants** (Ghidra, Th07.exe v1.00b — keep provenance
-comments): unfocused orb offsets (±32, +8); focused options *orbit* at
-radius 24 phase-shifted π/2 (rate unconfirmed — static approximation in
-place, flagged); focus-toggle glide is 8 frames (x lerp, y eased); cherry
-border trigger 50000 (0xC350), border duration 540 frames (0x21C) with
-30-frame fades; point-item value `50000 − 100·|y − pocLine|` floored to
-tens, min 100.
+comments): unfocused orb offsets (∓24, 0), focused (∓8, −32); SakuyaB-only
+option orbit fully decoded (rate vx·π/200, clamp ±36°, focused cluster
+±π/14 at r=24); focus-toggle glide is 8 frames (x lerp, y eased); cherry
+border trigger 50000 (0xC350) on **cherryPlus** (not the displayed gauge
+cap!), border duration 540 frames (0x21C) with 30-frame fades; initial
+**cherryMax** is per difficulty — 200000 E/N, 250000 H, 300000 L
+(FUN_0042cf2f @ 0x42cf2f); the bottom-left gauge displays
+`cherry/cherryMax` plus a small purple cherryPlus; border-survive score
+bonus is `cherry` (×1, not ×10 — the
+exe's `bonus*10` immediately `/10` is a lossless compiler no-op); point
+item score (case 1 of the item-collect switch) is `v = 50000 − 100·round(y
+− pocLine)` (or flat 50000 at/above the line), `+= floor((cherry−50000)/5)`
+once cherry exceeds 50000 (or capped down to `cherry` itself if `v`
+would've been the flat 50000), floored to tens, **then `score += v/10`**
+— the live in-game score field is added-to (and displayed) at ×1 with no
+further scaling anywhere in the HUD digit path (confirmed via the raw
+"%.8d"/"%.9d" format strings backing the score readout, no appended
+digit); see reference/re-specs/exe-cherry-border.md §3c/§4 and
+EXECUTION-LOG.md's score-unit adjudication.
 
 **HUD layout**: front.png sprite rects and resting coordinates are decoded
 in `src/game/stage-scene.ts` (`FRONT`, `drawSidebar`, `drawFrame`) — labels
@@ -238,9 +260,10 @@ column x=432, digit font = ascii.png 8×12 glyphs at texture y=208 (digit d
 at x=8d, pitch 8, no comma glyph), 東方妖々夢 logo at (480,208), caption at
 (448,336), frame tiled from the 32×32 maroon tile + 128×16 strip (exact
 integer fit), boss nameplates are ename.png rows (row 0 Cirno, row 1 Letty)
-composited at (32,26), Cherry+ banner at (32,448) with the value
-right-aligned into the blank slot ending at in-sprite x≈84 and the 50000
-cap after the slash.
+composited at (32,26), cherry banner at (32,448) showing `cherry/cherryMax`
+(cherry right-aligned into the blank slot ending at in-sprite x≈84,
+cherryMax after the slash) with the small purple cherryPlus above the
+blank (exe draw @ all.c:1760-1870).
 
 ## 7. Approximations registry (known, flagged, improvable)
 
@@ -255,12 +278,26 @@ comparisons against real play).
 - HUD star icon x positions; spell-timer and fps exact placement.
 - Cherry+ banner interrupt→state mapping (dim=charging, bright=border).
 - Bomb mechanics are functionally accurate first-pass; damage/cancel cadence
-  not yet exe-verified. Bomb visuals run the characters' own playerXX.anm
-  bomb scripts (Reimu scr133–143, Marisa scr71–78/98–104, Sakuya scr5–14 —
-  decoded from the embedded data), but the spawn cadence/anchor offsets in
+  not yet exe-verified (bomb-TOUCHED bullets now spawn the exe-correct item:
+  type 0 power → big cherry at power≥128, DAT_004b5ebc BSS=0 @ all.c:16160,
+  but the exe's per-orb touch test is approximated by a 128px radius). Bomb
+  visuals run the characters' own playerXX.anm bomb scripts (Reimu
+  scr133–143, Marisa scr71–78/98–104, Sakuya scr5–14 — decoded from the
+  embedded data), but the spawn cadence/anchor offsets in
   `StageScene#spawnBombEffects` approximate the exe's placement routine.
-- ECL per-frame damage cap 70 inherited from the TH06 family (op 142
-  parameter suspected related, unconfirmed).
+- Phase-end sweep popups: the exe pops each escalating 2000/+20 (bullets)
+  and 2000/+30 (helpers) value at the converted entity (FUN_00402260); the
+  port banks the identical score total but draws no per-item popup text.
+- EX bullet behaviors activate all-at-once at spawn; the exe arms one op-79
+  slot per frame (≤N-frame phase error, N = #armed slots).
+- Move-then-ECL order differs from the exe's ECL-then-move by ≤1 frame of
+  aim skew on aimed FIREs.
+- Spell-bonus decay rounding: exe writes `floor10(ftol(<register-arg float
+  expr>))` per frame (0x41f8a8 region); the port computes
+  `floor10(base − decayPerSec·elapsed/60)`. Sub-10-point drift only.
+  (The damage cap 70 and op 142 are no longer approximations: cap
+  confirmed at all.c:14226; op 142 = N-frame damage shield, boss /9 /
+  non-boss 0, countdown at all.c:14440 — see FIX_LOG 2026-07-10.)
 - `ins_30/31` render flags unknown (no-op everywhere, matches PyTouhou).
 - Spell declaration presentation: the eff01.anm background script is
   open-coded (its op-4 loop defeats AnmRunner's frame-keyed fades); the
