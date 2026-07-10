@@ -26,6 +26,11 @@ export class Input {
   private held = new Set<Button>();
   private codes = new Set<string>();
   private downEdges = new Set<Button>();
+  // Reused snapshots keep the 60 Hz input hot path allocation-free. Every
+  // consumer reads InputFrame synchronously during the same update tick.
+  private frameHeld = new Set<Button>();
+  private framePressed = new Set<Button>();
+  private frameState: InputFrame = { held: this.frameHeld, pressed: this.framePressed };
 
   constructor() {
     addEventListener('keydown', (e) => this.down(e), { passive: false });
@@ -72,8 +77,11 @@ export class Input {
   }
 
   frame(): InputFrame {
-    const pressed = new Set(this.downEdges);
+    this.frameHeld.clear();
+    for (const button of this.held) this.frameHeld.add(button);
+    this.framePressed.clear();
+    for (const button of this.downEdges) this.framePressed.add(button);
     this.downEdges.clear();
-    return { held: new Set(this.held), pressed };
+    return this.frameState;
   }
 }
