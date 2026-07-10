@@ -207,7 +207,8 @@ export class StageRuntime {
   }
 
   update(game: GameHost): void {
-    if (!game.timeStopped) this.std.advance();
+    const rate = game.slowRate ?? 1;
+    if (!game.timeStopped) this.std.advance(rate);
     if (this.timelineCursors.length === 0) this.reset();
     for (let t = 0; t < this.ecl.timelines.length; t++) {
       const timeline = this.ecl.timelines[t];
@@ -227,7 +228,8 @@ export class StageRuntime {
         }
         cursor.index++;
       }
-      if (!held && !game.isDialogueBlocking?.()) cursor.frame++;
+      // Timeline clock advances at the global rate (spec-slowmo.md §3.2).
+      if (!held && !game.isDialogueBlocking?.()) cursor.frame += rate;
     }
   }
 
@@ -318,7 +320,7 @@ export class StageRuntime {
 
   private makeEnemyState(subId: number, mirrored: boolean, itemDrop: number, parent: Enemy | null): EclState {
     return {
-      ctx: { subId, index: 0, time: 0, windowBase: parent ? parent.ecl.ctx.windowBase : 0, waitTimer: 0 },
+      ctx: { subId, index: 0, time: 0, timeFrac: 0, windowBase: parent ? parent.ecl.ctx.windowBase : 0, waitTimer: 0 },
       stack: [],
       subId,
       mirrored,
@@ -540,8 +542,10 @@ export class StageRuntime {
     this.runPendingInterrupt(s);
     if (s.effectArm) this.runBulletEffect(game, e, s.effectArm.id, this.getInt(game, e, s.effectArm.paramOff));
     this.tickInterpSlots(game, e);
+    const rate = game.slowRate ?? 1;
     if (s.periodicSub && s.periodicSub.subId >= 0) {
-      if (++s.periodicSub.elapsed >= s.periodicSub.period) {
+      s.periodicSub.elapsed += rate;
+      if (s.periodicSub.elapsed >= s.periodicSub.period) {
         s.periodicSub.elapsed = 0;
         // Nested gosub: return resumes the interrupted flow (the exe also
         // snapshots/restores the FIRE template around it — approximated by
@@ -553,17 +557,25 @@ export class StageRuntime {
     // FUN_0040f6c0 dispatches this frame's ECL before recomputing velocity;
     // op45 only pauses dispatch/time, never the movement block at 0x41592f.
     this.runEcl(game, e);
-    this.applyMovement(e);
+    this.applyMovement(e, rate);
     s.frameVx = e.x - prevX;
     s.frameVy = e.y - prevY;
     this.updateAutoShoot(game, e);
-    if (s.isBoss && !game.timeStopped) s.bossTimer++;
+    // Boss spell timer is a split counter at the global rate
+    // (exe-ecl-boss.md §3 + spec-slowmo.md §3.2).
+    if (s.isBoss && !game.timeStopped) {
+      s.bossTimerFrac = (s.bossTimerFrac ?? 0) + rate;
+      if (s.bossTimerFrac >= 1) {
+        s.bossTimer++;
+        s.bossTimerFrac -= 1;
+      }
+    }
     this.updateAnmPose(e);
-    s.anmRunner?.update();
-    for (const slot of s.anmSlots) slot?.runner?.update();
+    s.anmRunner?.update(rate);
+    for (const slot of s.anmSlots) slot?.runner?.update(rate);
   }
 
-  private applyMovement(e: Enemy): void {
+  private applyMovement(e: Enemy, rate = 1): void {
     const s = e.ecl;
     // Th07.exe FUN_00416d00 @ 0x416d00 sets +0x2e2b bit0 permanently;
     // the master enemy tick skips FUN_0041d050 while it remains set.
@@ -572,7 +584,7 @@ export class StageRuntime {
       const m = s.interp;
       // FUN_00436a06 decrements the remaining-frame counter before the
       // interpolation fraction is read, so the first movement tick is 1/N.
-      m.left = Math.max(0, m.left - 1);
+      m.left = Math.max(0, m.left - rate);
       const elapsed = m.duration - m.left;
       const t = applyEclEase(clamp(elapsed / Math.max(1, m.duration), 0, 1), s.interpKind);
       e.x = m.start.x + m.delta.x * t;
@@ -590,33 +602,34 @@ export class StageRuntime {
       // computes a polar offset in a scratch temp, then derives this frame's
       // velocity as (temp+target)-pos so FUN_0041d050's unconditional integrator
       // lands exactly on target+polar(angle,speed) — see spec §3 Group B / §5.3.
-      s.orbitAngle = normalizeAngle(s.orbitAngle + s.orbitAngularVelocity);
-      s.orbitSpeed += s.orbitAcceleration;
+      s.orbitAngle = normalizeAngle(s.orbitAngle + s.orbitAngularVelocity * rate);
+      s.orbitSpeed += s.orbitAcceleration * rate;
       const vx = (Math.cos(s.orbitAngle) * s.orbitSpeed + s.orbitTarget.x) - e.x;
       const vy = (Math.sin(s.orbitAngle) * s.orbitSpeed + s.orbitTarget.y) - e.y;
       // Mode 3 leaves velocity.z untouched. Keep all three components because
       // clearing the mode bits at timeout does not clear the velocity vector.
       s.axisSpeed.x = vx;
       s.axisSpeed.y = vy;
-      e.x += s.mirrored ? -vx : vx;
-      e.y += vy;
-      e.z += s.axisSpeed.z;
-      if (s.orbitDuration > 0 && --s.orbitLeft < 1) s.moveMode = 0;
+      e.x += (s.mirrored ? -vx : vx) * rate;
+      e.y += vy * rate;
+      e.z += s.axisSpeed.z * rate;
+      if (s.orbitDuration > 0 && (s.orbitLeft -= rate) < 1) s.moveMode = 0;
     } else if (s.moveMode === 1) {
       // FUN_0040f6c0 @ 0x415a9e-0x415b0c updates the polar state first,
       // then writes the velocity consumed by the unconditional integrator.
-      s.angle = normalizeAngle(s.angle + s.angularVelocity);
-      s.speed += s.acceleration;
+      s.angle = normalizeAngle(s.angle + s.angularVelocity * rate);
+      s.speed += s.acceleration * rate;
       const vx = Math.cos(s.angle) * s.speed;
       const vy = Math.sin(s.angle) * s.speed;
       s.axisSpeed = { x: vx, y: vy, z: 0 };
-      e.x += s.mirrored ? -vx : vx;
-      e.y += vy;
-      if (s.orbitDuration > 0 && --s.orbitLeft < 1) s.moveMode = 0;
+      e.x += (s.mirrored ? -vx : vx) * rate;
+      e.y += vy * rate;
+      if (s.orbitDuration > 0 && (s.orbitLeft -= rate) < 1) s.moveMode = 0;
     } else {
-      e.x += s.mirrored ? -s.axisSpeed.x : s.axisSpeed.x;
-      e.y += s.axisSpeed.y;
-      e.z += s.axisSpeed.z;
+      // Generic integrator (exe FUN_0041d050): pos += vel * rate.
+      e.x += (s.mirrored ? -s.axisSpeed.x : s.axisSpeed.x) * rate;
+      e.y += s.axisSpeed.y * rate;
+      e.z += s.axisSpeed.z * rate;
     }
     if (s.shouldClamp) {
       e.x = clamp(e.x, s.lowerMoveLimit.x, s.upperMoveLimit.x);
@@ -684,6 +697,7 @@ export class StageRuntime {
       subId,
       index: 0,
       time: 0,
+      timeFrac: 0,
       windowBase: Math.max(0, s.ctx.windowBase + windowShift),
       waitTimer: 0
     };
@@ -714,7 +728,7 @@ export class StageRuntime {
     for (let i = 0; i < s.interpSlots.length; i++) {
       const slot = s.interpSlots[i];
       if (!slot) continue;
-      slot.elapsed++;
+      slot.elapsed += game.slowRate ?? 1;
       const done = slot.elapsed >= slot.duration;
       const t = applyEclEase(done ? 1 : slot.elapsed / Math.max(1, slot.duration), slot.ease);
       let value: number;
@@ -885,20 +899,25 @@ export class StageRuntime {
         }
         return;
       }
-      case 10: { // enter bullet-time: slow all live bullets by 1/param
+      case 10: { // FUN_00418020: enter bullet-time. Sets the GLOBAL rate to
+        // 1/param and retroactively rescales every live bullet's velocity
+        // vector (never the nominal speed field) — the per-frame bullet
+        // integrator is unscaled, so this one-time edit IS the slowdown
+        // (spec-slowmo.md §1). Repeated enters compound, like the exe.
         const f = param > 0 ? 1 / param : 1;
-        if (this.bulletTimeScale === 1 && f !== 1) {
-          for (const b of game.enemyBullets) { b.vx *= f; b.vy *= f; b.speed *= f; }
-          this.bulletTimeScale = f;
+        for (const b of game.enemyBullets) {
+          if (!b.dead) { b.vx *= f; b.vy *= f; }
         }
+        game.setSlowRate?.(f);
         return;
       }
-      case 11: { // exit bullet-time
-        if (this.bulletTimeScale !== 1) {
-          const f = 1 / this.bulletTimeScale;
-          for (const b of game.enemyBullets) { b.vx *= f; b.vy *= f; b.speed *= f; }
-          this.bulletTimeScale = 1;
+      case 11: { // FUN_00418130: exit bullet-time — exact algebraic inverse
+        // of whatever rate is CURRENTLY active, then rate = 1.
+        const f = 1 / (game.slowRate ?? 1);
+        for (const b of game.enemyBullets) {
+          if (!b.dead) { b.vx *= f; b.vy *= f; }
         }
+        game.setSlowRate?.(1);
         return;
       }
       case 16: { // FUN_00418880: emit a five-way wave from every live seed
@@ -958,14 +977,122 @@ export class StageRuntime {
         return;
       }
       case 20: game.playBgmTrack?.('th07_13b'); return; // Yuyuko phase-2 cue
-      case 3: return; // exe stub
-      // Still unimplemented: 1/2/4/6/9/12-15/19/21-23. Several are gameplay
-      // effects and must not be classified as decorative no-ops.
+      case 1: { // FUN_00416da0: "declaw" — bullets of shape 2/4/6/8 (param
+        // 1 restricts to shape 8, param 2 to shape 4) drop their NOMINAL
+        // speed to a flat 0.3 and get marked processed; the bullet is not
+        // deleted and its live velocity vector is untouched. Plus a 12->0
+        // shake over 30f and a 3x pale flash (spec-effects-misc.md §1).
+        game.startScreenShake?.(30, 12, 0);
+        game.startScreenFlash?.(4, 3, 0x80ffcfcf);
+        for (const b of game.enemyBullets) {
+          if (b.dead || b.effectState !== 0) continue;
+          if (param === 1 && b.sprite !== 8) continue;
+          if (param === 2 && b.sprite !== 4) continue;
+          if (param !== 1 && param !== 2 && ![2, 4, 6, 8].includes(b.sprite)) continue;
+          b.speed = 0.3;
+          b.effectState = 1;
+        }
+        return;
+      }
+      case 2: { // FUN_00416fc0: silently delete every live shape-2 bullet
+        // within a param-selected radius of the calling enemy, popping a
+        // small particle at each former position (§2). param 0 also fires
+        // the shake+flash pair.
+        const thresholds = [128, 192, 256, 999];
+        const thr = thresholds[param] ?? 999;
+        if (param === 0) {
+          game.startScreenShake?.(32, 12, 0);
+          game.startScreenFlash?.(4, 1, 0x80cfcfff);
+        }
+        for (const b of game.enemyBullets) {
+          if (b.dead || b.sprite !== 2) continue;
+          if (Math.hypot(e.x - b.x, e.y - b.y) >= thr) continue;
+          game.spawnEffectParticles(2, b.x, b.y, 1, 0xffffffff);
+          b.dead = true;
+        }
+        return;
+      }
+      case 4: { // FUN_00417290: find the FIRST live big-sprite bullet
+        // (descriptor size > 60), remember its position in locals 10004/5,
+        // burst + delete it. Sentinel -999 when none found. Param unused.
+        this.varWrite(game, e, 10004, -999);
+        for (const b of this.bulletsInPoolOrder(game)) {
+          if (b.dead || Math.max(b.rect.w, b.rect.h) <= 60) continue;
+          this.varWrite(game, e, 10004, b.x);
+          this.varWrite(game, e, 10005, b.y);
+          game.spawnEffectParticles(2, b.x, b.y, 1, 0xffffffff);
+          b.dead = true;
+          break;
+        }
+        return;
+      }
+      case 6: { // FUN_00417440: delete every bullet of the one shape the
+        // param selects (0->6, 1->15, 2->2), each replaced by a three-ring
+        // burst oriented opposite its travel (§5).
+        const shape = param === 0 ? 6 : param === 1 ? 15 : param === 2 ? 2 : -1;
+        if (shape < 0) return;
+        for (const b of game.enemyBullets) {
+          if (b.dead || b.sprite !== shape) continue;
+          game.spawnEffectParticles(6, b.x, b.y, 3, 0xffffffff);
+          b.dead = true;
+        }
+        return;
+      }
+      case 9: // FUN_00417ff0: strong 80-frame screen shake, 8->0 (§6).
+        game.startScreenShake?.(80, 8, 0);
+        return;
+      case 12: case 21: { // FUN_00418260 / FUN_00418bc0: big bullets
+        // (descriptor size > 48) inside a Y-band around the enemy explode
+        // into sparkles and are DELETED. id12 band: ±64 (<Hard) / ±48;
+        // count 10/18/22/25 by difficulty. id21 band: ±128 (Hard) / ±180;
+        // fixed 15 sparkles. Both fire the same pale-blue 8f flash (§7/§12).
+        game.startScreenFlash?.(8, 1, 0x50cfcfff);
+        const hard = game.difficulty >= 2;
+        const band = id === 12 ? (hard ? 48 : 64) : (game.difficulty === 2 ? 128 : 180);
+        const count = id === 12 ? [10, 18, 22, 25][Math.min(3, game.difficulty)] : 15;
+        for (const b of game.enemyBullets) {
+          if (b.dead || Math.max(b.rect.w, b.rect.h) <= 48) continue;
+          if (Math.abs(b.y - e.y) >= band) continue;
+          game.spawnEffectParticles(12, b.x, b.y, count, 0xffffffff);
+          b.dead = true;
+        }
+        return;
+      }
+      case 13: { // FUN_00418650 (armed, per-frame): tag bullets drifting
+        // into the narrow strip directly below the enemy (|dx|<16,
+        // y<352) with processed=1 — cosmetic overlay only, no deletion (§8).
+        for (const b of game.enemyBullets) {
+          if (b.dead || b.effectState !== 0) continue;
+          if (b.y <= e.y || b.y >= 352 || Math.abs(b.x - e.x) >= 16) continue;
+          b.effectState = 1;
+        }
+        return;
+      }
+      case 14: { // FUN_00418780: sweep every id13-tagged bullet (processed
+        // ==1), orient its overlay toward the player, advance the tag to 2;
+        // 16f pale flash. No deletion (§9).
+        game.startScreenFlash?.(16, 1, 0x50cfcfff);
+        for (const b of game.enemyBullets) {
+          if (!b.dead && b.effectState === 1) b.effectState = 2;
+        }
+        return;
+      }
+      case 15: // FUN_00418850: single pale flash, duration = the op's own
+        // param (live-read; §10). Color 0xd0cfcfff.
+        game.startScreenFlash?.(Math.max(1, param), 1, 0xd0cfcfff);
+        return;
+      case 19: // FUN_00418ee0: fade the current BGM out over 3.0 seconds.
+        game.fadeBgm?.(3);
+        return;
+      case 22: case 23: // FUN_00418f20/FUN_00419150: per-frame decorative
+        // aura particles on big bullets, keyed to bossTimer parity — purely
+        // cosmetic, no bullet state changes; not ported (§13/§14, priority
+        // table blesses no-op).
+        return;
+      case 3: return; // exe stub (confirmed empty; unused by real data)
       default: return;
     }
   }
-
-  private bulletTimeScale = 1;
 
   private updateAutoShoot(game: GameHost, e: Enemy): void {
     const s = e.ecl;
@@ -974,7 +1101,7 @@ export class StageRuntime {
     // the immediate fire inside FIRE ops 64-72). Checking shootDisabled here
     // silenced every op75-then-op73 pattern.
     if (!s.shootInterval || !s.bulletProps) return;
-    s.shootTimer++;
+    s.shootTimer += game.slowRate ?? 1;
     if (s.shootTimer >= s.shootInterval) {
       s.shootTimer = 0;
       this.spawnBullets(game, e, s.bulletProps);
@@ -1016,7 +1143,7 @@ export class StageRuntime {
       // on every dispatcher pass also handles RETURN restoring a waiting
       // caller after an op144 periodic gosub.
       if (ctx.waitTimer > 0) {
-        ctx.waitTimer--;
+        ctx.waitTimer -= game.slowRate ?? 1;
         return;
       }
       const instrs = this.ecl.sub(ctx.subId);
@@ -1036,7 +1163,19 @@ export class StageRuntime {
       }
       ctx.index++;
     }
-    s.ctx.time++;
+    // The ECL clock is a split (int, frac) counter at the global rate
+    // (exe FUN_00436acc @ all.c:7329; spec-slowmo.md §5). Integer semantics
+    // are load-bearing: instruction dispatch compares time with ===.
+    const rate = game.slowRate ?? 1;
+    if (rate > 0.99) {
+      s.ctx.time++;
+    } else {
+      s.ctx.timeFrac += rate;
+      if (s.ctx.timeFrac >= 1) {
+        s.ctx.time++;
+        s.ctx.timeFrac -= 1;
+      }
+    }
   }
 
   private jumpTo(s: EclState, targetOffset: number, newTime: number): void {
@@ -1724,9 +1863,15 @@ export class StageRuntime {
         s.lifeThresholds[slot] = { threshold: v.i32(a + 4), sub: v.i32(a + 8) };
         return null;
       }
-      case 149: case 150: // 149 = attached-laser origin follow/detach (the
-        // +0x2eb0 boss-laser object — not modeled); 150 = write to enemy+8
-        // (unidentified, 1 use). Store-and-ignore per spec.
+      case 149: // SetSpellPresentationOrigin(followBoss, x, y, z) — moves/
+        // freezes the spell-card presentation entity created at op90
+        // (spec-effects-misc.md §15). The port draws that presentation as a
+        // flat overlay with no world entity, so there is nothing to move;
+        // no-op with corrected semantics (1 use: stage 4 freeze mode).
+        return null;
+      case 150: // exe case 0x95: absolute Z rotation into the enemy's own
+        // embedded ANM VM (+8), radians (spec-effects-misc.md §16).
+        s.anmRotZ = gf(0);
         return null;
       case 151: { // PolarToXY (exe case 0x96): arg1-var = cos(angle)*mag,
         // arg0-var = sin(angle)*mag (angle arg2, magnitude arg3).
@@ -1918,14 +2063,17 @@ export class StageRuntime {
         const spawnDuration = flags & 2 ? 8 : flags & 4 ? 11 : flags & 8 ? 14 : 0;
         const spawnMoveScale = flags & 2 ? 1 / 2 : flags & 4 ? 1 / 2.5 : flags & 8 ? 1 / 3 : 1;
         const ex = resolveExBehaviors(p.exSlots, flags, angle, spd);
+        // Spawn-time rate bake-in (exe FUN_00421e90/FUN_004229f0:
+        // FUN_004074e0(angle, speed * DAT_0056baa8); spec-slowmo.md §3.4) —
+        // the nominal speed field stays unscaled.
         game.enemyBullets.push({
           id: game.id++,
           poolSlot,
           effectState: 0,
           x: shootX,
           y: shootY,
-          vx: Math.cos(angle) * spd,
-          vy: Math.sin(angle) * spd,
+          vx: Math.cos(angle) * spd * (game.slowRate ?? 1),
+          vy: Math.sin(angle) * spd * (game.slowRate ?? 1),
           speed: spd,
           angle,
           age: 0,
@@ -1985,6 +2133,9 @@ export class StageRuntime {
       const drops = sweepItems && enemy.ecl.sweepItemFlag;
       this.clearNonBossEnemy(game, enemy, sweepItems);
       if (drops) {
+        // FUN_004217c0: escalating popup per swept drop — white while
+        // ramping, yellow at the cap (spec-popups.md §4.2).
+        game.spawnScorePopup?.(value, enemy.x, enemy.y, value < 8000 ? 0xffffffff : 0xffffff00);
         total += value;
         value = Math.min(8000, value + 30);
       }

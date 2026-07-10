@@ -1,0 +1,471 @@
+import type { PlayerEffects } from './player-effects';
+import type { Player } from './player';
+import type { Rng } from '../core/rng';
+import type { Enemy, EnemyBullet } from './types';
+
+// Player bomb attack-slot engine + the twelve decoded per-form state
+// machines (Th07.exe bomb tick functions 0x407840-0x40cbf0; specs:
+// reference/re-specs/spec-bombs-{shared,reimu,marisa,sakuya}.md).
+//
+// Damage delivery: the exe writes moving attack hitboxes into the
+// player+0x9dc array (stride 0x20: pos, radiusX/Y as FULL widths halved at
+// test, damage, hitTally), consumed by FUN_0043a980 every frame per enemy —
+// an overlapping slot applies its damage value EVERY frame it overlaps.
+// Bullet cancellation is the same spatial touch, gated on bomb-active.
+
+export interface AttackSlot {
+  x: number;
+  y: number;
+  radiusX: number; // FULL widths — halved at the point of test
+  radiusY: number;
+  damage: number;
+  hitTally: number;
+  active: boolean;
+}
+
+export interface BombContext {
+  player: Player;
+  fx: PlayerEffects;
+  rng: Rng;
+  frame: number; // integer bomb-local frame (exe 16a38)
+  duration: number;
+  focused: boolean; // latched at cast (exe 16a24)
+  rate: number; // global slow-motion rate
+  enemies: Enemy[];
+  enemyBullets: EnemyBullet[];
+  playSfx(id: number): void;
+  spawnParticles(effectId: number, x: number, y: number, count: number, color: number): void;
+  startScreenShake(duration: number, from: number, to: number): void;
+}
+
+const MAX_SLOTS = 112; // exe pool size (0x70)
+const TAU = Math.PI * 2;
+
+export class BombEngine {
+  slots: AttackSlot[] = Array.from({ length: MAX_SLOTS }, () => ({
+    x: 0, y: 0, radiusX: 0, radiusY: 0, damage: 0, hitTally: 0, active: false
+  }));
+
+  reset(): void {
+    for (const s of this.slots) {
+      s.active = false;
+      s.radiusX = s.radiusY = s.damage = s.hitTally = 0;
+    }
+  }
+
+  set(i: number, x: number, y: number, radiusX: number, radiusY: number, damage: number): AttackSlot {
+    const s = this.slots[i];
+    s.x = x;
+    s.y = y;
+    s.radiusX = radiusX;
+    s.radiusY = radiusY;
+    s.damage = damage;
+    s.active = true;
+    return s;
+  }
+
+  clear(i: number): void {
+    const s = this.slots[i];
+    s.active = false;
+    s.radiusX = s.radiusY = s.damage = 0;
+  }
+
+  *activeSlots(): IterableIterator<AttackSlot> {
+    for (const s of this.slots) if (s.active && s.radiusX > 0) yield s;
+  }
+}
+
+// Per-entity simulation state shared by the burst-style forms.
+interface BombActor {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  angle: number;
+  speed: number;
+  accel: number;
+  turnRate: number;
+  state: number;
+  age: number;
+}
+
+export class BombRunner {
+  private actors: BombActor[] = [];
+  private castX = 0;
+  private castY = 0;
+  private sweepSign = 1;
+  private spawnedCount = 0;
+
+  constructor(private engine: BombEngine, private character: string, private focused: boolean) {}
+
+  start(ctx: BombContext): void {
+    this.castX = ctx.player.x;
+    this.castY = ctx.player.y;
+    this.engine.reset();
+    // MarisaB unfocused: the sweep direction sign is locked at cast from
+    // which half of the playfield the player stood on (spec-bombs-marisa §3).
+    this.sweepSign = this.castX >= 192 ? -1 : 1;
+    // ReimuB both casts open with the building 2->6 shake (spec-bombs-reimu §5/6).
+    if (this.character === 'reimuB') ctx.startScreenShake(60, 2, 6);
+  }
+
+  tick(ctx: BombContext): void {
+    switch (this.character) {
+      case 'reimuA': this.focused ? this.reimuAFocused(ctx) : this.reimuAUnfocused(ctx); break;
+      case 'reimuB': this.focused ? this.reimuBFocused(ctx) : this.reimuBUnfocused(ctx); break;
+      case 'marisaA': this.focused ? this.marisaAFocused(ctx) : this.marisaAUnfocused(ctx); break;
+      case 'marisaB': this.focused ? this.marisaBFocused(ctx) : this.marisaBUnfocused(ctx); break;
+      case 'sakuyaA': this.focused ? this.sakuyaAFocused(ctx) : this.sakuyaAUnfocused(ctx); break;
+      case 'sakuyaB': this.focused ? this.sakuyaBFocused(ctx) : this.sakuyaBUnfocused(ctx); break;
+    }
+  }
+
+  // 霊符「夢想封印」 unfocused — FUN_00407840 (spec-bombs-reimu §3).
+  // 8 orbs, frames 12..54 step 6, fanning 45° apart from straight up,
+  // mirrored by which half the player cast from. Each decelerates 0.4/f
+  // from 15, freezes when speed < -10 (having flown out and swung back),
+  // then leaves a 30-frame r256/d2 aftermath that stays as a frozen
+  // "landmine" slot. The r256/d400 finisher write is overwritten the same
+  // frame in the exe and never lands (§3.4) — reproduced by simply not
+  // writing it.
+  private reimuAUnfocused(ctx: BombContext): void {
+    const f = ctx.frame;
+    if (f >= 12 && f <= 54 && f % 6 === 0 && this.actors.length < 8) {
+      const i = this.actors.length;
+      const mirror = this.castX >= 192 ? -i : i;
+      const angle = mirror * (TAU / 8) - Math.PI / 2;
+      this.actors.push({
+        x: ctx.player.x, y: ctx.player.y, vx: 0, vy: 0,
+        angle, speed: 15, accel: 0, turnRate: 0, state: 1, age: 0
+      });
+      ctx.fx.spawn({ scriptId: 133 + (i & 3), x: ctx.player.x, y: ctx.player.y });
+      ctx.playSfx(13);
+    }
+    this.actors.forEach((orb, i) => {
+      if (orb.state === 1) {
+        orb.speed -= 0.4 * ctx.rate;
+        orb.vx = Math.cos(orb.angle) * orb.speed;
+        orb.vy = Math.sin(orb.angle) * orb.speed;
+        if (orb.speed < -10) {
+          orb.state = 2;
+          orb.vx = orb.vy = 0;
+          ctx.playSfx(15);
+          ctx.startScreenShake(16, 8, 0);
+          ctx.spawnParticles(6, orb.x, orb.y, 12, 0xffffffff);
+        }
+        this.engine.set(i, orb.x, orb.y, 48, 48, 8);
+      } else if (orb.state === 2) {
+        this.engine.set(i, orb.x, orb.y, 256, 256, 2);
+        if (++orb.age > 29) orb.state = 0; // slot stays frozen (exe quirk)
+      }
+      if (orb.state !== 0) {
+        orb.x += orb.vx * ctx.rate;
+        orb.y += orb.vy * ctx.rate;
+      }
+    });
+  }
+
+  // 霊符「夢想封印」 focused — FUN_004082e0 (spec-bombs-reimu §4).
+  // 7 homing orbs at frames 80..176 step 16 (the frame-64 slot is skipped
+  // by the exe itself); uniform-random launch heading, vector-seek steering
+  // capped at 10 px/f toward the live player position; detonates at
+  // hitTally > 99 or in the bomb's final 30 frames, leaving a PERSISTENT
+  // r256/d400 hitbox while the orb sprite coasts on.
+  private reimuAFocused(ctx: BombContext): void {
+    const f = ctx.frame;
+    if (f >= 80 && f <= 176 && (f - 60) % 16 === 0 && this.actors.length < 7) {
+      const launch = ctx.rng.range(TAU) - Math.PI;
+      this.actors.push({
+        x: ctx.player.x, y: ctx.player.y,
+        vx: Math.cos(launch), vy: Math.sin(launch),
+        angle: launch, speed: 8 /* turnParam seed */, accel: 0, turnRate: 0, state: 1, age: 0
+      });
+      ctx.fx.spawn({ scriptId: 133 + (this.actors.length & 3), x: ctx.player.x, y: ctx.player.y });
+      ctx.playSfx(13);
+    }
+    this.actors.forEach((orb, i) => {
+      if (orb.state === 1) {
+        const dx = ctx.player.x - orb.x;
+        const dy = ctx.player.y - orb.y;
+        const dist = Math.hypot(dx, dy);
+        let div = dist / (orb.speed / 8);
+        if (div < 1) div = 1;
+        const rawVx = dx / div + orb.vx;
+        const rawVy = dy / div + orb.vy;
+        const rawSpeed = Math.hypot(rawVx, rawVy) || 1;
+        orb.speed = Math.max(1, Math.min(10, rawSpeed));
+        orb.vx = (rawVx * orb.speed) / rawSpeed;
+        orb.vy = (rawVy * orb.speed) / rawSpeed;
+        const slot = this.engine.set(i, orb.x, orb.y, 48, 48, 8);
+        if (slot.hitTally > 99 || ctx.frame >= ctx.duration - 30) {
+          orb.state = 2;
+          // Persistent detonation landmine (exe §4.4) — set once, then the
+          // slot is never revisited; the orb keeps coasting visually.
+          this.engine.set(i, orb.x, orb.y, 256, 256, 400);
+          ctx.playSfx(15);
+          ctx.startScreenShake(16, 8, 0);
+          ctx.spawnParticles(6, orb.x, orb.y, 12, 0xffffffff);
+        }
+      }
+      if (orb.state !== 0) {
+        orb.x += orb.vx * ctx.rate;
+        orb.y += orb.vy * ctx.rate;
+        if (orb.state === 2 && ++orb.age > 29) orb.state = 0;
+      }
+    });
+  }
+
+  // 霊符「封魔陣」 unfocused — FUN_00408f10 (spec-bombs-reimu §5): a cross
+  // through the cast point. Four slots reduce to two unique geometries —
+  // a 62×448 vertical strip through cast X and a 384×62 horizontal strip
+  // through screen-center Y — continuously active at d16 (the exe's odd-
+  // frame write gating only halves the cosmetic position refresh).
+  private reimuBUnfocused(ctx: BombContext): void {
+    this.engine.set(0, this.castX, 224, 62, 448, 16);
+    this.engine.set(1, 192, this.castY, 384, 62, 16);
+    this.engine.set(2, this.castX, 224, 62, 448, 16);
+    this.engine.set(3, 192, this.castY, 384, 62, 16);
+  }
+
+  // 霊符「封魔陣」 focused — FUN_004094e0 (spec-bombs-reimu §6): one fixed
+  // r256/d18 box at the cast point for the whole bomb; a second 20->0
+  // shake fires at frame 60.
+  private reimuBFocused(ctx: BombContext): void {
+    if (ctx.frame === 60) ctx.startScreenShake(80, 20, 0);
+    this.engine.set(0, this.castX, this.castY, 256, 256, 18);
+  }
+
+  // 魔符「スターダストレヴァリエ」 unfocused — FUN_00409900
+  // (spec-bombs-marisa §3): 8 stars in a compass rose (i·45°) at speed 2
+  // from the cast point, each an r128/d8 slot refreshed two of every
+  // three frames.
+  private marisaAUnfocused(ctx: BombContext): void {
+    if (this.actors.length === 0) {
+      for (let i = 0; i < 8; i++) {
+        const angle = (i * TAU) / 8;
+        this.actors.push({
+          x: ctx.player.x, y: ctx.player.y,
+          vx: Math.cos(angle) * 2, vy: Math.sin(angle) * 2,
+          angle, speed: 2, accel: 0, turnRate: 0, state: 1, age: 0
+        });
+      }
+    }
+    this.actors.forEach((star, i) => {
+      star.x += star.vx * ctx.rate;
+      star.y += star.vy * ctx.rate;
+      if (ctx.frame % 3 !== 0) this.engine.set(i, star.x, star.y, 128, 128, 8);
+      else this.engine.clear(i);
+    });
+  }
+
+  // 魔符「スターダストレヴァリエ」 focused — FUN_0040a050
+  // (spec-bombs-marisa §4): one trail star every 6 frames up to 24, launched
+  // in a narrow downward cone (90°±11.25°, speed 5) with an independent
+  // upward-cone acceleration ≈0.24/f; r128/d12 until its own tally
+  // reaches 80; despawns above y=-256.
+  private marisaAFocused(ctx: BombContext): void {
+    if (ctx.frame % 6 === 0 && this.actors.length < 24) {
+      const down = Math.PI / 2 + (ctx.rng.range(Math.PI / 8) - Math.PI / 16);
+      const up = -Math.PI / 2 + (ctx.rng.range(Math.PI / 8) - Math.PI / 16);
+      this.actors.push({
+        x: ctx.player.x, y: ctx.player.y,
+        vx: Math.cos(down) * 5, vy: Math.sin(down) * 5,
+        angle: up, speed: 0, accel: 0.24, turnRate: 0, state: 1, age: 0
+      });
+    }
+    this.actors.forEach((star, i) => {
+      if (star.state === 0) return;
+      star.vx += Math.cos(star.angle) * star.accel * ctx.rate;
+      star.vy += Math.sin(star.angle) * star.accel * ctx.rate;
+      star.x += star.vx * ctx.rate;
+      star.y += star.vy * ctx.rate;
+      if (star.y < -256) {
+        star.state = 0;
+        this.engine.clear(i);
+        return;
+      }
+      const slot = this.engine.slots[i];
+      if (slot.hitTally < 80) this.engine.set(i, star.x, star.y, 128, 128, 12);
+      else this.engine.clear(i);
+    });
+  }
+
+  // 恋符「マスタースパーク」 — FUN_0040a910 (spec-bombs-marisa §5): three
+  // beams from the live player position at -90°/+30°/+150°, sweeping with
+  // an accelerating per-frame delta sign·(frame·π)/9000; 6 slots per beam
+  // spaced along its length, r128/d10, no frame gating.
+  private marisaBUnfocused(ctx: BombContext): void {
+    if (ctx.frame === 20) ctx.startScreenShake(60, 7, 0);
+    const base = [-Math.PI / 2, Math.PI / 6, (5 * Math.PI) / 6];
+    const sweep = (this.sweepSign * (ctx.frame * ctx.frame * Math.PI)) / 18000;
+    for (let b = 0; b < 3; b++) {
+      const angle = base[b] + sweep;
+      for (let k = 0; k < 6; k++) {
+        const d = 48 + k * 76;
+        this.engine.set(b * 6 + k,
+          ctx.player.x + Math.cos(angle) * d,
+          ctx.player.y + Math.sin(angle) * d,
+          128, 128, 10);
+      }
+    }
+  }
+
+  // 恋符「ファイナルスパーク」 — FUN_0040af70 (spec-bombs-marisa §6): one
+  // vertical region above the player — pos (192, playerY/2), radius
+  // (384, playerY), d23 on three of every four frames.
+  private marisaBFocused(ctx: BombContext): void {
+    if (ctx.frame === 20) ctx.startScreenShake(60, 7, 0);
+    if (ctx.frame % 4 !== 0) {
+      this.engine.set(0, 192, ctx.player.y / 2, 384, ctx.player.y, 23);
+    } else {
+      this.engine.clear(0);
+    }
+  }
+
+  // 幻符「殺人ドール」 unfocused — FUN_0040b440 (spec-bombs-sakuya §2):
+  // up to 5 knives/frame during frames 60-120 (96 cap), each launched from
+  // the cast snapshot at a uniform-random angle, speed [5.5,11.5) with
+  // uncapped accel [0.1,0.2) and a gentle random curve (±1.8°/f);
+  // r24/d10 until its slot tallies 30 damage; culled 32px off-screen.
+  private sakuyaAUnfocused(ctx: BombContext): void {
+    const f = ctx.frame;
+    if (f >= 60 && f <= 120) {
+      for (let n = 0; n < 5 && this.actors.length < 96; n++) {
+        const angle = ctx.rng.range(TAU) - Math.PI;
+        const speed = ctx.rng.range(6) + 5.5;
+        this.actors.push({
+          x: this.castX + Math.cos(angle) * 24,
+          y: this.castY + Math.sin(angle) * 24,
+          vx: 0, vy: 0, angle, speed,
+          accel: ctx.rng.range(0.1) + 0.1,
+          turnRate: ctx.rng.range(0.0628) - 0.0314,
+          state: 1, age: 0
+        });
+        const i = this.actors.length - 1;
+        ctx.fx.spawn({ scriptId: 5 + (i & 1), x: this.actors[i].x, y: this.actors[i].y, rotation: angle + Math.PI / 2 });
+      }
+    }
+    this.actors.forEach((k, i) => {
+      if (k.state === 0) return;
+      const slot = this.engine.slots[i];
+      if (slot.hitTally < 30) {
+        k.angle += k.turnRate * ctx.rate;
+        k.speed += k.accel * ctx.rate;
+        k.vx = Math.cos(k.angle) * k.speed;
+        k.vy = Math.sin(k.angle) * k.speed;
+        k.x += k.vx * ctx.rate;
+        k.y += k.vy * ctx.rate;
+        this.engine.set(i, k.x, k.y, 24, 24, 10);
+      }
+      if (k.x < -32 || k.x > 416 || k.y < -32 || k.y > 480) {
+        k.state = 0;
+        this.engine.clear(i);
+      }
+    });
+  }
+
+  // 幻符「殺人ドール」 focused — FUN_0040bbb0 (spec-bombs-sakuya §3):
+  // 96 knives in a deterministic ring (pairs every 2 frames, frames
+  // 20-114) anchored to the LIVE player at spawn; fly 30 frames, spin in
+  // place -9°/f for exactly one revolution (ages 30-69), re-aim at the
+  // nearest enemy at age 70 with speed reset to 14, then fly uncapped;
+  // r24/d22 until the slot's first hit (the hitbox then stays, per exe).
+  private sakuyaAFocused(ctx: BombContext): void {
+    const f = ctx.frame;
+    if (f >= 20 && f < 116 && f % 2 === 0 && this.actors.length < 96) {
+      for (let n = 0; n < 2 && this.actors.length < 96; n++) {
+        const i = this.actors.length;
+        const angle = (i * TAU) / 96 - Math.PI + (n === 1 ? Math.PI : 0);
+        this.actors.push({
+          x: ctx.player.x + Math.cos(angle) * 24,
+          y: ctx.player.y + Math.sin(angle) * 24,
+          vx: 0, vy: 0, angle,
+          speed: ctx.rng.range(1) + 0.5,
+          accel: ctx.rng.range(0.1) + 0.03,
+          turnRate: -0.15707964,
+          state: 1, age: 0
+        });
+        ctx.fx.spawn({ scriptId: 7 + (i & 1), x: this.actors[i].x, y: this.actors[i].y, rotation: angle + Math.PI / 2 });
+      }
+    }
+    // Shared nearest-enemy metric: horizontally closest to the player
+    // (the exe reads the same player+0x2428 cache the homing shots use).
+    let target: Enemy | null = null;
+    let bestDx = Infinity;
+    for (const e of ctx.enemies) {
+      if (!e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.canTakeDamage || !e.ecl.shotCollision) continue;
+      const dx = Math.abs(e.x - ctx.player.x);
+      if (dx < bestDx) {
+        bestDx = dx;
+        target = e;
+      }
+    }
+    this.actors.forEach((k, i) => {
+      if (k.state === 0) return;
+      k.age++;
+      if (k.age < 30 || k.age >= 70) {
+        if (k.age === 70) {
+          if (target) k.angle = Math.atan2(target.y - k.y, target.x - k.x);
+          k.speed = 14;
+        }
+        k.speed += k.accel * ctx.rate;
+        k.vx = Math.cos(k.angle) * k.speed;
+        k.vy = Math.sin(k.angle) * k.speed;
+      } else {
+        // Spin phase: hold position, rotate -9°/frame (one full turn).
+        k.angle += k.turnRate * ctx.rate;
+        k.vx = k.vy = 0;
+      }
+      const slot = this.engine.slots[i];
+      if (slot.hitTally === 0) {
+        k.x += k.vx * ctx.rate;
+        k.y += k.vy * ctx.rate;
+        this.engine.set(i, k.x, k.y, 24, 24, 22);
+      }
+    });
+  }
+
+  // 時符「プライベートスクウェア」 unfocused — FUN_0040c620
+  // (spec-bombs-sakuya §4): the whole-playfield time stop. Bullet-freeze
+  // pulses at frames 0/60/120; one enormous static box at the playfield
+  // center (352×416, d3) on every fourth frame from frame 32.
+  private sakuyaBUnfocused(ctx: BombContext): void {
+    if (ctx.frame === 0 || ctx.frame === 60 || ctx.frame === 120) this.freezeBullets(ctx);
+    if (ctx.frame >= 32 && ctx.frame % 4 === 0) this.engine.set(0, 192, 224, 352, 416, 3);
+    else this.engine.clear(0);
+  }
+
+  // 時符「プライベートスクウェア」 focused — FUN_0040cbf0
+  // (spec-bombs-sakuya §5): freeze pulses at frames 40/100; a single
+  // 160×160 d1 box that chases the player on a spring
+  // (accel = (player-head)/1700), refreshed every frame.
+  private sakuyaBFocused(ctx: BombContext): void {
+    if (ctx.frame === 40 || ctx.frame === 100) this.freezeBullets(ctx);
+    if (this.actors.length === 0) {
+      this.actors.push({
+        x: ctx.player.x, y: ctx.player.y, vx: 0, vy: 0,
+        angle: 0, speed: 0, accel: 0, turnRate: 0, state: 1, age: 0
+      });
+    }
+    const head = this.actors[0];
+    head.vx += ((ctx.player.x - head.x) / 1700) * ctx.rate * ctx.rate;
+    head.vy += ((ctx.player.y - head.y) / 1700) * ctx.rate * ctx.rate;
+    head.x += head.vx * ctx.rate;
+    head.y += head.vy * ctx.rate;
+    this.engine.set(0, head.x, head.y, 160, 160, 1);
+  }
+
+  // FUN_00425f10: SakuyaB's time-stop pulse — zero every live enemy
+  // bullet's motion cluster outright (velocity, nominal speed, active
+  // ex-behaviors). Not a cancel: the bullets stay alive and lethal.
+  private freezeBullets(ctx: BombContext): void {
+    for (const b of ctx.enemyBullets) {
+      if (b.dead) continue;
+      b.vx = 0;
+      b.vy = 0;
+      b.speed = 0;
+      b.exFlags = 0;
+    }
+    ctx.playSfx(0x20); // se_border — the time-stop snap
+  }
+}

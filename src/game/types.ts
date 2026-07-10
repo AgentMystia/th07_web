@@ -91,6 +91,8 @@ export interface EnemyLaser {
   flags: number;
   state: number;
   phaseFrame: number;
+  // Fractional accumulator for phaseFrame under global slow motion.
+  phaseFrac?: number;
   hideTipDuringGrow: boolean;
 }
 
@@ -135,6 +137,12 @@ export interface GameHost {
   power: number;
   score: number;
   timeStopped?: boolean;
+  // Global slow-motion rate (exe DAT_0056baa8, spec-slowmo.md): 1.0 normal;
+  // bullet-effect 10 writes 1/param, effect 11 restores 1.0. Continuous
+  // motion multiplies by it per frame; discrete timers accumulate it
+  // fractionally; collision always runs at wall clock.
+  slowRate?: number;
+  setSlowRate?(rate: number): void;
   addScore(v: number): void;
   spawnItem(type: ItemType, x: number, y: number, options?: { state?: number; vx?: number; vy?: number }): void;
   spawnEffectParticles(effectId: number, x: number, y: number, count: number, color: number): void;
@@ -159,6 +167,10 @@ export interface GameHost {
   // +0x37a160, FUN_00421a40) with no score popup. Runs at op80, spell
   // declare (op90) and the full-power crossing.
   cancelBulletsToItems(): void;
+  // Floating score/cherry number popup (spec-popups.md): value < 0 draws
+  // the single sentinel glyph; color is D3D ARGB. Popups never move or
+  // expire — they live until their ring slot is reused.
+  spawnScorePopup?(value: number, x: number, y: number, color: number): void;
   // Frames remaining of the exe's post-field-clear laser-spawn suppression
   // (gamestate+0x37a12c, set to 10 by every FUN_00422ea0 call; op-82/83
   // fires are gated on it unless the laser is bomb-immune, all.c:15737).
@@ -167,6 +179,12 @@ export interface GameHost {
   awardCherry?(v: number): void;
   // Bullet-effect id 20: hardcoded BGM cue (Yuyuko phase 2, th07_13b).
   playBgmTrack?(name: string): void;
+  // Bullet-effect id 19 (FUN_00418ee0): three-second BGM fade-out.
+  fadeBgm?(seconds: number): void;
+  // Screen FX scheduler (exe FUN_004459c0): type-1 shake (magnitude ramps
+  // from->to over duration) and type-3 repeating full-screen tint flash.
+  startScreenShake?(duration: number, from: number, to: number): void;
+  startScreenFlash?(duration: number, repeats: number, argb: number): void;
   // FUN_00422ea0's laser half: graceful-cancel non-bomb-immune lasers
   // (unconditional = the bombType-10 spell-timeout variant).
   cancelLasers?(unconditional: boolean): void;
@@ -187,6 +205,10 @@ export interface EclContext {
   subId: number;
   index: number; // instruction index within sub
   time: number;
+  // Fractional accumulator for the script clock under global slow motion
+  // (exe: split (int, frac) counter at enemy+0x6f0/+0x6ec advanced by
+  // FUN_00436acc at the DAT_0056baa8 rate; spec-slowmo.md §5).
+  timeFrac: number;
   windowBase: number; // register-window offset into EclState.vars
   // op45 wait countdown (exe context +0x80 == enemy +0x764/+0x76c).
   // CALL saves/restores it with the rest of the 0x218-byte ECL context.
@@ -271,6 +293,8 @@ export interface EclState {
   timerCallbackThreshold: number;
   timerCallbackSub: number;
   bossTimer: number;
+  // Fractional accumulator for bossTimer under global slow motion.
+  bossTimerFrac?: number;
   currentAnm: number;
   anmRunner: AnmRunner | null;
   anmSlots: ({ script: number; runner: AnmRunner | null } | null)[];
@@ -286,6 +310,9 @@ export interface EclState {
   frameVx: number;
   frameVy: number;
   anmRotateWithAngle: boolean;
+  // ECL op150 (exe case 0x95): absolute Z rotation written into the enemy's
+  // embedded ANM VM (+8), consumed by the sprite draw (radians).
+  anmRotZ?: number;
   bossLifeCount: number;
   lasers: (EnemyLaser | null)[];
   laserStore: number;

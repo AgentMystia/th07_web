@@ -273,19 +273,23 @@ comparisons against real play).
 - Frame tiling positions (exact-fit math, engine placement not literal).
 - HUD star icon x positions; spell-timer and fps exact placement.
 - Cherry+ banner interrupt→state mapping (dim=charging, bright=border).
-- Bomb mechanics are a structurally incomplete first pass. The executable's
-  twelve focus-latched forms use multiple moving attack slots, while the port
-  still applies a generic player-centered radius. Bomb-TOUCHED bullets spawn:
-  type 0 power → big cherry at power≥128, DAT_004b5ebc BSS=0 @ all.c:16160,
-  but the per-orb touch test, damage cadence, focus-specific ANM selection,
-  and shared screen tint are missing. See
-  `docs/FABLE5_HANDOFF_2026-07-10.md` §4B.
-- Player shots still render static sprite rectangles instead of per-shot ANM
-  VMs and impact scripts. Marisa B lasers and Marisa A repeat-hit explosions
-  are also incomplete; see the handoff §4A.
-- Phase-end sweep popups: the exe pops each escalating 2000/+20 (bullets)
-  and 2000/+30 (helpers) value at the converted entity (FUN_00402260); the
-  port banks the identical score total but draws no per-item popup text.
+- Bomb mechanics: the twelve focus-latched forms now run decoded per-form
+  state machines (`src/game/player-bombs.ts`) writing the exe's moving
+  attack-slot pool (player+0x9dc, consumed by FUN_0043a980). Damage/cancel
+  use the slot AABBs (no full-screen sweep). SakuyaB's time-stop freeze
+  pulses (FUN_00425f10) are implemented. The shared 60-frame screen tint
+  (FUN_00407520) and reserved-slot activation VM (FUN_00407620) are
+  represented by the character bomb ANM scripts + the runner, not byte-
+  exact VM spawns. Per-form spawn cadence/orb motion are from specs
+  spec-bombs-{shared,reimu,marisa,sakuya}.md.
+- Player shots run per-shot ANM VMs (SHT `sprite` = global script id; impact
+  re-arms `sprite+0x20`; bullet dies when its script ends). MarisaB's two
+  persistent-laser forms (3-slot tracker, beam-history ring, helper boxes)
+  and MarisaA's repeat-hit missile explosion are implemented. See
+  spec-marisab-beams.md / exe-player-funcs1.md.
+- Floating score/Cherry popups implemented (spec-popups.md): two ring pools,
+  distance-from-player alpha pulse, full color/value rules incl. the
+  phase-end escalating sweeps and the red cherry-gain popups.
 - EX bullet behaviors activate all-at-once at spawn; the exe arms one op-79
   slot per frame (≤N-frame phase error, N = #armed slots).
 - Spell-bonus decay rounding: exe writes `floor10(ftol(<register-arg float
@@ -304,13 +308,17 @@ comparisons against real play).
 - Boss X-position marker: exact sprite not recovered from front.anm
   (spec-ui-stageclear.md §3); drawn as a small ~60% alpha "Enemy" label at
   the playfield bottom edge tracking boss.x.
-- Bullet-effect ids 1/2/4/6/9/12-15/19/21-23 remain unported. Ids 0/5/7/8/
-  16/17/18/20 are implemented from executable handlers; ids 10/11 are only a
-  local velocity approximation and remain incorrect globally.
+- Bullet-effect ids 1/2/4/6/9/12-15/19/21-23 ported (spec-effects-misc.md):
+  ids 1/2/4/6/12/21 delete bullets, id 1 "declaws" them to 0.3 speed, ids
+  9/15 are screen shake/flash, id 19 is the 3-second BGM fade. Ids 22/23
+  (cosmetic auras) are intentional no-ops. ECL op149 (spell-presentation
+  origin, 1 use) and op150 (enemy ANM Z-rotation) are handled.
 - Slowmo clock (op121 ids 10/11): the executable scales STD, ANM, ECL,
   player, enemies, lasers, items, bombs, and timers while collision remains
-  wall-clock. The port currently rescales only bullet velocity; see the
-  handoff §4D.
+  wall-clock. The port now drives all of these from one global `slowRate`
+  (effect 10 = 1/param + retroactive bullet-vector rescale, effect 11 =
+  inverse + reset; split-counter timers accumulate fractionally); see
+  spec-slowmo.md.
 - Extra/Phantasm starting bombs/power PROBABLE (community convention),
   not exe-verified.
 

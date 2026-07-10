@@ -142,9 +142,11 @@ export class CherrySystem {
   }
 
   // Advances the border timer; returns the score bonus when it completes.
-  tick(): number {
+  tick(rate = 1): number {
     if (!this.borderActive) return 0;
-    this.borderTimer--;
+    // Border countdown ticks at the global slow-motion rate
+    // (exe FUN_0043e2e0 via FUN_00436a06; spec-slowmo.md §3.2).
+    this.borderTimer = Math.max(0, this.borderTimer - rate);
     if (this.borderTimer === 0) {
       // Th07.exe FUN_0043e620 (spec §4, CONFIRMED instruction-by-instruction
       // @ 0x43e62b-0x43e68e): +10000 to both cherryMax (de56) and cherry

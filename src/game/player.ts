@@ -51,7 +51,7 @@ export interface PlayerBullet {
   damage: number;
   shotType: number;
   // ShtShot.funcs[0], the spawn-time behavior selector: 4 = aim at an enemy
-  // at spawn (SakuyaA focused); 5 = unknown SakuyaB variant (flies straight).
+  // at spawn (SakuyaA focused); 5 = SakuyaB orbit-angle bank.
   behaviorFunc: number;
   hitboxW: number;
   hitboxH: number;
@@ -59,8 +59,29 @@ export interface PlayerBullet {
   age: number;
   state: 'fired' | 'collided';
   hitAge: number;
+  // Per-shot ANM VM (Th07.exe: SHT `sprite` is a global ANM script id at
+  // player base 1024; FUN_0043a290 ticks the embedded VM each frame and the
+  // bullet dies when its script ends). Scripts carry the vanilla alpha/
+  // scale/spin/auto-rotate; the impact switch re-arms the VM with script
+  // sprite+0x20 (FUN_0043a980 @ 0x43aa8c: slot+0x1d8 += 0x20).
+  runner: AnmRunner;
+  impactScript: number;
   rect: { x: number; y: number; w: number; h: number; imageKey: string };
   dead?: boolean;
+  // Which option fired this shot (0 = player) and the record's own x offset —
+  // MarisaB's persistent lasers (types 4/5) re-anchor to these every frame.
+  orb: number;
+  anchorX: number;
+  // Per-frame vertical sprite stretch for the beam types (exe writes the VM
+  // scaleY directly: optionY/14 resp. (playerY+64)/14 — sprite 70 is 14px).
+  scaleYOverride?: number;
+  // Type 5 beam-history ring (up to 16 previous beam centers); each sample
+  // is a damage-1 helper box and an alpha-faded ghost draw.
+  history?: { x: number; y: number }[];
+  // Beam release-fade request (exe slot+0x1c6): the ANM VM only consumes the
+  // interrupt while parked at its waitInt checkpoint, so the request re-tries
+  // each frame until delivered (spec-marisab-beams.md §0.4).
+  fadePending?: boolean;
 }
 
 // Option (orb) offsets relative to the player; fire origins for orb shots.
@@ -145,7 +166,13 @@ export class Player {
   // (see update()): a shot with delay 0 must fire on the very press frame,
   // not "interval" frames later.
   fireFrame = -1;
+  private fireFrameFrac = 0;
   bullets: PlayerBullet[] = [];
+  // MarisaB persistent-laser slot tracker (exe player+0x169c4/+0x169d0
+  // 3-entry array, exe-player-shot.md §2.2): at most one live laser bullet
+  // per record slot id (the record's `delay` field). timer counts down each
+  // frame; release/bomb/dialogue clamp it; <71 arms the ANM fade.
+  laserSlots: ({ bullet: PlayerBullet; timer: number; fading: boolean } | null)[] = [null, null, null];
   lives = 2;
   bombs = 3;
   power = 0;
@@ -162,6 +189,10 @@ export class Player {
   // Latched from BOMB_PARAMS at cast; multiplies move speed while bombTimer>0.
   // SakuyaB legitimately exceeds 1.0. Reset to 1.0 when the bomb ends.
   bombSpeedMult = 1.0;
+  // Focus state latched at cast (exe player+0x16a24) — selects which of the
+  // two per-character bomb forms runs for the WHOLE bomb; toggling focus
+  // mid-bomb must not change it.
+  bombFocused = false;
   runner: AnmRunner;
   private poseState: 'idle' | 'left' | 'right' = 'idle';
 
@@ -225,18 +256,20 @@ export class Player {
     return { scaleX: t, scaleY: 3 - 2 * t, alpha: t };
   }
 
-  update(input: InputFrame): void {
+  // `rate` = global slow-motion rate: movement/orbit scale directly, the
+  // player-side timers accumulate fractionally (spec-slowmo.md §3.1/§3.2).
+  update(input: InputFrame, rate = 1): void {
     const focused = input.held.has('focus');
     if (focused !== this.focusHeld) {
       this.focusHeld = focused;
       this.focusGlideFrame = 0;
     } else if (this.focusGlideFrame < GLIDE_FRAMES) {
-      this.focusGlideFrame++;
+      this.focusGlideFrame += rate;
     }
-    if (this.invulnFrames > 0) this.invulnFrames--;
-    if (this.bombInvuln > 0) this.bombInvuln--;
+    if (this.invulnFrames > 0) this.invulnFrames = Math.max(0, this.invulnFrames - rate);
+    if (this.bombInvuln > 0) this.bombInvuln = Math.max(0, this.bombInvuln - rate);
     if (this.bombTimer > 0) {
-      this.bombTimer--;
+      this.bombTimer = Math.max(0, this.bombTimer - rate);
       if (this.bombTimer === 0) this.bombSpeedMult = 1.0;
     }
     if (this.materializeFrame >= 0) {
@@ -247,27 +280,42 @@ export class Player {
         this.invulnFrames = SPAWN_INVULN_FRAMES;
       }
     }
-    if (this.controllable) this.move(input);
+    if (this.controllable) this.move(input, rate);
     else this.lastVx = 0;
     this.shooting = input.held.has('shoot') && this.controllable;
     if (this.shooting) {
-      this.fireFrame = (this.fireFrame + 1) % SHOT_CYCLE;
+      // Shot cadence is a split counter at the global rate (exe
+      // FUN_0043a820 via FUN_00436acc). The press frame re-arms to 0
+      // immediately (FUN_0043a930) so delay-0 shooters fire on it.
+      if (this.fireFrame < 0) {
+        this.fireFrame = 0;
+        this.fireFrameFrac = 0;
+      } else if (rate > 0.99) {
+        this.fireFrame = (this.fireFrame + 1) % SHOT_CYCLE;
+      } else {
+        this.fireFrameFrac += rate;
+        if (this.fireFrameFrac >= 1) {
+          this.fireFrameFrac -= 1;
+          this.fireFrame = (this.fireFrame + 1) % SHOT_CYCLE;
+        }
+      }
     } else {
       this.fireFrame = -1;
+      this.fireFrameFrac = 0;
     }
     this.updatePose(input);
-    this.runner.update();
+    this.runner.update(rate);
     const vx = this.lastVx;
     if (vx === 0) {
       if (Math.abs(this.orbitAngle - -Math.PI / 2) <= Math.PI / 100) this.orbitAngle = -Math.PI / 2;
-      else this.orbitAngle += (this.orbitAngle < -Math.PI / 2 ? 1 : -1) * (2 * Math.PI / 100);
+      else this.orbitAngle += (this.orbitAngle < -Math.PI / 2 ? 1 : -1) * (2 * Math.PI / 100) * rate;
     } else {
       this.orbitAngle += vx * Math.PI / 200;
       this.orbitAngle = Math.min(-3 * Math.PI / 10, Math.max(-7 * Math.PI / 10, this.orbitAngle));
     }
   }
 
-  private move(input: InputFrame): void {
+  private move(input: InputFrame, rate = 1): void {
     const sht = this.sht;
     let dx = 0;
     let dy = 0;
@@ -285,9 +333,10 @@ export class Player {
     // Th07.exe (v1.00b) Player::Update clamp @ 0x43c3cc / 0x43c430: field-local
     // x∈[0,384], y∈[0,448] (full playfield). Mins DAT_00625854/858 = 0; ranges
     // DAT_0062585c/860 = 384/448 (confirmed via FUN_0041de20 @ 0x41dfeb/0x41e016).
-    this.x = clamp(this.x + dx * speed, 0, 384);
-    this.y = clamp(this.y + dy * speed, 0, 448);
-    this.lastVx = dx * speed;
+    // exe FUN_0043be00: velocity = inputDir * speed * DAT_0056baa8.
+    this.x = clamp(this.x + dx * speed * rate, 0, 384);
+    this.y = clamp(this.y + dy * speed * rate, 0, 448);
+    this.lastVx = dx * speed * rate;
   }
 
   private updatePose(input: InputFrame): void {
@@ -333,31 +382,66 @@ export class Player {
     if (!this.shooting || !this.alive) return [];
     const out: PlayerBullet[] = [];
     for (const shot of this.sht.shotsForPower(this.power)) {
+      const isLaser = shot.funcs[0] === 2 || shot.funcs[0] === 3;
+      if (isLaser) {
+        // MarisaB persistent lasers (FUN_00438db0/FUN_00438ef0): the record's
+        // delay field is a SLOT INDEX, not a cadence delay; a slot spawns at
+        // most one live beam, only while the option glide is settled in the
+        // record's own focus state (funcs0=2 ⇒ unfocused, 3 ⇒ focused).
+        const slotId = shot.delay;
+        if (slotId < 0 || slotId > 2 || this.laserSlots[slotId]) continue;
+        const settled = this.focusGlideFrame >= GLIDE_FRAMES;
+        const wantFocused = shot.funcs[0] === 3;
+        if (!settled || this.focusHeld !== wantFocused) continue;
+        const b = this.makeBullet(shot);
+        if (!b) continue;
+        if (shot.shotType === 5) b.history = [];
+        // funcs0=2 seeds the countdown from the record's interval field
+        // (130-330 by power); funcs0=3 seeds 999 (held indefinitely).
+        this.laserSlots[slotId] = { bullet: b, timer: wantFocused ? 999 : Math.max(1, shot.interval), fading: false };
+        out.push(b);
+        continue;
+      }
       const interval = Math.max(1, shot.interval);
       if (this.fireFrame % interval !== shot.delay % interval) continue;
-      const rect = this.anm.sprites.get(shot.sprite - PLAYER_SPRITE_BASE) ?? this.anm.sprites.get(64);
-      if (!rect) continue;
-      const source = shot.orb === 1 || shot.orb === 2 ? this.orbOffset(shot.orb) : { x: 0, y: 0 };
-      out.push({
-        x: this.x + source.x + shot.x,
-        y: this.y + source.y + shot.y,
-        vx: Math.cos(shot.angle) * shot.speed,
-        vy: Math.sin(shot.angle) * shot.speed,
-        angle: shot.angle,
-        speed: shot.speed,
-        damage: shot.damage,
-        shotType: shot.shotType,
-        behaviorFunc: shot.funcs[0],
-        hitboxW: shot.hitboxW,
-        hitboxH: shot.hitboxH,
-        sfxId: shot.sfxId,
-        age: 0,
-        state: 'fired',
-        hitAge: 0,
-        rect: { x: rect.x, y: rect.y, w: rect.w, h: rect.h, imageKey: rect.imageKey }
-      });
+      const b = this.makeBullet(shot);
+      if (b) out.push(b);
     }
     return out;
+  }
+
+  private makeBullet(shot: ShtShot): PlayerBullet | null {
+    // SHT sprite is a global ANM SCRIPT id (base 1024): playerXX.anm shot
+    // scripts live at 64+, their impact variants at +0x20 (96+).
+    const scriptId = shot.sprite - PLAYER_SPRITE_BASE;
+    if (!this.anm.hasScript(scriptId)) return null;
+    const runner = new AnmRunner(this.anm, scriptId);
+    const rect = this.anm.sprites.get(scriptId) ?? this.anm.sprites.get(64);
+    const source = shot.orb === 1 || shot.orb === 2 ? this.orbOffset(shot.orb) : { x: 0, y: 0 };
+    return {
+      x: this.x + source.x + shot.x,
+      y: this.y + source.y + shot.y,
+      vx: Math.cos(shot.angle) * shot.speed,
+      vy: Math.sin(shot.angle) * shot.speed,
+      angle: shot.angle,
+      speed: shot.speed,
+      damage: shot.damage,
+      shotType: shot.shotType,
+      behaviorFunc: shot.funcs[0],
+      hitboxW: shot.hitboxW,
+      hitboxH: shot.hitboxH,
+      sfxId: shot.sfxId,
+      age: 0,
+      state: 'fired',
+      hitAge: 0,
+      runner,
+      impactScript: scriptId + 0x20,
+      orb: shot.orb,
+      anchorX: shot.x,
+      rect: rect
+        ? { x: rect.x, y: rect.y, w: rect.w, h: rect.h, imageKey: rect.imageKey }
+        : { x: 0, y: 0, w: 0, h: 0, imageKey: '' }
+    };
   }
 
   hit(): 'deathbomb-window' | 'invulnerable' {
@@ -400,11 +484,18 @@ export class Player {
     this.bombTimer = duration;
     this.bombInvuln = invulnTotal;
     this.bombSpeedMult = speedMult;
+    this.bombFocused = this.focusHeld;
     return true;
   }
 
   die(): void {
     this.deathTimer = -1;
+    // Exe FUN_0043a290: player state 2 hard-frees all three laser slots.
+    for (let i = 0; i < 3; i++) {
+      const slot = this.laserSlots[i];
+      if (slot) slot.bullet.dead = true;
+      this.laserSlots[i] = null;
+    }
     this.lives--;
     this.bombs = Math.trunc(this.unfocused.bombs);
     this.power = Math.max(0, this.power - 16);

@@ -322,10 +322,12 @@ export class Std {
 
   // Script time may pause or jump. Object and special-ANM time is monotonic,
   // and all interpolation tracks continue through op3 pauses.
-  advance(): void {
-    this.animationFrame++;
-    if (this.primaryAnm) this.primaryAnm.age++;
-    if (this.secondaryAnm) this.secondaryAnm.age++;
+  advance(rate = 1): void {
+    // Both STD clocks advance at the global slow-motion rate
+    // (spec-slowmo.md §3.2, FUN_004043d0/FUN_0041de20).
+    this.animationFrame += rate;
+    if (this.primaryAnm) this.primaryAnm.age += rate;
+    if (this.secondaryAnm) this.secondaryAnm.age += rate;
 
     if (this.pendingResume > 0) {
       const labelIndex = this.labels.get(this.pendingResume);
@@ -338,8 +340,8 @@ export class Std {
     }
 
     if (!this.paused) this.dispatchDueInstructions();
-    this.tickTracks();
-    if (!this.paused) this.frame++;
+    this.tickTracks(rate);
+    if (!this.paused) this.frame += rate;
   }
 
   private dispatchDueInstructions(): void {
@@ -448,9 +450,9 @@ export class Std {
     return h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1;
   }
 
-  private tickVec(track: VecTrack): void {
+  private tickVec(track: VecTrack, rate = 1): void {
     if (track.duration <= 0) return;
-    track.elapsed = Math.min(track.duration, track.elapsed + 1);
+    track.elapsed = Math.min(track.duration, track.elapsed + rate);
     const t0 = clamp(track.elapsed / track.duration, 0, 1);
     if (track.mode === 7) {
       track.current = {
@@ -469,21 +471,21 @@ export class Std {
     if (track.elapsed >= track.duration) track.duration = 0;
   }
 
-  private tickScalar(track: ScalarTrack): void {
+  private tickScalar(track: ScalarTrack, rate = 1): void {
     if (track.duration <= 0) return;
-    track.elapsed = Math.min(track.duration, track.elapsed + 1);
+    track.elapsed = Math.min(track.duration, track.elapsed + rate);
     const t = applyStdFormula(clamp(track.elapsed / track.duration, 0, 1), track.mode);
     track.current = lerp(track.p0, track.p1, t);
     if (track.elapsed >= track.duration) track.duration = 0;
   }
 
-  private tickTracks(): void {
-    this.tickVec(this.cameraTrack);
-    this.tickVec(this.facingTrack);
-    this.tickVec(this.upTrack);
-    this.tickScalar(this.fovTrack);
+  private tickTracks(rate = 1): void {
+    this.tickVec(this.cameraTrack, rate);
+    this.tickVec(this.facingTrack, rate);
+    this.tickVec(this.upTrack, rate);
+    this.tickScalar(this.fovTrack, rate);
     if (this.fogDuration > 0) {
-      this.fogElapsed = Math.min(this.fogDuration, this.fogElapsed + 1);
+      this.fogElapsed = Math.min(this.fogDuration, this.fogElapsed + rate);
       const t = clamp(this.fogElapsed / this.fogDuration, 0, 1);
       this.fogCurrent = {
         r: lerp(this.fogStart.r, this.fogTarget.r, t),

@@ -102,7 +102,12 @@ export class Renderer {
     if (options.rotation) ctx.rotate(options.rotation);
     if (scaleX < 0) ctx.scale(-1, 1);
     if (scaleY < 0) ctx.scale(1, -1);
-    ctx.drawImage(img, sx, sy, sw, sh, -w / 2, -h / 2, w, h);
+    const color = options.color;
+    if (color != null && (color & 0x00ffffff) !== 0x00ffffff) {
+      this.tintedSprite(img, sx, sy, sw, sh, -w / 2, -h / 2, w, h, color);
+    } else {
+      ctx.drawImage(img, sx, sy, sw, sh, -w / 2, -h / 2, w, h);
+    }
     ctx.restore();
   }
 

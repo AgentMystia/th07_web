@@ -56,10 +56,10 @@ export class PlayerEffects {
     });
   }
 
-  update(): void {
+  update(rate = 1): void {
     for (const e of this.entries) {
       if (e.delay > 0) {
-        e.delay--;
+        e.delay -= rate;
         continue;
       }
       if (!e.runner) {
@@ -69,10 +69,10 @@ export class PlayerEffects {
         else e.age = e.ttl = 0; // unknown script: cull quietly
         continue;
       }
-      e.runner.update();
-      e.x += e.vx;
-      e.y += e.vy;
-      e.age++;
+      e.runner.update(rate);
+      e.x += e.vx * rate;
+      e.y += e.vy * rate;
+      e.age += rate;
     }
     let w = 0;
     for (const e of this.entries) {

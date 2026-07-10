@@ -11,6 +11,7 @@ import type { AudioBus } from '../audio/audio';
 import { CHARACTERS, Player, type CharacterId, type PlayerBullet } from './player';
 import { PlayerEffects } from './player-effects';
 import { CherrySystem, BORDER_DURATION, CHERRY_PLUS_MAX } from './cherry';
+import { BombEngine, BombRunner, type BombContext } from './player-bombs';
 import { DialogueRunner, portraitSprite } from './dialogue';
 import { stageBgmTrack } from './bgm';
 
@@ -30,6 +31,7 @@ export interface RunCarry {
   cherryMax: number;
   cherryPlus: number;
   spellsCaptured: number;
+  extendLevel: number;
 }
 
 // Item sprites live in etama.anm entry 1 (the etama2.png sheet), addressed
@@ -105,6 +107,14 @@ const DIGIT_Y = 208;
 // quad is drawn in full every frame with plenty of headroom to spare.
 const BG_MAX_CELL_STEPS = 24;
 
+// MarisaA missile explosion table, Th07.exe FUN_00439d80 switch on the
+// bullet's script id (0x441-0x448 = script 65-72): [hitbox full width,
+// burst speed]. Constants read as raw floats from the exe .rdata.
+const MISSILE_EXPLOSION: Record<number, [number, number]> = {
+  65: [32, 4], 66: [42, 4], 67: [48, 4], 68: [56, 4],
+  69: [48, 6], 70: [64, 6], 71: [80, 6], 72: [96, 6]
+};
+
 // Th07.exe spell-card base-bonus table @ 0x4951a8, int32[141] (one entry
 // per spell id 0-140), read directly from the binary — see
 // spec-extra-phantasm.md §6c. Stage ranges: 0-9 s1, 10-25 s2, 26-43 s3,
@@ -146,6 +156,9 @@ export class StageScene implements GameHost {
   // hardcoded 16 made every non-spell pattern 0.5 px/f faster and fire 20%
   // more often than vanilla.
   rank = 0;
+  // Global slow-motion rate (exe DAT_0056baa8; spec-slowmo.md). Bullet-effect
+  // 10 sets 1/param, 11 restores 1.0; reset at stage init by construction.
+  slowRate = 1;
   frame = 0;
   id = 1;
   player = { x: 192, y: 384 };
@@ -163,6 +176,10 @@ export class StageScene implements GameHost {
   playerBullets: PlayerBullet[] = [];
   graze = 0;
   pointItems = 0;
+  // Point-item extend ladder (exe stats +0x2c level / +0x30 threshold,
+  // all.c:19744/22099-22125): main game 50/125/200/300/450/800+200n;
+  // Extra+Phantasm 200/500/800+500n. Persists across stages in a credit.
+  extendLevel = 0;
   // Th07.exe DAT_012f40bc: latched to the spell-active state at each bomb
   // trigger — bomb damage during a spell card is 0 until a bomb has been
   // triggered during that spell (anti pre-bomb rule, disasm @ 0x41faeb).
@@ -265,6 +282,29 @@ export class StageScene implements GameHost {
   // Script-driven bomb visuals (see spawnBombEffects).
   private readonly playerEffects: PlayerEffects;
   private prevBombTimer = 0;
+  // Moving bomb attack hitboxes (exe player+0x9dc pool; see player-bombs.ts).
+  private readonly bombEngine = new BombEngine();
+  // The active bomb form's decoded state machine (12 forms, player-bombs.ts).
+  private bombRunner: BombRunner | null = null;
+  // Latched bomb duration (frames) for end-window checks (ReimuA focused's
+  // final-30-frames detonation, etc.).
+  private bombDuration = 0;
+  // Bomb-local frame counter (exe 16a38): 0 on the first active tick.
+  private bombFrame = 0;
+  // Player-wide hit tally (exe player+0x240c): beams/attack slots pop a
+  // spark on every 8th (lasers) / 4th (bomb slots) accumulated hit.
+  private playerHitTally = 0;
+  // Floating number popups (spec-popups.md): two ring pools (720 large,
+  // 3 small — the small one serves the bullet-cancel star pickups), no
+  // per-frame update at all — entries never move or expire, they live until
+  // their ring slot is overwritten. The visible variation is a distance-
+  // from-player alpha pulse recomputed at draw time.
+  private popupsLarge: { digits: number[]; color: number; x: number; y: number; active: boolean }[] =
+    Array.from({ length: 720 }, () => ({ digits: [0], color: 0, x: 0, y: 0, active: false }));
+  private popupsSmall: { digits: number[]; color: number; x: number; y: number; active: boolean }[] =
+    Array.from({ length: 3 }, () => ({ digits: [0], color: 0, x: 0, y: 0, active: false }));
+  private popupCursorLarge = 0;
+  private popupCursorSmall = 0;
 
   constructor(
     private assets: GameAssets,
@@ -380,7 +420,41 @@ export class StageScene implements GameHost {
       this.cherry.cherryMax = carry.cherryMax;
       this.cherry.cherryPlus = carry.cherryPlus;
       this.cherry.spellsCaptured = carry.spellsCaptured;
+      this.extendLevel = carry.extendLevel;
     }
+  }
+
+  // Next point-item extend threshold for the current level (all.c:22101-22120).
+  get extendThreshold(): number {
+    const lvl = this.extendLevel;
+    if (this.difficulty < 4) {
+      if (lvl < 3) return lvl * 75 + 50; // 50, 125, 200
+      if (lvl < 5) return (lvl - 3) * 150 + 300; // 300, 450
+      return (lvl - 5) * 200 + 800;
+    }
+    if (lvl === 0) return 200;
+    if (lvl === 1) return 500;
+    return (lvl - 2) * 500 + 800;
+  }
+
+  // Power bracket index (SHT thresholds 8/16/32/48/64/80/96/128; AGENTS §6):
+  // FUN_00430860 compares this before/after a power gain — crossing a
+  // bracket fires the salmon "tier up" popup + chime instead of the white 10.
+  private powerTier(power: number): number {
+    const brackets = [8, 16, 32, 48, 64, 80, 96, 128];
+    let tier = 0;
+    for (const b of brackets) if (power >= b) tier++;
+    return tier;
+  }
+
+  // Point-extend award, Th07.exe FUN_0042bf29 @ 0x42bf29: +1 life below 8
+  // lives, else +1 bomb below 8 bombs, else nothing. se_extend either way.
+  private awardExtend(): void {
+    const p = this.playerObj;
+    if (p.lives < 8) p.lives++;
+    else if (p.bombs < 8) p.bombs++;
+    else return;
+    this.playSfx(28);
   }
 
   // Stage-clear bonus, exe-exact (FUN_00429446's credit block @
@@ -433,7 +507,8 @@ export class StageScene implements GameHost {
       cherry: this.cherry.cherry,
       cherryMax: this.cherry.cherryMax,
       cherryPlus: this.cherry.cherryPlus,
-      spellsCaptured: this.cherry.spellsCaptured
+      spellsCaptured: this.cherry.spellsCaptured,
+      extendLevel: this.extendLevel
     };
   }
 
@@ -441,6 +516,100 @@ export class StageScene implements GameHost {
 
   addScore(v: number): void {
     this.score += v;
+  }
+
+  setSlowRate(rate: number): void {
+    this.slowRate = rate;
+  }
+
+  // Screen FX scheduler (exe FUN_004459c0). Type 1 shake: each frame both
+  // camera axes independently pick {0, +mag, -mag}, mag ramping from->to
+  // over the duration. Type 3 flash: a full-screen tint held `duration`
+  // frames, repeated `repeats` times, alpha from the ARGB high byte.
+  private screenShake: { duration: number; elapsed: number; from: number; to: number } | null = null;
+  private screenFlash: { duration: number; timer: number; repeats: number; color: number } | null = null;
+  private shakeX = 0;
+  private shakeY = 0;
+
+  startScreenShake(duration: number, from: number, to: number): void {
+    this.screenShake = { duration: Math.max(1, duration), elapsed: 0, from, to };
+  }
+
+  startScreenFlash(duration: number, repeats: number, argb: number): void {
+    this.screenFlash = { duration: Math.max(1, duration), timer: 0, repeats, color: argb >>> 0 };
+  }
+
+  fadeBgm(seconds: number): void {
+    this.audio.fadeOutBgm(seconds);
+  }
+
+  private tickScreenFx(): void {
+    const shake = this.screenShake;
+    this.shakeX = 0;
+    this.shakeY = 0;
+    if (shake) {
+      const mag = shake.from + (shake.elapsed / shake.duration) * (shake.to - shake.from);
+      const pick = () => [0, mag, -mag][this.rng.u32InRange(3)];
+      this.shakeX = pick();
+      this.shakeY = pick();
+      if (++shake.elapsed >= shake.duration) this.screenShake = null;
+    }
+    const flash = this.screenFlash;
+    if (flash && ++flash.timer >= flash.duration) {
+      flash.timer = 0;
+      if (--flash.repeats <= 0) this.screenFlash = null;
+    }
+  }
+
+  // FUN_00402260 (large pool) / FUN_00402310 (3-slot pool): digits stored
+  // least-significant-first; value < 0 stores the single sentinel glyph 10;
+  // value 0 stores one zero digit.
+  spawnScorePopup(value: number, x: number, y: number, color: number, small = false): void {
+    const pool = small ? this.popupsSmall : this.popupsLarge;
+    const cursor = small ? this.popupCursorSmall : this.popupCursorLarge;
+    const entry = pool[cursor % pool.length];
+    if (small) this.popupCursorSmall = (cursor + 1) % pool.length;
+    else this.popupCursorLarge = (cursor + 1) % pool.length;
+    entry.active = true;
+    entry.x = x;
+    entry.y = y;
+    entry.color = color >>> 0;
+    entry.digits.length = 0;
+    let v = Math.trunc(value);
+    if (v < 0) {
+      entry.digits.push(10);
+    } else if (v === 0) {
+      entry.digits.push(0);
+    } else {
+      while (v !== 0) {
+        entry.digits.push(v % 10);
+        v = Math.trunc(v / 10);
+      }
+    }
+  }
+
+  // Draw pass (exe FUN_00403770 @ all.c:1684-1758): 8x12 ascii glyphs at
+  // 8px pitch, x-centered by digitCount*4, most-significant first; alpha is
+  // a distance-from-player pulse — 80/255 within 32px of the player,
+  // linearly rising to 208/255 at 64px, flat beyond. No motion, no fade.
+  private drawPopups(r: Renderer, ox: number, oy: number): void {
+    const p = this.playerObj;
+    const drawPool = (pool: { digits: number[]; color: number; x: number; y: number; active: boolean }[]) => {
+      for (const pop of pool) {
+        if (!pop.active) continue;
+        const dist = Math.hypot(pop.x - p.x, pop.y - p.y);
+        const alpha = (dist <= 32 ? 80 : dist >= 64 ? 208 : 80 + ((dist - 32) / 32) * 128) / 255;
+        const n = pop.digits.length;
+        const startX = pop.x - n * 4;
+        for (let i = 0; i < n; i++) {
+          const glyph = pop.digits[n - 1 - i];
+          r.drawSprite('ascii', glyph * DIGIT_W, DIGIT_Y, DIGIT_W, DIGIT_H,
+            ox + startX + i * 8 + DIGIT_W / 2, oy + pop.y, { alpha, color: pop.color });
+        }
+      }
+    };
+    drawPool(this.popupsLarge);
+    drawPool(this.popupsSmall);
   }
 
   spawnItem(type: ItemType, x: number, y: number, options: { state?: number; vx?: number; vy?: number } = {}): void {
@@ -465,7 +634,10 @@ export class StageScene implements GameHost {
     const isSnow = effectId >= 18;
     for (let i = 0; i < Math.min(count, 64); i++) {
       const angle = this.rng.range(Math.PI * 2);
-      const speed = isSnow ? 0.2 + this.rng.range(0.5) : 0.5 + this.rng.range(2);
+      // Decorative particles bake the current slow rate into their spawn
+      // velocity and then tick at wall clock (exe FUN_004194d0 family /
+      // FUN_00419650; spec-slowmo.md §3.4.5).
+      const speed = (isSnow ? 0.2 + this.rng.range(0.5) : 0.5 + this.rng.range(2)) * this.slowRate;
       this.particles.push({
         id: this.id++,
         x: x + (isSnow ? this.rng.range(384) - 192 : 0),
@@ -646,6 +818,9 @@ export class StageScene implements GameHost {
     let value = 2000;
     for (const b of this.enemyBullets) {
       this.spawnItem('cherry', b.x, b.y, { state: 1 });
+      // FUN_00423100 @ all.c:15624: escalating popup per bullet — white
+      // while ramping, yellow once the 8000 cap is reached.
+      this.spawnScorePopup(value, b.x, b.y, value < 8000 ? 0xffffffff : 0xffffff00);
       total += value;
       value = Math.min(8000, value + 20);
     }
@@ -789,7 +964,7 @@ export class StageScene implements GameHost {
     }
     if (!frozen) this.cherry.retryBorderStart();
     // Movement runs every frame, dialogue or not.
-    p.update(input);
+    p.update(input, this.slowRate);
     this.focusHeld = p.focusHeld;
     if (!frozen) {
       const death = p.tickDeath();
@@ -817,7 +992,7 @@ export class StageScene implements GameHost {
       this.stageFrame++;
     }
     for (const runner of this.stageIntroRunners) {
-      if (!runner.removed) runner.update();
+      if (!runner.removed) runner.update(this.slowRate);
     }
     if (this.dialogue) {
       this.dialogueSeen = true;
@@ -857,7 +1032,7 @@ export class StageScene implements GameHost {
     if (!frozen) {
       // FUN_0043eef0 returns before the state-4 border timer while dialogue
       // freeze DAT_0061c25c is set; the 540-frame clock pauses with gameplay.
-      const borderBonus = this.cherry.tick();
+      const borderBonus = this.cherry.tick(this.slowRate);
       if (borderBonus > 0) this.addScore(borderBonus);
       this.runtime.update(this);
       this.updateEnemies();
@@ -881,10 +1056,15 @@ export class StageScene implements GameHost {
     // conversation.
     if (!frozen && p.bombTimer > 0) this.applyBombEffects();
     // Bomb over: release the interrupt-gated bomb visuals (label 1 is the
-    // fade-out path in the player bomb scripts).
-    if (this.prevBombTimer > 0 && p.bombTimer === 0) this.playerEffects.interruptAll(1);
+    // fade-out path in the player bomb scripts) and tear down the form runner.
+    if (this.prevBombTimer > 0 && p.bombTimer === 0) {
+      this.playerEffects.interruptAll(1);
+      this.bombRunner = null;
+      this.bombEngine.reset();
+    }
     this.prevBombTimer = p.bombTimer;
-    this.playerEffects.update();
+    this.playerEffects.update(this.slowRate);
+    this.tickScreenFx();
     if (this.score > this.hiScore) this.hiScore = this.score;
   }
 
@@ -894,7 +1074,43 @@ export class StageScene implements GameHost {
     // Th07.exe FUN_00431d10: bombing flags every live item for collection
     // (same state=1 autocollect the border uses in updateItems).
     for (const it of this.items) if (!it.dead) it.state = 1;
+    this.bombEngine.reset();
+    this.bombFrame = 0;
+    this.bombDuration = this.playerObj.bombTimer;
+    // FUN_00407620: the shared activation presentation (a reserved-slot ANM
+    // VM tied to the invuln duration) — represented here by the character's
+    // own bomb ANM scripts plus the runner's choreography.
+    const p = this.playerObj;
+    this.bombRunner = new BombRunner(this.bombEngine, p.character, p.bombFocused);
+    this.bombRunner.start(this.bombCtx());
     this.spawnBombEffects();
+  }
+
+  private bombCtx(): BombContext {
+    const p = this.playerObj;
+    return {
+      player: p,
+      fx: this.playerEffects,
+      rng: this.rng,
+      frame: Math.floor(this.bombFrame),
+      duration: this.bombDuration,
+      focused: p.bombFocused,
+      rate: this.slowRate,
+      enemies: this.enemies,
+      enemyBullets: this.enemyBullets,
+      playSfx: (id) => this.playSfx(id),
+      spawnParticles: (effectId, x, y, count, color) => this.spawnEffectParticles(effectId, x, y, count, color),
+      startScreenShake: (duration, from, to) => this.startScreenShake(duration, from, to)
+    };
+  }
+
+  // Per-frame bomb choreography: the active form's decoded state machine
+  // writes moving attack slots into the pool each frame (Th07.exe bomb tick
+  // functions 0x407840-0x40cbf0; specs spec-bombs-{shared,reimu,marisa,
+  // sakuya}.md). Slot consumption below is exe-exact.
+  private tickBombChoreography(): void {
+    if (!this.bombRunner) return;
+    this.bombRunner.tick(this.bombCtx());
   }
 
   // Bomb visuals, per shot type, from the character's own playerXX.anm bomb
@@ -974,44 +1190,43 @@ export class StageScene implements GameHost {
 
   private applyBombEffects(): void {
     const p = this.playerObj;
-    // Approximation of Th07.exe's per-orb localized hitboxes (radii 24-256,
-    // per-tick damage 1-23, exe-bombs.md §3): a single player-centered 128px
-    // region at 8 dmg/frame. Full 24-state-machine fidelity out of scope;
-    // flagged per AGENTS.md §7. No full-screen sweep exists in the exe.
+    // Per-form choreography updates the attack-slot pool (Th07.exe bomb tick
+    // functions 0x407840-0x40cbf0 write player+0x9dc slots each frame).
+    this.tickBombChoreography();
+    this.bombFrame += this.slowRate;
+    // Slot consumption, exe FUN_0043a980 @ 0x43a980: every active slot's
+    // AABB (pos ± radius/2) is tested against the enemy box EVERY frame;
+    // overlapping slots each apply their damage value per frame (the /5
+    // score credit and the 70 cap happen in settlePendingDamage).
     for (const e of this.enemies) {
       // shotCollision: bomb damage flows through the same bit4-gated hit
       // test as shots (Th07.exe FUN_0041ed50) — emitters with op104=0 are
       // bomb-immune too.
       if (!e.ecl.canTakeDamage || !e.ecl.interactable || !e.ecl.shotCollision) continue;
-      if (Math.abs(e.x - p.x) <= 128 && Math.abs(e.y - p.y) <= 128) this.damageEnemy(e, 8, 'bomb');
+      for (const s of this.bombEngine.activeSlots()) {
+        const hw = (e.ecl.hitbox.x + s.radiusX) / 2;
+        const hh = (e.ecl.hitbox.y + s.radiusY) / 2;
+        if (Math.abs(e.x - s.x) <= hw && Math.abs(e.y - s.y) <= hh) {
+          this.damageEnemy(e, s.damage, 'bomb');
+          s.hitTally += s.damage;
+        }
+      }
     }
     for (const b of this.enemyBullets) {
       if (b.dead) continue;
-      if (Math.abs(b.x - p.x) <= 128 && Math.abs(b.y - p.y) <= 128) {
-        // Bomb-touched bullets spawn item type DAT_004b5ebc — BSS, never
-        // written, so 0 = a power item (bullet tick @ all.c:16160), which
-        // FUN_00430970/spawnItem converts to a big cherry (+1000+100c) at
-        // power >= 128. That conversion IS the vanilla bomb-to-charge-
-        // border economy; the old 'pointBullet' spawn starved it.
-        this.spawnItem('power', b.x, b.y, { state: 1 });
-        b.dead = true;
+      for (const s of this.bombEngine.activeSlots()) {
+        if (Math.abs(b.x - s.x) <= s.radiusX / 2 && Math.abs(b.y - s.y) <= s.radiusY / 2) {
+          // Bomb-touched bullets spawn item type DAT_004b5ebc — BSS, never
+          // written, so 0 = a power item (bullet tick @ all.c:16160), which
+          // FUN_00430970/spawnItem converts to a big cherry (+1000+100c) at
+          // power >= 128. That conversion IS the vanilla bomb-to-charge-
+          // border economy. Cancellation is the same spatial slot touch as
+          // damage (exe-bombs.md §4) — never a full-screen sweep.
+          this.spawnItem('power', b.x, b.y, { state: 1 });
+          b.dead = true;
+          break;
+        }
       }
-    }
-    // Marisa's bombs continuously pop star bursts (player01.anm scr98-104)
-    // — around the player for A, along the spark beam for B (cadence
-    // approximated, AGENTS.md §7).
-    if (p.character === 'marisaA' && this.frame % 4 === 0) {
-      this.playerEffects.spawn({
-        scriptId: 98 + this.rng.u32InRange(7),
-        x: p.x + this.rng.range(192) - 96,
-        y: p.y - this.rng.range(224)
-      });
-    } else if (p.character === 'marisaB' && this.frame % 3 === 0) {
-      this.playerEffects.spawn({
-        scriptId: 98 + this.rng.u32InRange(7),
-        x: p.x + this.rng.range(48) - 24,
-        y: p.y - 40 - this.rng.range(280)
-      });
     }
   }
 
@@ -1176,8 +1391,13 @@ export class StageScene implements GameHost {
         homingTarget = e;
       }
     }
+    const anm = this.playerObj.anm;
+    const rate = this.slowRate;
+    this.tickLaserSlots();
     for (const b of this.playerBullets) {
-      b.age++;
+      // Player-shot age is a rate-scaled split counter (exe FUN_0043a290
+      // tail); parity checks below use the integer part.
+      b.age += rate;
       if (b.state === 'fired') {
         if (b.shotType === 1 || b.shotType === 2) this.steerHomingBullet(b, homingTarget);
         else if (b.shotType === 3) {
@@ -1185,14 +1405,34 @@ export class StageScene implements GameHost {
           // per-frame random vertical boost from spawn, no age gate, no cap,
           // vx untouched — never routed through angle/speed.
           b.vy -= this.rng.range(0.1) + 0.27;
+        } else if (b.shotType === 4 || b.shotType === 5) {
+          this.anchorBeamBullet(b);
         }
-        b.x += b.vx;
-        b.y += b.vy;
       } else {
         b.hitAge++;
-        if (b.hitAge > 16) b.dead = true;
       }
-      if (b.state !== 'fired') continue;
+      // Th07.exe FUN_0043a290: both fired and collided slots keep integrating
+      // velocity (× the global rate) every frame; the per-shot ANM VM ticks
+      // alongside and the bullet dies when its script removes itself (impact
+      // scripts end in remove(); flight scripts end in static and never do).
+      b.x += b.vx * rate;
+      b.y += b.vy * rate;
+      // Beam release fade: the VM consumes the interrupt only while parked
+      // at its waitInt checkpoint (exe FUN_0044aa20 @ all.c:36279) — the
+      // request re-tries every frame until then.
+      if (b.fadePending && b.runner.waiting) {
+        b.runner.interrupt(1);
+        b.fadePending = false;
+      }
+      b.runner.update(rate);
+      if (b.runner.removed) {
+        b.dead = true;
+        continue;
+      }
+      // Hit-test gate, exe FUN_0043a980 @ 0x43a9d1: state 1 (fired) bullets,
+      // plus shotType 3 (MarisaA missile) in EITHER state — the collided
+      // missile keeps dealing contact damage while its explosion plays.
+      if (b.state !== 'fired' && b.shotType !== 3) continue;
       for (const e of collide ? this.enemies : []) {
         // Exe shot gate is bit0 (interactable) && bit4 (shotCollision) —
         // NOT bit1 (collisionEnabled), which only covers body-vs-player.
@@ -1203,27 +1443,147 @@ export class StageScene implements GameHost {
           if (b.shotType === 4 || b.shotType === 5) {
             // Th07.exe FUN_0043a980: lasers deal FULL table damage on even values
             // of their own age counter only, never enter 'collided', never spawn
-            // the hit effect/SE, and pierce indefinitely (no damage decay).
-            if ((b.age & 1) === 0) this.damageEnemy(e, b.damage);
+            // the impact ANM, and pierce (the test continues to further
+            // enemies). FUN_0043a080 (funcs[3]=2) pops a spark at the
+            // beam/enemy crossing every 8th tallied hit.
+            if ((Math.floor(b.age) & 1) === 0) {
+              this.damageEnemy(e, b.damage);
+              if ((++this.playerHitTally & 7) === 0) this.spawnEffectParticles(5, b.x, e.y, 1, 0xffffffff);
+            }
+          } else if (b.state === 'collided') {
+            // Missile re-hit (FUN_00439d80 state-2 branch): even values of
+            // the bullet's own age counter only; the slot damage is
+            // PERMANENTLY /3 (min 1), the explosion slows ×0.88 per
+            // qualifying hit, and a spark pops on ages divisible by 6.
+            if ((Math.floor(b.age) & 1) === 0) {
+              b.damage = Math.max(1, Math.trunc(b.damage / 3));
+              b.vx *= 0.88;
+              b.vy *= 0.88;
+              this.damageEnemy(e, b.damage);
+              if (Math.floor(b.age) % 6 === 0) this.spawnEffectParticles(5, e.x, e.y, 1, 0xffffffff);
+            }
           } else {
+            // First hit. MarisaA's missile (FUN_00439d80 state-1 branch)
+            // expands its box per sprite id and bursts at a random upward
+            // angle in [-3π/4, -π/4] before the shared hit path runs.
+            if (b.shotType === 3) {
+              const exp = MISSILE_EXPLOSION[b.impactScript - 0x20];
+              if (exp) {
+                b.hitboxW = exp[0];
+                b.hitboxH = exp[0];
+                const ang = this.rng.range(Math.PI / 2) - (3 * Math.PI) / 4;
+                b.vx = Math.cos(ang) * exp[1];
+                b.vy = Math.sin(ang) * exp[1];
+              }
+            }
             this.damageEnemy(e, b.damage);
             b.state = 'collided';
+            // Exe impact switch (FUN_0043a980 @ 0x43aa8c): re-arm the VM with
+            // script sprite+0x20 and pop one type-5 particle at the bullet.
+            if (anm.hasScript(b.impactScript)) b.runner = new AnmRunner(anm, b.impactScript);
+            this.spawnEffectParticles(5, b.x, b.y, 1, 0xffffffff);
             if (b.shotType !== 3) {
               // Th07.exe: velocity/8 on hit — except shotType 3 (MarisaA missile)
-              // which keeps full velocity into its collided fade.
+              // which keeps full velocity into its collided explosion.
               b.vx /= 8;
               b.vy /= 8;
             }
             this.playSfx(20);
           }
-          break;
+          // Beams pierce and the collided missile keeps overlapping — only a
+          // fresh single-hit bullet stops testing further enemies.
+          if (b.shotType !== 3 && b.shotType !== 4 && b.shotType !== 5) break;
+        }
+        // Type-5 helper boxes (FUN_004398e0 → attack slots 0x60+): every
+        // beam-history sample is a 10-wide, full-beam-height, damage-1 box
+        // tested every frame with no parity gate.
+        if (b.shotType === 5 && b.history) {
+          for (const hpt of b.history) {
+            if (Math.abs(hpt.x - e.x) <= (e.ecl.hitbox.x + 10) / 2 &&
+                Math.abs(hpt.y - e.y) <= (e.ecl.hitbox.y + b.hitboxH) / 2) {
+              this.damageEnemy(e, 1, this.playerObj.bombTimer > 0 ? 'bomb' : 'shot');
+            }
+          }
         }
       }
-      if (b.y < -32 || b.x < -32 || b.x > 416) b.dead = true;
+      // Bounds cull, exe FUN_0043a290 (FUN_0042bdc7): skipped entirely for
+      // the persistent beam types — their lifetime is the laser-slot timer.
+      if (b.shotType !== 4 && b.shotType !== 5 &&
+          (b.y < -32 || b.x < -32 || b.x > 416 || b.y > 480)) b.dead = true;
     }
     let w = 0;
     for (const b of this.playerBullets) if (!b.dead) this.playerBullets[w++] = b;
     this.playerBullets.length = w;
+  }
+
+  // MarisaB laser-slot upkeep, Th07.exe FUN_0043a290 head + the shared
+  // timer logic inside FUN_004396a0/FUN_004398e0:
+  //  - the countdown ticks every frame; shoot released clamps it to 50;
+  //    a bomb or blocking dialogue clamps it to 20;
+  //  - dropping below 71 arms the beam ANM's interrupt-1 release fade
+  //    (script 75/77: 30f fade then remove — the removal frees the bullet);
+  //  - leaving the settled-unfocused state fades slots 0/1; leaving the
+  //    settled-focused state (state != 3) hard-frees slot 2;
+  //  - timer 0 hard-frees.
+  private tickLaserSlots(): void {
+    const p = this.playerObj;
+    const blocked = this.isDialogueBlocking() || p.bombTimer > 0;
+    for (let i = 0; i < 3; i++) {
+      const slot = p.laserSlots[i];
+      if (!slot) continue;
+      const b = slot.bullet;
+      if (b.dead || b.runner.removed) {
+        p.laserSlots[i] = null;
+        continue;
+      }
+      const wantFocused = b.behaviorFunc === 3;
+      if (wantFocused && !p.focusHeld) {
+        // exe: 240a != 3 → slot 2's owner is freed outright (+0x34a = 0).
+        b.dead = true;
+        p.laserSlots[i] = null;
+        continue;
+      }
+      slot.timer -= this.slowRate;
+      if (!p.shooting && slot.timer > 50) slot.timer = 50;
+      if (blocked && slot.timer > 20) slot.timer = 20;
+      if (!wantFocused && p.focusHeld) {
+        // exe: 240a != 1 → unfocused beams get the fade interrupt and their
+        // slot is released for the focused-file record.
+        b.fadePending = true;
+        p.laserSlots[i] = null;
+        continue;
+      }
+      if (slot.timer < 71) b.fadePending = true;
+      if (slot.timer <= 0) {
+        b.dead = true;
+        p.laserSlots[i] = null;
+      }
+    }
+  }
+
+  // Per-frame beam anchoring, Th07.exe FUN_004396a0 (type 4) and
+  // FUN_004398e0 (type 5). Type 4 rides its option: the beam box spans from
+  // the option to the screen top (center optionY/2, full height optionY) and
+  // the 14px beam sprite stretches to match (VM scaleY = optionY/14).
+  // Type 5 rides the player with 64px of overhang past the top edge and
+  // records its previous centers into the 16-sample history ring.
+  private anchorBeamBullet(b: PlayerBullet): void {
+    const p = this.playerObj;
+    if (b.shotType === 4) {
+      const off = p.orbOffset((b.orb === 2 ? 2 : 1) as 1 | 2);
+      const optY = p.y + off.y;
+      b.x = p.x + off.x + b.anchorX;
+      b.hitboxH = optY;
+      b.y = optY / 2;
+      b.scaleYOverride = optY / 14;
+    } else if (b.history) {
+      b.history.unshift({ x: b.x, y: b.y });
+      if (b.history.length > 16) b.history.pop();
+      b.x = p.x + b.anchorX;
+      b.hitboxH = p.y + 64;
+      b.y = p.y / 2 - 32;
+      b.scaleYOverride = (p.y + 64) / 14;
+    }
   }
 
   // Nearest damageable enemy to (x, y); shared by the homing steer and the
@@ -1498,10 +1858,11 @@ export class StageScene implements GameHost {
   // added to position ONCE. Every behavior reads only its OWN op-79 slot's
   // resolved params and clears its own bit when finished.
   private updateBulletMotion(b: EnemyBullet): void {
+    const rate = this.slowRate;
     if (b.age < b.spawnDuration) {
       b.x += b.vx * b.spawnMoveScale;
       b.y += b.vy * b.spawnMoveScale;
-      b.age++;
+      b.age += rate;
       return;
     }
     const age = b.age - b.spawnDuration;
@@ -1511,8 +1872,8 @@ export class StageScene implements GameHost {
       // scalar, so it composes cleanly with accel/angle-change.
       if (age <= 16) {
         const extra = 5 - (age * 5) / 16;
-        b.vx = Math.cos(b.angle) * (b.speed + extra);
-        b.vy = Math.sin(b.angle) * (b.speed + extra);
+        b.vx = Math.cos(b.angle) * (b.speed + extra) * rate;
+        b.vy = Math.sin(b.angle) * (b.speed + extra) * rate;
       } else {
         b.exFlags &= ~1;
       }
@@ -1525,8 +1886,8 @@ export class StageScene implements GameHost {
       const ac = b.exAccel;
       if (age >= ac.limit) b.exFlags &= ~0x10;
       else {
-        b.vx += Math.cos(ac.angle) * ac.mag;
-        b.vy += Math.sin(ac.angle) * ac.mag;
+        b.vx += Math.cos(ac.angle) * ac.mag * rate;
+        b.vy += Math.sin(ac.angle) * ac.mag * rate;
         b.angle = Math.atan2(b.vy, b.vx);
       }
     }
@@ -1538,8 +1899,8 @@ export class StageScene implements GameHost {
       else {
         b.angle = normalizeAngle(b.angle + an.angleDelta);
         b.speed += an.speedDelta;
-        b.vx = Math.cos(b.angle) * b.speed;
-        b.vy = Math.sin(b.angle) * b.speed;
+        b.vx = Math.cos(b.angle) * b.speed * rate;
+        b.vy = Math.sin(b.angle) * b.speed * rate;
       }
     }
     if ((b.exFlags & 0x40) && b.exDir) this.dirChangeBullet(b, age, 'relative');
@@ -1549,7 +1910,7 @@ export class StageScene implements GameHost {
     if ((b.exFlags & 0x800) && b.exBounce) this.bounceBullet(b, false);
     b.x += b.vx;
     b.y += b.vy;
-    b.age++;
+    b.age += rate;
   }
 
   private dirChangeBullet(b: EnemyBullet, age: number, mode: 'relative' | 'absolute' | 'aimed'): void {
@@ -1571,8 +1932,8 @@ export class StageScene implements GameHost {
     } else {
       speed = b.speed - ((age - interval * times) * b.speed) / interval;
     }
-    b.vx = Math.cos(b.angle) * speed;
-    b.vy = Math.sin(b.angle) * speed;
+    b.vx = Math.cos(b.angle) * speed * this.slowRate;
+    b.vy = Math.sin(b.angle) * speed * this.slowRate;
   }
 
   private bounceBullet(b: EnemyBullet, includeBottom: boolean): void {
@@ -1582,8 +1943,8 @@ export class StageScene implements GameHost {
     if (b.x < 0 || b.x >= 384) b.angle = normalizeAngle(-b.angle - Math.PI);
     if (b.y < 0 || (includeBottom && b.y >= 448)) b.angle = -b.angle;
     b.speed = bo.speed;
-    b.vx = Math.cos(b.angle) * b.speed;
-    b.vy = Math.sin(b.angle) * b.speed;
+    b.vx = Math.cos(b.angle) * b.speed * this.slowRate;
+    b.vy = Math.sin(b.angle) * b.speed * this.slowRate;
     b.dirTimes = (b.dirTimes ?? 0) + 1;
     if (b.dirTimes >= maxTimes) b.exFlags &= includeBottom ? ~0x400 : ~0x800;
   }
@@ -1639,9 +2000,12 @@ export class StageScene implements GameHost {
   // to 0 over shrinkDuration (drawn/hit only while phaseFrame <
   // shrinkCutoff); nearDist >= 640 or the shrink finishing frees the slot.
   private updateLasers(): void {
+    const lrate = this.slowRate;
     for (const l of this.enemyLasers) {
       if (!l.inUse) continue;
-      l.farDist += l.speed;
+      // exe FUN_004241c0: farDist growth is rate-scaled; the phase clock is
+      // a split counter at the same rate (spec-slowmo.md §3.1/§3.2).
+      l.farDist += l.speed * lrate;
       if (l.farDist - l.nearDist > l.maxLength) l.nearDist = l.farDist - l.maxLength;
       if (l.nearDist < 0) l.nearDist = 0;
       if (l.state === 0) {
@@ -1668,7 +2032,15 @@ export class StageScene implements GameHost {
         if (l.phaseFrame >= l.shrinkDuration) l.inUse = false;
       }
       if (l.nearDist >= 640) l.inUse = false;
-      l.phaseFrame++;
+      if (lrate > 0.99) {
+        l.phaseFrame++;
+      } else {
+        l.phaseFrac = (l.phaseFrac ?? 0) + lrate;
+        if (l.phaseFrac >= 1) {
+          l.phaseFrame++;
+          l.phaseFrac -= 1;
+        }
+      }
     }
     // Compact the pool once nothing references dead entries (the per-enemy
     // handle tables hold object references, so splicing is safe).
@@ -1720,12 +2092,13 @@ export class StageScene implements GameHost {
       if (this.cherry.borderActive) it.state = 1;
       if (p.alive && (it.state === 1 || pocActive)) {
         const angle = Math.atan2(p.y - it.y, p.x - it.x);
-        it.x += Math.cos(angle) * sht.autocollectSpeed;
-        it.y += Math.sin(angle) * sht.autocollectSpeed;
+        it.x += Math.cos(angle) * sht.autocollectSpeed * this.slowRate;
+        it.y += Math.sin(angle) * sht.autocollectSpeed * this.slowRate;
       } else {
-        it.vy = Math.min(3, it.vy + 0.03);
-        it.x += it.vx;
-        it.y += it.vy;
+        // exe FUN_00430c10: item motion is rate-scaled (spec-slowmo.md §3.1).
+        it.vy = Math.min(3, it.vy + 0.03 * this.slowRate);
+        it.x += it.vx * this.slowRate;
+        it.y += it.vy * this.slowRate;
       }
       if (p.alive && Math.abs(it.x - p.x) <= sht.itemRadius && Math.abs(it.y - p.y) <= sht.itemRadius) {
         this.collectItem(it);
@@ -1743,25 +2116,63 @@ export class StageScene implements GameHost {
     this.playSfx(21);
     switch (it.type) {
       case 'power':
+      case 'bigPower': {
+        // Item-collect cases 0/2 (spec-popups.md §4.1): below max power a
+        // plain white "10" popup, or — when the pickup crosses a power
+        // bracket (8/16/32/48/64/80/96/128) — a salmon sentinel glyph and
+        // the power-up chime. Case 0 at max power pays the escalating
+        // combo score (flat 12800 here — combo ladder unported, AGENTS §7).
+        const add = it.type === 'power' ? 1 : 8;
         if (p.power < 128) {
-          p.power = Math.min(128, p.power + 1);
+          const before = this.powerTier(p.power);
+          p.power = Math.min(128, p.power + add);
+          if (this.powerTier(p.power) > before) {
+            this.spawnScorePopup(-1, it.x, it.y, 0xffffc0a0);
+            this.playSfx(0x1f);
+          } else {
+            this.spawnScorePopup(10, it.x, it.y, 0xffffffff);
+          }
           // Crossing to full power clears the field: FUN_00422ea0(1)
           // inside the collect handler (all.c:22031/22139) — plain cancel
           // to cherry items, no score sweep.
           if (p.power === 128) this.cancelBulletsToItems();
-        } else {
+        } else if (it.type === 'power') {
           this.addScore(12800);
+          this.spawnScorePopup(128000, it.x, it.y, 0xffffff00);
         }
+        // bigPower at max: the exe path shows uninitialized garbage and
+        // credits nothing (confirmed v1.00b bug) — the port draws nothing.
         break;
-      case 'bigPower':
-        p.power = Math.min(128, p.power + 8);
-        break;
-      case 'fullPower':
+      }
+      case 'fullPower': {
+        // Case 4 (spec-popups.md §4.1): salmon sentinel + chime + convert
+        // every live power/bigPower item to bigCherry (FUN_00431da0) when
+        // power was below max, then always a white "1000" popup and +100.
+        if (p.power < 128) {
+          this.spawnScorePopup(-1, it.x, it.y, 0xffffc0a0);
+          this.playSfx(0x1f);
+          for (const other of this.items) {
+            if (!other.dead && (other.type === 'power' || other.type === 'bigPower')) other.type = 'bigCherry';
+          }
+        }
         p.power = 128;
+        this.addScore(100);
+        this.spawnScorePopup(1000, it.x, it.y, 0xffffffff);
         break;
+      }
       case 'point': {
         this.pointItems++;
-        this.addScore(this.cherry.pointItemScore(it.y, p.sht.pocLineY, it.state === 1));
+        const pts = this.cherry.pointItemScore(it.y, p.sht.pocLineY, it.state === 1);
+        this.addScore(pts);
+        // Case 1: the popup shows the pre-divide value — yellow above the
+        // collection line or when auto-collected, white otherwise.
+        const yellow = it.state === 1 || it.y <= p.sht.pocLineY;
+        this.spawnScorePopup(pts * 10, it.x, it.y, yellow ? 0xffffff00 : 0xffffffff);
+        // Extend ladder (exe item-collect case 1 @ all.c:22099-22125).
+        while (this.pointItems >= this.extendThreshold) {
+          this.awardExtend();
+          this.extendLevel++;
+        }
         break;
       }
       case 'pointBullet':
@@ -1780,20 +2191,30 @@ export class StageScene implements GameHost {
         p.lives = Math.min(8, p.lives + 1);
         this.playSfx(28);
         break;
-      case 'cherry':
+      case 'cherry': {
         // exe case 6 (spec §3b): +20 cherry, score = grazeScaledValue/10.
-        this.addScore(this.cherry.grazeScaledItemScore(this.graze));
+        // The popup uses the 3-slot pool, always white (spec-popups.md §4.1).
+        const v = this.cherry.grazeScaledItemScore(this.graze);
+        this.addScore(v);
+        this.spawnScorePopup(v * 10, it.x, it.y, 0xffffffff, true);
         this.cherry.onSmallCherryItem();
         break;
+      }
       case 'bigCherry': {
         // This ItemType is exe item TYPE 7 (the drop-table entry, and what
         // power drops convert to at power>=128, FUN_00430970 all.c:21819) —
         // exe collect case 7: cherry AND cherryPlus += 1000 + 100×spell
         // captures (all.c:22236), plus a height-falloff score bonus when
-        // cherry is already saturated. The previous onBigCherryItem() call
-        // was exe case 8 (+30 cherryPlus, a DIFFERENT item) — that 33×+
-        // under-award starved the border trigger (never reached 50000).
-        this.addScore(this.cherry.largeCherryItemScore(it.y, this.playerObj.sht.pocLineY, it.state === 1));
+        // cherry is already saturated. Saturated: white/yellow score popup;
+        // otherwise a RED popup showing the cherry gain (spec-popups.md).
+        if (this.cherry.cherry >= this.cherry.cherryMax) {
+          const v = this.cherry.largeCherryItemScore(it.y, this.playerObj.sht.pocLineY, it.state === 1);
+          this.addScore(v);
+          const yellow = it.state === 1 || it.y <= p.sht.pocLineY;
+          this.spawnScorePopup(v * 10, it.x, it.y, yellow ? 0xffffff00 : 0xffffffff);
+        } else {
+          this.spawnScorePopup(this.cherry.largeCherryItemGain(), it.x, it.y, 0xffff4040);
+        }
         this.cherry.onLargeCherryItem();
         break;
       }
@@ -1845,8 +2266,8 @@ export class StageScene implements GameHost {
     r.ctx.fillStyle = '#04040c';
     r.ctx.fillRect(PLAYFIELD.x, PLAYFIELD.y, PLAYFIELD.width, PLAYFIELD.height);
     r.clipPlayfield(() => {
-      const ox = PLAYFIELD.x;
-      const oy = PLAYFIELD.y;
+      const ox = PLAYFIELD.x + this.shakeX;
+      const oy = PLAYFIELD.y + this.shakeY;
       this.drawBackground(r, ox, oy);
       this.drawSpellBackground(r);
       for (const p of this.particles) {
@@ -1862,7 +2283,9 @@ export class StageScene implements GameHost {
           if (slot?.runner) r.drawAnmFrame(slot.runner.spriteFrame(), ox + e.x, oy + e.y);
         }
         const frame = e.ecl.anmRunner?.spriteFrame() ?? null;
-        const rotation = e.ecl.anmRotateWithAngle ? e.ecl.angle : undefined;
+        // op150 writes an absolute VM rotation; the op27 angle-follow flag
+        // takes precedence when armed (both write the same exe field).
+        const rotation = e.ecl.anmRotateWithAngle ? e.ecl.angle : e.ecl.anmRotZ;
         r.drawAnmFrame(frame, ox + e.x, oy + e.y, rotation != null ? { rotation } : {});
       }
       this.drawLasers(r, ox, oy);
@@ -1891,14 +2314,31 @@ export class StageScene implements GameHost {
       }
       const p = this.playerObj;
       for (const b of this.playerBullets) {
-        const fade = b.state === 'collided' ? 1 - b.hitAge / 16 : 0.9;
-        r.drawSprite(b.rect.imageKey, b.rect.x, b.rect.y, b.rect.w, b.rect.h, ox + b.x, oy + b.y, {
-          rotation: b.angle + Math.PI / 2,
-          alpha: Math.max(0, fade),
-          scaleMultiplier: b.state === 'collided' ? 1 + b.hitAge / 10 : 1
-        });
+        // Script-driven sprite state (alpha/scale/spin/blend all come from
+        // the playerXX.anm shot script). Auto-rotate scripts (op25 — Sakuya
+        // knives, Marisa main star, the impact streaks) orient along the
+        // live velocity +π/2 (sprites point up, exe FUN_0043a630); others
+        // (Reimu's spinning amulets) use the script's own rotation.
+        const frame = b.runner.spriteFrame();
+        if (!frame) continue;
+        const opts: { rotation?: number; scaleY?: number; alpha?: number } = {};
+        if (frame.autoRotate) opts.rotation = Math.atan2(b.vy, b.vx) + Math.PI / 2;
+        // Beam types stretch their 14px segment over the live beam length
+        // (exe writes the VM scaleY each frame: FUN_004396a0/FUN_004398e0).
+        if (b.scaleYOverride != null) opts.scaleY = b.scaleYOverride;
+        // Type-5 ghost trail (FUN_00439c50, funcs[2]=1): the beam redraws at
+        // each history sample with alpha falling off by sample index.
+        if (b.shotType === 5 && b.history) {
+          const n = b.history.length;
+          for (let i = n - 1; i >= 0; i--) {
+            const hpt = b.history[i];
+            r.drawAnmFrame(frame, ox + hpt.x, oy + hpt.y, { ...opts, alpha: 1 - (i + 1) / 16 });
+          }
+        }
+        r.drawAnmFrame(frame, ox + b.x, oy + b.y, opts);
       }
       this.playerEffects.draw(r, ox, oy);
+      this.drawPopups(r, ox, oy);
       // Option orbs (yin-yang, local sprite 128).
       if (p.alive && p.power >= 8) {
         const orbSprite = p.anm.sprites.get(128) ?? p.anm.sprites.get(66);
@@ -1939,6 +2379,18 @@ export class StageScene implements GameHost {
         }
       }
       if (this.cherry.borderActive) this.drawBorder(r, ox, oy);
+      if (this.screenFlash) {
+        const f = this.screenFlash;
+        const a = ((f.color >>> 24) & 0xff) / 255;
+        const cr = (f.color >>> 16) & 0xff;
+        const cg = (f.color >>> 8) & 0xff;
+        const cb = f.color & 0xff;
+        r.ctx.save();
+        r.ctx.globalAlpha = a;
+        r.ctx.fillStyle = `rgb(${cr},${cg},${cb})`;
+        r.ctx.fillRect(PLAYFIELD.x, PLAYFIELD.y, PLAYFIELD.width, PLAYFIELD.height);
+        r.ctx.restore();
+      }
       this.drawSpellDeclaration(r, ox, oy);
     });
     this.drawFrame(r);
@@ -2525,21 +2977,30 @@ export class StageScene implements GameHost {
     label(FRONT.bomb, 112);
     for (let i = 0; i < Math.max(0, p.bombs); i++) star(FRONT.blueStar, valueX + i * 16, 112);
 
-    // Power bar sits on the Power row at the value column (a filled gradient
-    // bar with MAX/current inside, like the original's readout).
+    // Power row, exe-exact (sidebar draw @ all.c:18593-18648): an untextured
+    // gradient quad from x=496 (0x48ecb0) to 496+power, y 144..160, vertex
+    // colors ARGB 0xE0E0E0FF top / 0x80E0E0FF bottom (light periwinkle,
+    // alpha 224 fading to 128); then the power value as HUD digits, or the
+    // literal string "MAX" (DAT_0048e138) at 128.
     label(FRONT.power, 144);
-    const barW = 128;
-    ctx.fillStyle = '#2a0817';
-    ctx.fillRect(valueX, 146, barW, 12);
-    ctx.fillStyle = p.power >= 128 ? '#d9b95c' : '#a53a63';
-    ctx.fillRect(valueX, 146, barW * Math.min(1, p.power / 128), 12);
-    if (p.power >= 128) r.text('MAX', valueX + 4, 156, { size: 12, color: '#fff' });
-    else this.drawNumber(r, p.power, valueX + 4, 146);
+    if (p.power > 0) {
+      const grad = ctx.createLinearGradient(0, 144, 0, 160);
+      grad.addColorStop(0, 'rgba(224,224,255,0.878)');
+      grad.addColorStop(1, 'rgba(224,224,255,0.502)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(496, 144, Math.min(128, p.power), 16);
+    }
+    if (p.power >= 128) r.text('MAX', 496, 146, { size: 12, color: '#fff' });
+    else this.drawNumber(r, p.power, 496, 146);
 
     label(FRONT.graze, 160);
     this.drawNumber(r, this.graze, valueX, 162);
+    // Point row displays "collected/next-extend threshold" ("%d/%d" @
+    // all.c:18587, stats +0x28 / +0x30). Slash = ascii.png 16px-font glyph.
     label(FRONT.point, 176);
-    this.drawNumber(r, this.pointItems, valueX, 178);
+    const pointEnd = this.drawNumber(r, this.pointItems, valueX, 178);
+    r.text('/', pointEnd + 1, 178, { size: 12, color: '#eee', stroke: false });
+    this.drawNumber(r, this.extendThreshold, pointEnd + 8, 178);
 
     // Cherry readout hugging the screen's bottom-left (ascii.anm script4;
     // exe draw @ all.c:1760-1870): the main row is `cherry / cherryMax`

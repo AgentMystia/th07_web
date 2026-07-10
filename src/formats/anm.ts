@@ -315,17 +315,20 @@ export class AnmRunner {
     return false;
   }
 
-  update(): void {
+  // `rate` is the global slow-motion rate (spec-slowmo.md §3.1/§3.2): the
+  // exe scales both the ANM VM's delta channels and its tween-progress
+  // clock by DAT_0056baa8, so the whole VM advances fractionally.
+  update(rate = 1): void {
     if (this.removed) return;
     this.runFrame();
     // Per-frame continuous updates.
-    this.scaleX += this.scaleSpeedX;
-    this.scaleY += this.scaleSpeedY;
-    if (this.rotSpeedX) this.rotX = normalizeAngle(this.rotX + this.rotSpeedX);
-    if (this.rotSpeedY) this.rotY = normalizeAngle(this.rotY + this.rotSpeedY);
-    if (this.rotSpeedZ) this.rotZ = normalizeAngle(this.rotZ + this.rotSpeedZ);
+    this.scaleX += this.scaleSpeedX * rate;
+    this.scaleY += this.scaleSpeedY * rate;
+    if (this.rotSpeedX) this.rotX = normalizeAngle(this.rotX + this.rotSpeedX * rate);
+    if (this.rotSpeedY) this.rotY = normalizeAngle(this.rotY + this.rotSpeedY * rate);
+    if (this.rotSpeedZ) this.rotZ = normalizeAngle(this.rotZ + this.rotSpeedZ * rate);
     this.applyInterps();
-    this.frame++;
+    this.frame += rate;
   }
 
   private applyInterps(): void {
