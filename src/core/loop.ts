@@ -28,6 +28,12 @@ export class Loop {
     requestAnimationFrame((t) => this.tick(t));
   }
 
+  // Test tooling can stop the real rAF driver before using advance(), making
+  // frame-exact probes immune to an incidental browser tick between calls.
+  stop(): void {
+    this.running = false;
+  }
+
   private tick(now: number): void {
     if (!this.running) return;
     const delta = Math.min(MAX_FRAME_DELTA_MS, now - this.last);

@@ -6,9 +6,11 @@ import { loadAssets } from './game/assets';
 import { StageScene } from './game/stage-scene';
 import { MenuFlow } from './game/title-scene';
 import type { CharacterId } from './game/player';
+import { stageBgmTracks } from './game/bgm';
 
 interface TestHook {
   ready: boolean;
+  pause(): void;
   advance(n: number): void;
   setLives(n: number): void;
   setInvuln(frames: number): void;
@@ -19,6 +21,8 @@ interface TestHook {
   inject(held: string[], pressed: string[]): void;
   damageBoss(n: number): void;
   addCherry(n: number): void;
+  primeBorderCollision(): boolean;
+  clearEnemyBullets(): void;
   spawnLog(): { t: number; time: number; sub: number }[];
   bgm(): { active: string | null; decoded: string[] };
 }
@@ -36,14 +40,20 @@ declare global {
 function stageSnapshot(scene: StageScene): Record<string, unknown> {
   return {
     scene: 'stage',
+    stageNumber: scene.stageNumber,
+    mode: scene.mode,
     frame: scene.frame,
+    stageFrame: scene.stageFrame,
     difficulty: scene.difficulty,
     character: scene.playerObj.character,
     score: scene.score,
+    hiScore: scene.hiScore,
     enemies: scene.enemies.length,
     bullets: scene.enemyBullets.length,
     items: scene.items.length,
-    itemDump: scene.items.slice(0, 12).map((it) => ({ type: it.type, x: Math.round(it.x), y: Math.round(it.y) })),
+    itemDump: scene.items.slice(0, 12).map((it) => ({
+      type: it.type, x: Math.round(it.x), y: Math.round(it.y), state: it.state
+    })),
     timelines: scene.runtime.timelineCursors.map((c) => ({ ...c })),
     bossActive: !!scene.bossActive,
     bossHp: scene.bossActive?.hp ?? null,
@@ -58,9 +68,21 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
     spellName: scene.spellName,
     spell: scene.spellcard ? { id: scene.spellcard.id, capturing: scene.spellcard.capturing, declAge: scene.spellcard.declAge } : null,
     rngSeed: scene.rng.seed,
-    player: { x: scene.playerObj.x, y: scene.playerObj.y, lives: scene.playerObj.lives, bombs: scene.playerObj.bombs, power: scene.playerObj.power },
+    player: {
+      x: scene.playerObj.x,
+      y: scene.playerObj.y,
+      lives: scene.playerObj.lives,
+      bombs: scene.playerObj.bombs,
+      power: scene.playerObj.power,
+      invuln: scene.playerObj.invulnFrames,
+      bombInvuln: scene.playerObj.bombInvuln,
+      deathTimer: scene.playerObj.deathTimer,
+      alive: scene.playerObj.alive
+    },
     bomb: { timer: scene.playerObj.bombTimer },
     graze: scene.graze,
+    pointItems: scene.pointItems,
+    spellsCaptured: scene.cherry.spellsCaptured,
     playerBullets: scene.playerBullets.length,
     playerBulletDump: scene.playerBullets.slice(0, 8).map((b) => ({
       x: Math.round(b.x),
@@ -71,10 +93,28 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
       vx: Number(b.vx.toFixed(2)),
       vy: Number(b.vy.toFixed(2))
     })),
-    cherry: { c: scene.cherry.cherry, max: scene.cherry.cherryMax, plus: scene.cherry.cherryPlus, border: scene.cherry.borderTimer },
+    cherry: {
+      c: scene.cherry.cherry,
+      max: scene.cherry.cherryMax,
+      plus: scene.cherry.cherryPlus,
+      border: scene.cherry.borderTimer,
+      pending: scene.cherry.borderPending,
+      message: scene.borderMessage ? { ...scene.borderMessage } : null,
+      clearWave: scene.borderClearWave ? { ...scene.borderClearWave } : null
+    },
+    std: {
+      frame: scene.runtime.std.frame,
+      animationFrame: scene.runtime.std.animationFrame,
+      paused: scene.runtime.std.paused,
+      primary: scene.runtime.std.primaryAnm ? { ...scene.runtime.std.primaryAnm } : null,
+      secondary: scene.runtime.std.secondaryAnm ? { ...scene.runtime.std.secondaryAnm } : null
+    },
     bulletDump: scene.enemyBullets.slice(0, 64).map((b) => ({
+      id: b.id,
       x: Math.round(b.x),
       y: Math.round(b.y),
+      flags: b.flags,
+      dead: !!b.dead,
       sprite: b.sprite,
       off: b.spriteOffset,
       rect: [b.rect.x, b.rect.y, b.rect.w, b.rect.h],
@@ -85,10 +125,20 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
     enemyDump: scene.enemies.slice(0, 8).map((e) => ({
       sub: e.ecl.subId,
       ctxSub: e.ecl.ctx.subId,
+      ctxTime: e.ecl.ctx.time,
+      ctxIndex: e.ecl.ctx.index,
+      waitTimer: e.ecl.ctx.waitTimer,
       x: Math.round(e.x),
       y: Math.round(e.y),
       hp: e.hp,
       boss: e.ecl.isBoss,
+      bossSlot: e.ecl.bossSlot,
+      canTakeDamage: e.ecl.canTakeDamage,
+      deathCallbackSub: e.ecl.deathCallbackSub,
+      pendingInterrupt: e.ecl.pendingInterrupt,
+      interactable: e.ecl.interactable,
+      invisible: e.ecl.invisible,
+      deathMode: e.ecl.deathMode,
       timer: e.ecl.bossTimer
     }))
   };
@@ -112,7 +162,7 @@ async function boot(): Promise<void> {
   // was measured starting 138.9ms (~8 frames) after stage frame 0 on a
   // zero-latency local server, and 8.9s/26.2s (~533/~1573 frames) under
   // throttled Slow-4G/Fast-3G — with the title theme still audibly looping
-  // for the entire gap (bug 5, measurements in reference/re-specs/bgm-audit.md).
+  // for the entire gap (measurements retained in the July 10 handoff).
   audio.preloadBgm(['th07_01', 'th07_02', 'th07_03']);
   const params = new URLSearchParams(location.search);
 
@@ -123,6 +173,10 @@ async function boot(): Promise<void> {
   // menu flow is always used.
   const isTest = params.get('test') === '1';
   const useMenu = !isTest || params.get('menu') === '1';
+  // Test-only direct arcade entry: keep the normal menu bypass while using
+  // the real stage-clear/continue/next-stage flow. This lets the transition
+  // probe exercise carryState() rather than constructing stage 2 directly.
+  const testArcade = isTest && params.get('arcade') === '1';
 
   let stage: StageScene | null = null;
   let menu: MenuFlow | null = null;
@@ -133,16 +187,6 @@ async function boot(): Promise<void> {
   // no ?menu=1) boot path below, so BGM/preload behavior is identical either
   // way. Track 1 (th07_01) is the title theme, per musiccmt.txt.
   //
-  // Per-stage BGM: thbgm track layout is stage theme = 2n, boss theme =
-  // 2n+1 for stages 1-6; Extra (7) = 16/17, Phantasm (8) = 18/19 (14/15
-  // are the ending/staff-roll themes — musiccmt.txt). All tracks are
-  // generated from thbgmogg.dat via `npm run generate-bgm`.
-  function stageTracks(stageNumber: number): [string, string] {
-    const base = stageNumber <= 6 ? stageNumber * 2 : 16 + (stageNumber - 7) * 2;
-    const pad = (n: number) => `th07_${String(n).padStart(2, '0')}`;
-    return [pad(base), pad(base + 1)];
-  }
-
   function startStage(
     difficulty: number,
     character: CharacterId,
@@ -152,7 +196,7 @@ async function boot(): Promise<void> {
     const s = new StageScene(assets, audio, difficulty, character, stageNumber, carry);
     // Headless probes (?test=1 without ?menu=1) keep the scene alive forever;
     // real play gets the arcade flow: continue screen + return to title.
-    s.mode = useMenu ? 'arcade' : 'test';
+    s.mode = useMenu || testArcade ? 'arcade' : 'test';
     s.hiScore = Math.max(s.hiScore, sessionHiScore);
     s.onExitToTitle = () => {
       sessionHiScore = Math.max(sessionHiScore, s.hiScore);
@@ -169,8 +213,11 @@ async function boot(): Promise<void> {
     };
     stage = s;
     menu = null;
-    const [stageTrack, bossTrack] = stageTracks(stageNumber);
+    const [stageTrack, bossTrack] = stageBgmTracks(stageNumber);
     audio.preloadBgm([stageTrack, bossTrack]);
+    // Main-route transitions have an entire stage of lead time to decode the
+    // next pair, matching the native game's ready-before-play behavior.
+    if (stageNumber < 6) audio.preloadBgm([...stageBgmTracks(stageNumber + 1)]);
     audio.playBgm(stageTrack);
     return s;
   }
@@ -193,6 +240,9 @@ async function boot(): Promise<void> {
     // Test-only override so scripts/dev-shot.mjs can snapshot a shot pattern
     // at an arbitrary power bracket without needing to grind for it in-game.
     if (params.has('power')) s.playerObj.power = Number(params.get('power'));
+    // Test-only entry point for driving a real MSG stream without waiting
+    // thousands of stage frames; DialogueRunner and AudioBus are unchanged.
+    if (params.has('dialogue')) s.startDialogue(Number(params.get('dialogue')));
   }
 
   const loop = new Loop({
@@ -210,6 +260,7 @@ async function boot(): Promise<void> {
   if (isTest) {
     window.__TH07_TEST__ = {
       ready: true,
+      pause: () => loop.stop(),
       advance: (n: number) => loop.advance(n),
       snapshot: () => (menu ? menu.snapshot() : stageSnapshot(stage!)),
       pixelAt: (x: number, y: number) => Array.from(renderer.ctx.getImageData(x, y, 1, 1).data),
@@ -235,6 +286,8 @@ async function boot(): Promise<void> {
         if (!stage) return;
         stage.cherry.debugAddCherry(n);
       },
+      primeBorderCollision: () => stage?.debugPrimeBorderCollision() ?? false,
+      clearEnemyBullets: () => { if (stage) stage.enemyBullets.length = 0; },
       // Test-only: force the life count so probes can reach and observe
       // late-stage content (boss spells, the Supernatural Border) that a
       // no-dodge headless run would otherwise die before reaching. Same

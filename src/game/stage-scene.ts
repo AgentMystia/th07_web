@@ -12,6 +12,7 @@ import { CHARACTERS, Player, type CharacterId, type PlayerBullet } from './playe
 import { PlayerEffects } from './player-effects';
 import { CherrySystem, BORDER_DURATION, CHERRY_PLUS_MAX } from './cherry';
 import { DialogueRunner, portraitSprite } from './dialogue';
+import { stageBgmTrack } from './bgm';
 
 // Stage host. Runs any of the 8 stage timelines (1-6 main game, 7 Extra,
 // 8 Phantasm) with per-stage ECL/STD/MSG/ANM data resolved from TH07_DATA.
@@ -176,6 +177,9 @@ export class StageScene implements GameHost {
   // current STD frame; shared by every quad instance that references it
   // (see drawBackground / bgAnmFrame).
   private bgAnmCache = new Map<number, { runner: AnmRunner; frame: number }>();
+  // STD ops 29/30 own two standalone ANM VMs, separate from the per-quad
+  // runners and from each other (Th07.exe FUN_004046f0 @ 0x40516d-0x4051e8).
+  private specialBgAnmCache: ({ script: number; runner: AnmRunner; age: number } | null)[] = [null, null];
   gameOver = false;
   // Arcade end-of-game flow. 'test' keeps the pre-existing headless-probe
   // semantics (no freeze, no scene exit); 'arcade' is the real game: PCB's
@@ -233,6 +237,12 @@ export class StageScene implements GameHost {
   // Spell-card capture popup (spec-ui-stageclear.md §4): label + value on
   // success only. Failure draws nothing (exe skips FUN_004264e3 entirely).
   private bonusPopup: { bonus: number; timer: number } | null = null;
+  // Shared UI slot at game-state +0x209f0. Type 2 announces border start;
+  // type 4 shows the natural-end reward. Th07.exe FUN_0042645b @ 0x42645b.
+  borderMessage: { type: 2 | 4; value: number; age: number; timer: number } | null = null;
+  // FUN_0043eb00 @ 0x43eb00 creates a fixed-center cancel circle on a
+  // border break: radius 32, +16/frame, 50 subsequent ticks.
+  borderClearWave: { x: number; y: number; radius: number; ticksLeft: number; createdFrame: number } | null = null;
   // Mirrors Th07.exe DAT_012f40a8's 1 -> 2 "phase failed by timeout" bump:
   // set by the timer-callback path, consumed by endBossSpell to skip the
   // scored field sweep, cleared by the next declare.
@@ -244,9 +254,8 @@ export class StageScene implements GameHost {
   // line of the declaration banner. The original persists this in
   // score.dat across runs — out of scope here (AGENTS.md §7).
   private spellHistory = new Map<number, { seen: number; got: number }>();
-  // Latched when the pre-boss dialogue starts: stage 1's ename.png rows are
-  // 0 = Cirno (midboss, no dialogue) and 1 = Letty (after the dialogue) —
-  // stage-1 heuristic, TH07-TODO a data-driven boss->nameplate mapping.
+  // Each stage owns two consecutive ename.png rows: midboss, then boss.
+  // Dialogue starts only for the latter and latches the within-stage row.
   private dialogueSeen = false;
   private eff01Pattern: CanvasPattern | null = null;
 
@@ -306,9 +315,35 @@ export class StageScene implements GameHost {
     );
     this.cherry = new CherrySystem(
       {
-        onBorderStart: () => this.playSfx(32),
-        onBorderEnd: (result) => {
-          if (result === 'survived') this.playSfx(36);
+        borderStartAction: () => {
+          const p = this.playerObj;
+          // FUN_0043e890 @ 0x43e890: state 1/3, an active bomb, or a
+          // blocked dialogue/transition records marker 2 and retries later.
+          if (this.isDialogueBlocking() || p.bombTimer > 0 || p.bombInvuln > 0 ||
+              p.invulnFrames > 0 || p.materializeFrame >= 0 || p.dyingFrame >= 0) {
+            return 'defer';
+          }
+          // State 2 with a live deathbomb meter consumes the pending border
+          // through FUN_0043eb00: no miss, no border timer, 40f invulnerability.
+          if (p.deathTimer >= 0) return 'cancel';
+          return 'start';
+        },
+        onBorderStart: () => {
+          // Th07.exe FUN_0043e890 @ 0x43eaba-0x43ead7.
+          this.playSfx(32);
+          this.playSfx(36);
+          this.borderMessage = { type: 2, value: 0, age: 0, timer: 180 };
+        },
+        onBorderCancel: () => this.applyBorderBreakEffects(null, true),
+        onBorderEnd: (result, bonus) => {
+          if (result === 'survived') {
+            // FUN_0043e620 @ 0x43e620: natural expiry enters state 3 for
+            // 40 frames and displays post-award cherry*10, while score gains
+            // post-award cherry*1.
+            this.playerObj.invulnFrames = Math.max(this.playerObj.invulnFrames, 40);
+            this.borderMessage = { type: 4, value: bonus * 10, age: 0, timer: 180 };
+            this.playSfx(33);
+          }
         }
       },
       difficulty
@@ -464,10 +499,11 @@ export class StageScene implements GameHost {
     const entry = CHARACTERS[this.playerObj.character].family * 10 + index;
     this.dialogue = new DialogueRunner(this.runtime.msg, entry, {
       playBgm: (track) => {
-        // MSG op 7's arg is the 0-based thbgm track index (stage 1's boss
-        // dialogue passes 2 = th07_03); generalize to th07_NN.
-        const name = `th07_${String(track + 1).padStart(2, '0')}`;
-        this.audio.playBgm(name);
+        // Th07.exe FUN_00428392 case 7 (@ 0x4288ae): the argument indexes
+        // this stage's BGM descriptor table, not the global thbgm list.
+        // Every original pre-boss MSG uses slot 1 (the boss theme).
+        const name = stageBgmTrack(this.stageNumber, track);
+        if (name) this.audio.playBgm(name);
       },
       fadeBgm: () => this.audio.fadeOutBgm(4)
     });
@@ -642,15 +678,52 @@ export class StageScene implements GameHost {
     this.cherry.debugAddCherry(v);
   }
 
+  // Test/debug-only: replace the live field with a deterministic three-shot
+  // border-break fixture, reusing a real parsed bullet frame. The production
+  // game never calls this; it gives the text-mode probe one direct hit, one
+  // wave-cancellable bullet at 160px, and one 0x1000-immune bullet beside it.
+  debugPrimeBorderCollision(): boolean {
+    const source = this.enemyBullets.find((b) => !b.dead);
+    if (!source) return false;
+    const p = this.playerObj;
+    const make = (x: number, flags: number): EnemyBullet => ({
+      ...source,
+      id: this.id++,
+      x,
+      y: p.y,
+      vx: 0,
+      vy: 0,
+      speed: 0,
+      angle: 0,
+      age: 16,
+      flags,
+      grazed: false,
+      spawnDuration: 0,
+      spawnMoveScale: 1,
+      exFlags: 0,
+      exAccel: null,
+      exAngle: null,
+      exDir: null,
+      exBounce: null,
+      dirTimes: undefined,
+      dead: false
+    });
+    this.enemyBullets.length = 0;
+    this.enemyBullets.push(
+      make(p.x, 0),
+      make(p.x + 160, 0),
+      make(p.x + 160, 0x1000)
+    );
+    return true;
+  }
+
   playBgmTrack(name: string): void {
     this.audio.playBgm(name);
   }
 
-  // ECL op 125 ("STD unpause") is a no-op here: stage1.std's script clock
-  // never actually pauses (that reading of op 5 was wrong — op 5 is the
-  // camera-position keyframe; see formats/std.ts), so there's nothing to
-  // release. Kept only to satisfy GameHost / the original opcode table.
-  unpauseStd(): void {}
+  unpauseStd(label: number): void {
+    this.runtime.std.requestResume(label);
+  }
 
   // -- update ----------------------------------------------------------------
 
@@ -699,8 +772,14 @@ export class StageScene implements GameHost {
     // rescues you. Blocked during the death squish / materialize (controllable
     // false, deathTimer < 0) and while a dialogue box is up (no damage in/out).
     if (!frozen && input.pressed.has('bomb') && (p.controllable || p.deathTimer >= 0) && !this.gameOver) {
-      if (p.tryBomb()) {
-        this.cherry.onBomb();
+      if (this.cherry.borderEngaged) {
+        // Th07.exe FUN_0043d9a0 @ 0x43d9e8-0x43da17: bombing during a
+        // border invokes the same free break as a hit. It spends no bomb,
+        // then flags every existing item for collection.
+        if (this.breakBorder(null)) {
+          for (const it of this.items) if (!it.dead) it.state = 1;
+        }
+      } else if (p.tryBomb()) {
         this.voidSpellCapture();
         // Th07.exe bomb trigger @ all.c:28503-28506: zeroes the pending
         // spell bonus and latches DAT_012f40bc = spell-active state.
@@ -708,6 +787,7 @@ export class StageScene implements GameHost {
         this.onBombUsed();
       }
     }
+    if (!frozen) this.cherry.retryBorderStart();
     // Movement runs every frame, dialogue or not.
     p.update(input);
     this.focusHeld = p.focusHeld;
@@ -762,6 +842,10 @@ export class StageScene implements GameHost {
       }
     }
     if (this.bonusPopup && --this.bonusPopup.timer <= 0) this.bonusPopup = null;
+    if (this.borderMessage) {
+      this.borderMessage.age++;
+      if (--this.borderMessage.timer <= 0) this.borderMessage = null;
+    }
     if (!this.stageClear && this.runtime.isTimelineComplete() && !this.bossActive && this.enemies.length <= 1) {
       this.clearTimer++;
       if (this.clearTimer > 180) {
@@ -770,9 +854,11 @@ export class StageScene implements GameHost {
         this.computeClearBonus();
       }
     }
-    const borderBonus = this.cherry.tick();
-    if (borderBonus > 0) this.addScore(borderBonus);
     if (!frozen) {
+      // FUN_0043eef0 returns before the state-4 border timer while dialogue
+      // freeze DAT_0061c25c is set; the 540-frame clock pauses with gameplay.
+      const borderBonus = this.cherry.tick();
+      if (borderBonus > 0) this.addScore(borderBonus);
       this.runtime.update(this);
       this.updateEnemies();
       this.updatePlayerBullets();
@@ -935,11 +1021,7 @@ export class StageScene implements GameHost {
   // squish, matching Th07.exe fcn.0043dca0.
   private onPlayerDeath(): void {
     const p = this.playerObj;
-    // exe-cherry-border.md §3d: the traced rate source is a per-stage
-    // config float, not the SHT's per-character cherryLossOnDeath field
-    // (still parsed on `p.unfocused` but unused here — see cherry.ts
-    // CherrySystem#onDeath).
-    this.cherry.onDeath(p.character.startsWith('sakuya'));
+    this.cherry.onDeath(p.sht.cherryLossOnDeath, p.character.startsWith('sakuya'));
     this.voidSpellCapture();
     this.playSfx(4);
     this.spawnEffectParticles(3, p.x, p.y, 32, 0xffffffff);
@@ -1225,8 +1307,8 @@ export class StageScene implements GameHost {
     const hit = p.hitboxHalf;
     // The Supernatural Border does NOT make the player skip collision: a
     // bullet (or body) reaching the kill hitbox BREAKS the border instead of
-    // killing -- onPlayerHit() calls cherry.breakBorder(), which absorbs the
-    // hit (brief invuln, no death) and forfeits the survive bonus. So the same
+    // killing -- onPlayerHit() enters the 40-frame state-3 invulnerability
+    // and creates the original expanding cancel field. So the same
     // graze+kill path below runs whether or not a border is up; only the
     // outcome of a kill contact differs. (A prior version special-cased the
     // border here with a graze-only early return, which made it fully
@@ -1244,7 +1326,7 @@ export class StageScene implements GameHost {
       }
       // exe FUN_004241c0: kill test runs from spawn; only graze has a min age (outer gate +0xbf0 unresolved)
       if (dx <= b.grazeW / 2 + hit && dy <= b.grazeH / 2 + hit) {
-        this.onPlayerHit();
+        this.onPlayerHit(b);
         return;
       }
     }
@@ -1252,7 +1334,7 @@ export class StageScene implements GameHost {
       if (!l.inUse) continue;
       const result = this.checkLaserCollision(l);
       if (result === 'hit') {
-        this.onPlayerHit();
+        this.onPlayerHit(null);
         return;
       }
       if (result === 'graze') this.onGrazeAward();
@@ -1261,7 +1343,7 @@ export class StageScene implements GameHost {
       if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead) continue;
       // Th07.exe FUN_0041ebc0: body kill uses hitbox*(1/1.5)/2 = /3
       if (Math.abs(e.x - px) <= e.ecl.hitbox.x / 3 + hit && Math.abs(e.y - py) <= e.ecl.hitbox.y / 3 + hit) {
-        this.onPlayerHit();
+        this.onPlayerHit(null);
         return;
       }
     }
@@ -1296,21 +1378,55 @@ export class StageScene implements GameHost {
     this.playSfx(30);
   }
 
-  private onPlayerHit(): void {
+  private onPlayerHit(sourceBullet: EnemyBullet | null): void {
     const p = this.playerObj;
     // An invulnerable player (spawn/bomb invuln, or already in the
     // deathbomb window) takes no hit outcome at all in the exe — in
     // particular a contact during invuln must NOT break the border.
-    // (Breaking it before this check let one absorbed hit's 30 invuln
+    // (Breaking it before this check let one absorbed hit's invulnerability
     // frames chain-eat every subsequent border the instant it started.)
     if (p.invulnFrames > 0 || p.bombInvuln > 0 || p.deathTimer >= 0) return;
-    if (this.cherry.breakBorder()) {
-      // The border absorbs the hit.
-      p.invulnFrames = Math.max(p.invulnFrames, 30);
-      return;
-    }
+    if (this.breakBorder(sourceBullet)) return;
     const result = p.hit();
     if (result === 'deathbomb-window') this.playSfx(20);
+  }
+
+  private breakBorder(sourceBullet: EnemyBullet | null): boolean {
+    if (!this.cherry.breakBorder()) return false;
+    this.applyBorderBreakEffects(sourceBullet, false);
+    return true;
+  }
+
+  private applyBorderBreakEffects(sourceBullet: EnemyBullet | null, rescueDeathbomb: boolean): void {
+    const p = this.playerObj;
+    // Direct collision result 1 deletes the touching bullet without an item;
+    // only later result-2 contacts with the expanding field drop power.
+    if (sourceBullet) sourceBullet.dead = true;
+    if (rescueDeathbomb) p.deathTimer = -1;
+    this.voidSpellCapture();
+    p.invulnFrames = Math.max(p.invulnFrames, 40);
+    this.borderClearWave = { x: p.x, y: p.y, radius: 32, ticksLeft: 50, createdFrame: this.frame };
+    // Th07.exe FUN_0043eb00 @ 0x43ed6c-0x43ed89.
+    this.playSfx(7);
+    this.playSfx(33);
+    // The original bullet loop can test later pool entries against the new
+    // radius-32 field on the creation frame. Sweep once now; the direct
+    // source is already dead and therefore produces no item.
+    this.sweepBorderClearWave();
+  }
+
+  private sweepBorderClearWave(): void {
+    const wave = this.borderClearWave;
+    if (!wave) return;
+    for (const b of this.enemyBullets) {
+      if (b.dead || (b.flags & 0x1000) !== 0) continue;
+      const dx = b.x - wave.x;
+      const dy = b.y - wave.y;
+      if (dx * dx + dy * dy < wave.radius * wave.radius) {
+        this.spawnItem('power', b.x, b.y, { state: 1 });
+        b.dead = true;
+      }
+    }
   }
 
   private updateEnemies(): void {
@@ -1346,8 +1462,25 @@ export class StageScene implements GameHost {
   }
 
   private updateBullets(): void {
+    const wave = this.borderClearWave;
+    if (wave && wave.createdFrame < this.frame) {
+      // FUN_0043d8f0 updates the zone before the bullet manager tests it.
+      wave.radius += 16;
+      wave.ticksLeft--;
+    }
     for (const b of this.enemyBullets) {
+      if (b.dead) continue;
       this.updateBulletMotion(b);
+      if (wave && !b.dead && (b.flags & 0x1000) === 0) {
+        const dx = b.x - wave.x;
+        const dy = b.y - wave.y;
+        // FUN_0043b040 uses a strict center-distance circle test; swept
+        // bullets become auto-collecting type-0 power items.
+        if (dx * dx + dy * dy < wave.radius * wave.radius) {
+          this.spawnItem('power', b.x, b.y, { state: 1 });
+          b.dead = true;
+        }
+      }
       const exActive = (b.flags & (0x40 | 0x80 | 0x100 | 0x400 | 0x800)) !== 0;
       const margin = exActive ? 160 : 32;
       if (b.x < -margin || b.x > 384 + margin || b.y < -margin || b.y > 448 + margin) b.dead = true;
@@ -1355,6 +1488,7 @@ export class StageScene implements GameHost {
     let w = 0;
     for (const b of this.enemyBullets) if (!b.dead) this.enemyBullets[w++] = b;
     this.enemyBullets.length = w;
+    if (wave && wave.ticksLeft <= 0) this.borderClearWave = null;
   }
 
   // Per-frame bullet ex-behaviors, matching Th07.exe FUN_004241c0 @ 0x4241c0.
@@ -1733,6 +1867,7 @@ export class StageScene implements GameHost {
       }
       this.drawLasers(r, ox, oy);
       for (const b of this.enemyBullets) {
+        if (b.dead) continue;
         const spawning = b.age < b.spawnDuration;
         r.drawSprite(b.rect.imageKey, b.rect.x, b.rect.y, b.rect.w, b.rect.h, ox + b.x, oy + b.y, {
           rotation: b.angle + Math.PI / 2,
@@ -1811,11 +1946,27 @@ export class StageScene implements GameHost {
     this.drawSpellOverlay(r);
     this.drawDialogue(r);
     this.drawStageTitle(r);
+    if (this.borderMessage) this.drawBorderMessage(r);
     if (this.bonusPopup) this.drawSpellBonusPopup(r);
     if (this.bossActive) this.drawBossMarker(r);
     if (this.stageClear) this.drawStageClear(r);
     if (this.continueScreen) this.drawContinueScreen(r);
     else if (this.gameOver) r.text('GAME OVER', PLAYFIELD.x + 140, PLAYFIELD.y + 200, { size: 20, color: '#f66' });
+  }
+
+  // Shared Full-Power/Border message slot, exact text/timing/slide from
+  // FUN_0042645b + FUN_00425dd1 (all.c:16941-16959, 17138-17169,
+  // 18287-18300). The original uses ascii.anm's 16px glyphs at x scale .9;
+  // canvas text is the existing glyph fallback, but coordinates and color
+  // are recovered constants rather than hand-tuned placement.
+  private drawBorderMessage(r: Renderer): void {
+    const msg = this.borderMessage;
+    if (!msg) return;
+    const x = msg.age < 30 ? 416 - (312 * msg.age) / 30 : 104;
+    const text = msg.type === 2
+      ? 'Supernatural Border!!'
+      : `Border Bonus ${String(Math.trunc(msg.value)).padStart(7, ' ')}`;
+    r.text(text, x, 168, { size: 16, color: '#e0b0ff', stroke: false });
   }
 
   // Spell Card Bonus! popup — spec-ui-stageclear.md §4 / all.c:17171-17193.
@@ -1845,7 +1996,7 @@ export class StageScene implements GameHost {
   // Boss X-position marker at the playfield bottom edge. Exact sprite not
   // recovered from front.anm (spec-ui-stageclear.md §3 — PROBABLE lead is
   // _DAT_004b5ee0 feed); fall back to a small "Enemy" label at ~60% alpha
-  // tracking boss.x, clamped to the playfield (GLM-PLAN-2 step 3).
+  // tracking boss.x, clamped to the playfield.
   private drawBossMarker(r: Renderer): void {
     const boss = this.bossActive;
     if (!boss) return;
@@ -1971,10 +2122,8 @@ export class StageScene implements GameHost {
     return x + s.length * DIGIT_W;
   }
 
-  // Background ANM scripts (stg1bg scripts 0-2) are static, time-driven
-  // scripts with no per-instance branching, so one cached AnmRunner per
-  // script id — stepped forward to the current STD frame — is shared by
-  // every quad instance that references it.
+  // Regular background quad VMs run on Std#animationFrame, which never
+  // pauses or rewinds with the script clock (FUN_00406850 @ 0x406850).
   private bgAnmFrame(scriptId: number, targetFrame: number): AnmFrame | null {
     let entry = this.bgAnmCache.get(scriptId);
     if (!entry || targetFrame < entry.frame) {
@@ -1993,16 +2142,36 @@ export class StageScene implements GameHost {
     return entry.runner.spriteFrame();
   }
 
+  private specialBgAnmFrame(slot: number, state: { script: number; age: number } | null): AnmFrame | null {
+    if (!state) {
+      this.specialBgAnmCache[slot] = null;
+      return null;
+    }
+    let entry = this.specialBgAnmCache[slot];
+    if (!entry || entry.script !== state.script || state.age < entry.age) {
+      const ref = this.bgScripts.get(state.script);
+      if (!ref) return null;
+      entry = {
+        script: state.script,
+        runner: new AnmRunner(ref.anm, ref.localId, { entryIndex: ref.entryIndex, spriteIndexOffset: ref.spriteBase }),
+        age: 0
+      };
+      this.specialBgAnmCache[slot] = entry;
+    }
+    while (entry.age < state.age) {
+      entry.runner.update();
+      entry.age++;
+    }
+    return entry.runner.spriteFrame();
+  }
+
   // Pseudo-3D stage background: STD quad instances, perspective-projected
   // (see Std#project for the world-space axis convention this relies on),
   // subdivided along depth into strips for perspective-correct-enough
   // texture mapping, sorted back-to-front, with linear distance fog.
   private drawBackground(r: Renderer, ox: number, oy: number): void {
     const std = this.runtime.std;
-    // The STD script clock free-runs every frame (advanced in
-    // StageRuntime#update); stage 1's script loops it between frames
-    // 5510-6022 during the boss fight (ins_4), which Std#advance handles
-    // generically, so std.frame is always the right clock to render from.
+    // Camera/fog use script time; quad textures use independent VM time.
     const frame = std.frame;
     const camFrame = std.cameraFrame(frame);
     const fog = std.fog(frame);
@@ -2011,6 +2180,13 @@ export class StageScene implements GameHost {
     // quads blend toward it with distance below.
     ctx.fillStyle = fog.css;
     ctx.fillRect(ox, oy, PLAYFIELD.width, PLAYFIELD.height);
+
+    // FUN_00405a30 draws the primary VM, then secondary, before ordinary
+    // stage geometry. Their ANM scripts carry screen-space positions.
+    const primary = this.specialBgAnmFrame(0, std.primaryAnm);
+    const secondary = this.specialBgAnmFrame(1, std.secondaryAnm);
+    if (primary) r.drawAnmFrame(primary, 0, 0);
+    if (secondary) r.drawAnmFrame(secondary, 0, 0);
 
     const playfield = { x: ox, y: oy, width: PLAYFIELD.width, height: PLAYFIELD.height };
 
@@ -2063,7 +2239,7 @@ export class StageScene implements GameHost {
     const focalDist = (PLAYFIELD.height / 2) / Math.tan(std.fov / 2);
     const jobs: Job[] = [];
     for (const c of candidates) {
-      const spriteFrame = this.bgAnmFrame(c.script, frame);
+      const spriteFrame = this.bgAnmFrame(c.script, std.animationFrame);
       if (!spriteFrame || spriteFrame.alpha <= 0) continue;
       const tl = std.project(c.lateral0, c.depth0, c.height, camFrame, playfield);
       const tr = std.project(c.lateral1, c.depth0, c.height, camFrame, playfield);
@@ -2401,21 +2577,11 @@ export class StageScene implements GameHost {
       }
       const seconds = Math.max(0, Math.trunc((this.timerThreshold() - this.bossActive.ecl.bossTimer) / 60));
       this.drawNumber(r, seconds, PLAYFIELD.x + PLAYFIELD.width - 20, PLAYFIELD.y + 4, 2);
-      // Boss nameplate: ename.png 16px rows composited at (32,26) (AGENTS.md
-      // §6). Row selection is the stage-1 heuristic from dialogueSeen (0 =
-      // Cirno midboss, 1 = Letty after the pre-boss dialogue).
+      // ename.png rows 0..15 are stage pairs: midboss, then dialogue boss.
       if (!this.dialogue) {
-        this.blit(r, 'ename', [0, this.dialogueSeen ? 16 : 0, 128, 16], 32, 26);
+        const row = 2 * (this.stageNumber - 1) + (this.dialogueSeen ? 1 : 0);
+        this.blit(r, 'ename', [0, row * 16, 128, 16], 32, 26);
       }
-      // Enemy position marker on the bottom edge (PCB feature).
-      const bx = PLAYFIELD.x + Math.max(0, Math.min(PLAYFIELD.width, this.bossActive.x));
-      ctx.fillStyle = '#f8bcd0';
-      ctx.beginPath();
-      ctx.moveTo(bx - 7, PLAYFIELD.y + PLAYFIELD.height);
-      ctx.lineTo(bx + 7, PLAYFIELD.y + PLAYFIELD.height);
-      ctx.lineTo(bx, PLAYFIELD.y + PLAYFIELD.height - 8);
-      ctx.closePath();
-      ctx.fill();
     }
   }
 

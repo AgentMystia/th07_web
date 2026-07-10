@@ -44,7 +44,8 @@ for (let done = 0; done < frames; done += 30) {
 }
 await page.screenshot({ path: out });
 const snap = await page.evaluate(() => window.__TH07_TEST__.snapshot());
-console.log(JSON.stringify({ frame: snap.frame, enemies: snap.enemies, bullets: snap.bullets, playerBullets: snap.playerBullets, score: snap.score, boss: snap.bossActive, spell: snap.spellName }));
+const bgm = await page.evaluate(() => window.__TH07_TEST__.bgm());
+console.log(JSON.stringify({ frame: snap.frame, enemies: snap.enemies, bullets: snap.bullets, playerBullets: snap.playerBullets, score: snap.score, boss: snap.bossActive, spell: snap.spellName, bgm }));
 if (errors.length) console.log('PAGE ERRORS:', JSON.stringify(errors.slice(0, 5)));
 await browser.close();
 server.close();
