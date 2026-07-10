@@ -20,6 +20,7 @@ export class DialogueRunner {
   private idx = 0;
   private time = 0;
   private waitTimer = 0;
+  private waitAge = 0;
   done = false;
   resumeTicket = false;
   lines: (string | null)[] = [null, null];
@@ -41,16 +42,27 @@ export class DialogueRunner {
     if (!this.instrs.length) this.done = true;
   }
 
-  update(confirmPressed: boolean): void {
+  // Th07.exe MSG interpreter FUN_00428392 @ 0x428392, case 4 (all.c:
+  // 17849-17858): a wait ends on (a) timeout, (b) a Z press edge once the
+  // wait is >= 12 frames old — NOT gated by op 13 — or (c) the CTRL
+  // fast-forward (input bit 0x100), which IS gated by op 13 skippability
+  // and at the interpreter top jumps the clock straight to the next
+  // instruction's timestamp. The old runner gated the Z-advance on op 13,
+  // which made the post-boss dialogue's 300/900/1200-frame tail waits
+  // unskippable.
+  update(confirmPressed: boolean, skipHeld = false): void {
     if (this.done) return;
     for (const p of this.portraits) {
       if (p.visible && p.slideIn < 1) p.slideIn = Math.min(1, p.slideIn + 0.1);
     }
     if (this.bossIntroTimer > 0) this.bossIntroTimer--;
     if (this.waitTimer > 0) {
-      if (confirmPressed && this.skippable) {
+      const ctrlCut = this.skippable && skipHeld;
+      const zCut = confirmPressed && this.waitAge >= 12;
+      if (ctrlCut || zCut) {
         this.waitTimer = 0;
       } else {
+        this.waitAge++;
         this.waitTimer--;
         return;
       }
@@ -90,6 +102,7 @@ export class DialogueRunner {
         }
         case 4:
           this.waitTimer = instr.arg ?? 0;
+          this.waitAge = 0;
           return;
         case 5: {
           const p = this.portraits[instr.portrait ?? 0];
