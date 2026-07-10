@@ -18,7 +18,7 @@ test('border triggers at 50000 cherry+ and survives with bonus (§4)', () => {
   const events = [];
   const c = new CherrySystem({
     onBorderStart: () => events.push('start'),
-    onBorderEnd: (r) => events.push(r)
+    onBorderEnd: (result, value) => events.push([result, value])
   });
   // 28-damage fodder hits give 10 cherry each (floor(28/28)*10=10); 5000 of
   // them reach the 50000 cherryPlus trigger deterministically.
@@ -32,10 +32,46 @@ test('border triggers at 50000 cherry+ and survives with bonus (§4)', () => {
   // default difficulty Normal: initial cherryMax 200000 (FUN_0042cf2f)
   // + 10000 border-survive bump
   assert.equal(c.cherryMax, 210000);
-  // §4 CONFIRMED: survive bonus = cherry (×1, not ×10 -- the exe's
-  // `bonus*10` immediately `/10` is a lossless compiler no-op).
-  assert.equal(bonus, 50000);
-  assert.deepEqual(events, ['start', 'survived']);
+  assert.equal(c.cherry, 60000);
+  // §4 CONFIRMED: +10000 is applied first, then the post-add cherry is
+  // credited at ×1. The separate popup argument is this value ×10.
+  assert.equal(bonus, 60000);
+  assert.deepEqual(events, ['start', ['survived', 60000]]);
+});
+
+test('border request defers and retries while player state is blocked', () => {
+  let action = 'defer';
+  const events = [];
+  const c = new CherrySystem({
+    borderStartAction: () => action,
+    onBorderStart: () => events.push('start')
+  });
+  c.debugAddCherry(CHERRY_PLUS_MAX);
+  assert.equal(c.borderActive, false);
+  assert.equal(c.borderPending, true);
+  assert.equal(c.borderEngaged, true);
+  assert.equal(c.cherryPlus, CHERRY_PLUS_MAX);
+  assert.equal(c.tick(), 0);
+  action = 'start';
+  c.retryBorderStart();
+  assert.equal(c.borderActive, true);
+  assert.equal(c.borderPending, false);
+  assert.equal(c.borderTimer, BORDER_DURATION);
+  assert.equal(c.cherryPlus, 0);
+  assert.deepEqual(events, ['start']);
+});
+
+test('pending border can cancel into deathbomb rescue without starting', () => {
+  let cancelled = 0;
+  const c = new CherrySystem({
+    borderStartAction: () => 'cancel',
+    onBorderCancel: () => cancelled++
+  });
+  c.debugAddCherry(CHERRY_PLUS_MAX);
+  assert.equal(cancelled, 1);
+  assert.equal(c.borderEngaged, false);
+  assert.equal(c.cherryPlus, 0);
+  assert.equal(c.borderTimer, 0);
 });
 
 test('border break absorbs hit, no bonus, cherry+ resets', () => {
@@ -146,13 +182,21 @@ test('point item score gets a cherry-headroom bonus below 50000, capped down abo
   assert.equal(c.pointItemScore(100, 128, false), 7500); // 75000/10
 });
 
-test('death loses floor10(min(cap, round(cherry*0.5))); cherry never exceeds max (§3d, RATE PROBABLE)', () => {
+test('death uses the selected SHT cherry-loss ratio and character-specific cap (§3d)', () => {
   const c = new CherrySystem();
   for (let i = 0; i < CHERRY_PLUS_MAX / 10; i++) fodderHit(c, 28);
   assert.equal(c.cherry, 50000); // 5000 hits x 10
-  c.onDeath(false); // not Sakuya: cap=100000, not binding here
+  c.onDeath(0.5, false); // Reimu/Marisa SHT rate; cap=100000, not binding
   assert.equal(c.cherry, 25000); // floor10(round(50000*0.5))
   assert.equal(c.cherryPlus, 0);
+
+  c.cherry = 50000;
+  c.onDeath(0.33000001311302185, true); // exact f32 carried by Sakuya SHTs
+  assert.equal(c.cherry, 33500); // 50000 - floor10(round(16500.000655...))
+
+  c.cherry = 200000;
+  c.onDeath(0.5, true);
+  assert.equal(c.cherry, 140000); // Sakuya penalty is capped at 60000
 });
 
 test('boss timeout costs exactly 25% of cherry, floored to 10, no cap (§3e CONFIRMED)', () => {

@@ -7,6 +7,12 @@ export type ItemType =
 
 export interface EnemyBullet {
   id: number;
+  // Stable slot in Th07.exe's fixed 0x400-entry bullet pool. Effects scan
+  // this identity in slot order, independently of the browser-side array.
+  poolSlot: number;
+  // Shared special-effect state (bullet +0xc08). Different op121/122 effect
+  // callbacks deliberately reuse it as a state, countdown, or laser id.
+  effectState: number;
   x: number;
   y: number;
   vx: number;
@@ -62,6 +68,8 @@ export interface BulletExSlot {
 // +0x4e0.
 export interface EnemyLaser {
   id: number;
+  // Stable slot in Th07.exe's fixed 64-entry enemy-laser pool.
+  poolSlot: number;
   ownerId: number;
   inUse: boolean;
   sprite: number;
@@ -83,6 +91,8 @@ export interface EnemyLaser {
   flags: number;
   state: number;
   phaseFrame: number;
+  // Fractional accumulator for phaseFrame under global slow motion.
+  phaseFrac?: number;
   hideTipDuringGrow: boolean;
 }
 
@@ -127,6 +137,12 @@ export interface GameHost {
   power: number;
   score: number;
   timeStopped?: boolean;
+  // Global slow-motion rate (exe DAT_0056baa8, spec-slowmo.md): 1.0 normal;
+  // bullet-effect 10 writes 1/param, effect 11 restores 1.0. Continuous
+  // motion multiplies by it per frame; discrete timers accumulate it
+  // fractionally; collision always runs at wall clock.
+  slowRate?: number;
+  setSlowRate?(rate: number): void;
   addScore(v: number): void;
   spawnItem(type: ItemType, x: number, y: number, options?: { state?: number; vx?: number; vy?: number }): void;
   spawnEffectParticles(effectId: number, x: number, y: number, count: number, color: number): void;
@@ -151,6 +167,10 @@ export interface GameHost {
   // +0x37a160, FUN_00421a40) with no score popup. Runs at op80, spell
   // declare (op90) and the full-power crossing.
   cancelBulletsToItems(): void;
+  // Floating score/cherry number popup (spec-popups.md): value < 0 draws
+  // the single sentinel glyph; color is D3D ARGB. Popups never move or
+  // expire — they live until their ring slot is reused.
+  spawnScorePopup?(value: number, x: number, y: number, color: number): void;
   // Frames remaining of the exe's post-field-clear laser-spawn suppression
   // (gamestate+0x37a12c, set to 10 by every FUN_00422ea0 call; op-82/83
   // fires are gated on it unless the laser is bomb-immune, all.c:15737).
@@ -159,6 +179,12 @@ export interface GameHost {
   awardCherry?(v: number): void;
   // Bullet-effect id 20: hardcoded BGM cue (Yuyuko phase 2, th07_13b).
   playBgmTrack?(name: string): void;
+  // Bullet-effect id 19 (FUN_00418ee0): three-second BGM fade-out.
+  fadeBgm?(seconds: number): void;
+  // Screen FX scheduler (exe FUN_004459c0): type-1 shake (magnitude ramps
+  // from->to over duration) and type-3 repeating full-screen tint flash.
+  startScreenShake?(duration: number, from: number, to: number): void;
+  startScreenFlash?(duration: number, repeats: number, argb: number): void;
   // FUN_00422ea0's laser half: graceful-cancel non-bomb-immune lasers
   // (unconditional = the bombType-10 spell-timeout variant).
   cancelLasers?(unconditional: boolean): void;
@@ -172,14 +198,21 @@ export interface GameHost {
   // (exe flags +0x2e2a bit6 == 0): cherry -25% (FUN_0041e6b0's
   // floor10(cherry*0.25) penalty) — applies to nonspell timeouts too.
   onBossPhaseTimeout?(): void;
-  unpauseStd(): void;
+  unpauseStd(label: number): void;
 }
 
 export interface EclContext {
   subId: number;
   index: number; // instruction index within sub
   time: number;
+  // Fractional accumulator for the script clock under global slow motion
+  // (exe: split (int, frac) counter at enemy+0x6f0/+0x6ec advanced by
+  // FUN_00436acc at the DAT_0056baa8 rate; spec-slowmo.md §5).
+  timeFrac: number;
   windowBase: number; // register-window offset into EclState.vars
+  // op45 wait countdown (exe context +0x80 == enemy +0x764/+0x76c).
+  // CALL saves/restores it with the rest of the 0x218-byte ECL context.
+  waitTimer: number;
 }
 
 export interface EclState {
@@ -208,30 +241,32 @@ export interface EclState {
   // live from the arming instruction each frame (paramOff = absolute byte
   // offset of arg1 in the ECL image).
   effectArm: { id: number; paramOff: number } | null;
+  // FUN_00416d00 sets enemy +0x2e2b bit0 on the first effect-0 callback.
+  // No instruction clears it: normal movement stays disabled for the rest
+  // of this entity's lifetime, even after op122 disarms the callback.
+  movementSuppressedByEffect0: boolean;
   // op144 periodic gosub (exe +0x2f58/+0x2f64/+0x2ee4): every `period`
   // frames, nested call into subId; -1 disarms.
   periodicSub: { period: number; subId: number; elapsed: number } | null;
-  // op145 remote pending-sub request (exe +0x2b08), drained at frame top.
-  pendingSub: number;
+  // Pending interrupt-table index (exe +0x2b08), written by op109/timeline
+  // op10/op145 and drained through the op108 table at frame/interpreter top.
+  pendingInterrupt: number;
   // op153 secondary shot-collision extent triple (exe +0x2b48/4c/50).
   hitbox2: { x: number; y: number; z: number } | null;
   moveMode: number;
   interpKind: number;
   interp: { start: { x: number; y: number; z: number }; delta: { x: number; y: number; z: number }; duration: number; left: number } | null;
-  // mode-3 orbit group (exe +0x2b5c/60/6c/70/8c-94/a0/a4), see
+  // mode-3 orbit group (exe +0x2b5c/60/6c/70/8c-94), see
   // reference/re-specs/exe-enemy-move-fields.md §3 Group B / §5.1.
   orbitAngle: number;
   orbitAngularVelocity: number;
   orbitSpeed: number;
   orbitAcceleration: number;
   orbitTarget: { x: number; y: number; z: number };
-  orbitDuration: number; // 0 = never auto-stop (exe +0x2ba4)
-  orbitLeft: number; // countdown (exe +0x2ba0)
-  // "active" countdown (exe +0x76c, op 45 SetActiveTimer): while > 0, gates
-  // ECL timeline advance + movement modes 1/2/3 (not mode 0's axisSpeed) --
-  // see spec §2 / §5.4. Defaults to Infinity so enemies that never call op45
-  // (the overwhelming majority) are unaffected.
-  activeTimer: number;
+  // Shared movement-mode timer (+0x2ba4/+0x2ba0). Ops 56/60 use it for
+  // mode 3; op59 uses the same fields for a bounded mode-1 move.
+  orbitDuration: number; // 0 = never auto-stop
+  orbitLeft: number;
   bulletProps: BulletProps | null;
   bulletSfx: number;
   // op-79 template slots, indexed by arg0 (0..4). Persist across FIREs (exe
@@ -258,6 +293,8 @@ export interface EclState {
   timerCallbackThreshold: number;
   timerCallbackSub: number;
   bossTimer: number;
+  // Fractional accumulator for bossTimer under global slow motion.
+  bossTimerFrac?: number;
   currentAnm: number;
   anmRunner: AnmRunner | null;
   anmSlots: ({ script: number; runner: AnmRunner | null } | null)[];
@@ -273,11 +310,13 @@ export interface EclState {
   frameVx: number;
   frameVy: number;
   anmRotateWithAngle: boolean;
+  // ECL op150 (exe case 0x95): absolute Z rotation written into the enemy's
+  // embedded ANM VM (+8), consumed by the sprite draw (radians).
+  anmRotZ?: number;
   bossLifeCount: number;
   lasers: (EnemyLaser | null)[];
   laserStore: number;
   interrupts: number[];
-  runInterrupt: number;
   disableCallStack: boolean;
   invisible: boolean;
   spellTimeoutFlag: boolean;

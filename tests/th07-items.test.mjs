@@ -7,11 +7,12 @@ import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 
-mkdirSync('tests/.build', { recursive: true });
-execSync('npx esbuild src/formats/anm.ts --bundle --format=esm --outfile=tests/.build/anm.mjs --log-level=silent');
-execSync('npx esbuild src/data/th07-data.ts --bundle --format=esm --outfile=tests/.build/th07-data.mjs --log-level=silent');
-const { Anm } = await import('../tests/.build/anm.mjs');
-const { TH07_DATA } = await import('../tests/.build/th07-data.mjs');
+const outDir = 'tests/.build/items';
+mkdirSync(outDir, { recursive: true });
+execSync(`npx esbuild src/formats/anm.ts --bundle --format=esm --outfile=${outDir}/anm.mjs --log-level=silent`);
+execSync(`npx esbuild src/data/th07-data.ts --bundle --format=esm --outfile=${outDir}/th07-data.mjs --log-level=silent`);
+const { Anm } = await import('../tests/.build/items/anm.mjs');
+const { TH07_DATA } = await import('../tests/.build/items/th07-data.mjs');
 
 const etama = new Anm(TH07_DATA.anm.etama, 'etama');
 

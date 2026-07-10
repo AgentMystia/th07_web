@@ -1,4 +1,4 @@
-// Long-run stage clear probe (GLM-PLAN-2 step 1/5).
+// Long-run stage-clear probe for data-driven stage progression.
 // Usage:
 //   node scripts/stage-clear-probe.mjs [stage=1] [difficulty=3] [maxFrames=20000] [outDir=/tmp/stage-probes]
 // Holds shoot, refreshes lives/invuln every 60 frames, dumps snapshots +

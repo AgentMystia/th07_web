@@ -8,9 +8,9 @@ every rule in it was earned by a real defect.
 ## 1. Mission
 
 Reimplement **Touhou Youyoumu ~ Perfect Cherry Blossom (TH07)** in
-TypeScript for the browser, driven by the original game data. Stage 1 is
-playable end-to-end (menus → difficulty select including Lunatic → stage →
-Letty Whiterock); later stages are future scope.
+TypeScript for the browser, driven by the original game data. Stages 1-8
+are data-driven and playable; the current fidelity target is original-grade
+Stage 1-6 behavior and presentation. Extra/Phantasm remain lower-confidence.
 
 **Default rule: reproduce the original game exactly.** Do not simplify,
 rebalance, redesign, modernize, or approximate original behavior unless it
@@ -251,8 +251,7 @@ would've been the flat 50000), floored to tens, **then `score += v/10`**
 — the live in-game score field is added-to (and displayed) at ×1 with no
 further scaling anywhere in the HUD digit path (confirmed via the raw
 "%.8d"/"%.9d" format strings backing the score readout, no appended
-digit); see reference/re-specs/exe-cherry-border.md §3c/§4 and
-EXECUTION-LOG.md's score-unit adjudication.
+digit); see reference/re-specs/exe-cherry-border.md §3c/§4.
 
 **HUD layout**: front.png sprite rects and resting coordinates are decoded
 in `src/game/stage-scene.ts` (`FRONT`, `drawSidebar`, `drawFrame`) — labels
@@ -271,57 +270,57 @@ Each also has an inline comment at its code site. Do not silently "fix"
 gameplay to taste — improve these only with better evidence (Ghidra, frame
 comparisons against real play).
 
-- Focused option *orbit rate* and orb-2 phase (exe shows orbit, rate
-  unconfirmed) — static offsets used.
-- STD easing-mode formulas for modes beyond those observed (0/1/4).
 - Frame tiling positions (exact-fit math, engine placement not literal).
 - HUD star icon x positions; spell-timer and fps exact placement.
 - Cherry+ banner interrupt→state mapping (dim=charging, bright=border).
-- Bomb mechanics are functionally accurate first-pass; damage/cancel cadence
-  not yet exe-verified (bomb-TOUCHED bullets now spawn the exe-correct item:
-  type 0 power → big cherry at power≥128, DAT_004b5ebc BSS=0 @ all.c:16160,
-  but the exe's per-orb touch test is approximated by a 128px radius). Bomb
-  visuals run the characters' own playerXX.anm bomb scripts (Reimu
-  scr133–143, Marisa scr71–78/98–104, Sakuya scr5–14 — decoded from the
-  embedded data), but the spawn cadence/anchor offsets in
-  `StageScene#spawnBombEffects` approximate the exe's placement routine.
-- Phase-end sweep popups: the exe pops each escalating 2000/+20 (bullets)
-  and 2000/+30 (helpers) value at the converted entity (FUN_00402260); the
-  port banks the identical score total but draws no per-item popup text.
+- Bomb mechanics: the twelve focus-latched forms now run decoded per-form
+  state machines (`src/game/player-bombs.ts`) writing the exe's moving
+  attack-slot pool (player+0x9dc, consumed by FUN_0043a980). Damage/cancel
+  use the slot AABBs (no full-screen sweep). SakuyaB's time-stop freeze
+  pulses (FUN_00425f10) are implemented. The shared 60-frame screen tint
+  (FUN_00407520) and reserved-slot activation VM (FUN_00407620) are
+  represented by the character bomb ANM scripts + the runner, not byte-
+  exact VM spawns. Per-form spawn cadence/orb motion are from specs
+  spec-bombs-{shared,reimu,marisa,sakuya}.md.
+- Player shots run per-shot ANM VMs (SHT `sprite` = global script id; impact
+  re-arms `sprite+0x20`; bullet dies when its script ends). MarisaB's two
+  persistent-laser forms (3-slot tracker, beam-history ring, helper boxes)
+  and MarisaA's repeat-hit missile explosion are implemented. See
+  spec-marisab-beams.md / exe-player-funcs1.md.
+- Floating score/Cherry popups implemented (spec-popups.md): two ring pools,
+  distance-from-player alpha pulse, full color/value rules incl. the
+  phase-end escalating sweeps and the red cherry-gain popups.
 - EX bullet behaviors activate all-at-once at spawn; the exe arms one op-79
   slot per frame (≤N-frame phase error, N = #armed slots).
-- Move-then-ECL order differs from the exe's ECL-then-move by ≤1 frame of
-  aim skew on aimed FIREs.
 - Spell-bonus decay rounding: exe writes `floor10(ftol(<register-arg float
   expr>))` per frame (0x41f8a8 region); the port computes
   `floor10(base − decayPerSec·elapsed/60)`. Sub-10-point drift only.
   (The damage cap 70 and op 142 are no longer approximations: cap
   confirmed at all.c:14226; op 142 = N-frame damage shield, boss /9 /
-  non-boss 0, countdown at all.c:14440 — see FIX_LOG 2026-07-10.)
+  non-boss 0, countdown at all.c:14440.)
 - `ins_30/31` render flags unknown (no-op everywhere, matches PyTouhou).
 - Spell declaration presentation: the eff01.anm background script is
   open-coded (its op-4 loop defeats AnmRunner's frame-keyed fades); the
   capture.anm flash draws as a flat teal tint (its runtime `'@'` texture is
   not extractable); the face_01_00 cutin sweep path/timing and the red
   name-banner gradient (text.anm textures not extractable) are hand-tuned;
-  spell history is session-scoped (original persists in score.dat);
-  ename nameplate row picked by the stage-1 dialogueSeen heuristic.
+  spell history is session-scoped (original persists in score.dat).
 - Boss X-position marker: exact sprite not recovered from front.anm
   (spec-ui-stageclear.md §3); drawn as a small ~60% alpha "Enemy" label at
-  the playfield bottom edge tracking boss.x (GLM-PLAN-2 step 3 fallback).
-- Bullet-effect ids 1/2/4/6/7/8/9/12-19: decorative or unported; ids 0/5/
-  10/11/20 are real. Ids 17/18 (seed-bullet detonation) and 7/8 (bounce
-  off lasers) deferred — needed by late-game spells only.
-- Slowmo clock (op121 id10/11): one-shot bullet-velocity rescale, no global
-  timescale (spec-op27-effects.md).
-- op59 approximated via orbit window.
-- Stage-4 STD ops 24-29 (background bank switch / sway tween) unimplemented
-  (spec-extra-phantasm.md §4; semantics PROBABLE).
+  the playfield bottom edge tracking boss.x.
+- Bullet-effect ids 1/2/4/6/9/12-15/19/21-23 ported (spec-effects-misc.md):
+  ids 1/2/4/6/12/21 delete bullets, id 1 "declaws" them to 0.3 speed, ids
+  9/15 are screen shake/flash, id 19 is the 3-second BGM fade. Ids 22/23
+  (cosmetic auras) are intentional no-ops. ECL op149 (spell-presentation
+  origin, 1 use) and op150 (enemy ANM Z-rotation) are handled.
+- Slowmo clock (op121 ids 10/11): the executable scales STD, ANM, ECL,
+  player, enemies, lasers, items, bombs, and timers while collision remains
+  wall-clock. The port now drives all of these from one global `slowRate`
+  (effect 10 = 1/param + retroactive bullet-vector rescale, effect 11 =
+  inverse + reset; split-counter timers accumulate fractionally); see
+  spec-slowmo.md.
 - Extra/Phantasm starting bombs/power PROBABLE (community convention),
   not exe-verified.
-- Stage-4 multi-slot sisters (op92 children + op145 remote-sub choreography)
-  still incomplete — slot-0 manager lives at (0,0); visible sisters despawn
-  via op145→sub0; damageBoss can still clear the manager.
 
 ## 8. Pitfall catalog (check these FIRST when something looks wrong)
 

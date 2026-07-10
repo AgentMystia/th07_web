@@ -7,11 +7,12 @@ import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 
-mkdirSync('tests/.build', { recursive: true });
-execSync('npx esbuild src/formats/sht.ts --bundle --format=esm --outfile=tests/.build/sht.mjs --log-level=silent');
-execSync('npx esbuild src/data/th07-data.ts --bundle --format=esm --outfile=tests/.build/th07-data.mjs --log-level=silent');
-const { Sht } = await import('../tests/.build/sht.mjs');
-const { TH07_DATA } = await import('../tests/.build/th07-data.mjs');
+const outDir = 'tests/.build/sht-funcs';
+mkdirSync(outDir, { recursive: true });
+execSync(`npx esbuild src/formats/sht.ts --bundle --format=esm --outfile=${outDir}/sht.mjs --log-level=silent`);
+execSync(`npx esbuild src/data/th07-data.ts --bundle --format=esm --outfile=${outDir}/th07-data.mjs --log-level=silent`);
+const { Sht } = await import('../tests/.build/sht-funcs/sht.mjs');
+const { TH07_DATA } = await import('../tests/.build/sht-funcs/th07-data.mjs');
 
 const load = (name) => new Sht(TH07_DATA.sht[name]);
 const allShots = (sht) => sht.levels.flatMap((l) => l.shots);

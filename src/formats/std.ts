@@ -1,6 +1,5 @@
 import { BinaryView } from './bin';
 import { clamp, DEG, lerp } from '../core/util';
-import { applyFormula } from './anm';
 
 // TH07 STD stage-background format. Same layout family as TH06:
 // header {u16 objectCount, u16 faceCount, u32 faceOffset, u32 scriptOffset,
@@ -9,17 +8,13 @@ import { applyFormula } from './anm';
 // {u16 objectId, u16 unknown, f32 x, f32 y, f32 z}, then a fixed-width (20
 // byte) script: {i32 frame, i16 op, i16 unused, f32 arg0, f32 arg1, f32 arg2}.
 //
-// Op numbers and argument meaning below are taken from thtk's thstd
-// (formats_v0 — TH06/07/08/09/09.5 all share this table) and verified
-// against reference/DSTD7/stage1.dstd's disassembly:
+// Base op numbers were cross-checked with stage1.std; TH07's advanced ops
+// are recovered from Th07.exe FUN_004046f0 @ 0x4046f0:
 //   ins_0(0,0,0)               no-op (also used as a padding/terminator entry)
 //   ins_1(argb, near, far)     fog keyframe (near/far are fog distances)
 //   ins_2(duration, 0, 0)      fog interpolation duration (always linear)
-//   ins_4(a, frameBits, 0)     jump: redirect the script clock to the frame
-//                              encoded in frameBits' raw bit pattern (not its
-//                              float *value* — thstd's formatter prints it as
-//                              a tiny denormal float, but it's really an
-//                              int32 stored in a float-tagged slot)
+//   ins_3                       pause at the current instruction
+//   ins_4(index, frame, 0)     jump to instruction index + raw integer clock
 //   ins_5(x, y, z)             camera position keyframe (x is likewise a
 //                              float stored in an int-tagged slot; e.g.
 //                              -1018691584 raw-decodes to -200.0)
@@ -28,8 +23,14 @@ import { applyFormula } from './anm';
 //   ins_7(x, y, z)             camera facing: a camera-relative look
 //                              direction vector (not an absolute point)
 //   ins_8(duration, mode)      interpolate facing to the next ins_7
-//   ins_9(0, 1.0, 0.0)         no-op (undocumented; not needed for stage 1)
+//   ins_9/10                    LookAt up-vector keyframe/interpolation
 //   ins_11(fovRadians, 0, 0)   vertical field of view
+//   ins_12(duration, mode)      FOV interpolation
+//   ins_14..18                  camera P0/P1/m0/m1/Hermite duration
+//   ins_19..23                  facing P0/P1/m0/m1/Hermite duration
+//   ins_24..28                  up-vector P0/P1/m0/m1/Hermite duration
+//   ins_29/30(script)           primary/secondary standalone ANM VM
+//   ins_31(label)               resume label for ins_3
 // World axes throughout: x = lateral, y = forward depth, z = height with
 // *negative* z up (camera z ≈ -400 sits ~400 units above the ground at -12).
 
@@ -83,16 +84,78 @@ interface FogState {
   far: number;
 }
 
-// Shared shape for the three script-driven "ease from A to B over `duration`
-// frames starting at `frame`, using easing `mode`" tracks (camera position,
-// facing, fog). Fog has no easing-mode argument in the format table, so its
-// events always carry mode 0 (linear).
-interface EaseEvent<T> {
+interface StdInstruction {
   frame: number;
-  start: T;
-  target: T;
+  op: number;
+  f0: number;
+  f1: number;
+  f2: number;
+  i0: number;
+  i1: number;
+  i2: number;
+}
+
+interface VecTrack {
+  current: Vec3;
+  p0: Vec3;
+  p1: Vec3;
+  m0: Vec3;
+  m1: Vec3;
   duration: number;
+  elapsed: number;
   mode: number;
+}
+
+interface ScalarTrack {
+  current: number;
+  p0: number;
+  p1: number;
+  duration: number;
+  elapsed: number;
+  mode: number;
+}
+
+export interface StdSpecialAnmState {
+  script: number;
+  age: number;
+}
+
+function vec(x: number, y: number, z: number): Vec3 {
+  return { x, y, z };
+}
+
+function cloneVec(v: Vec3): Vec3 {
+  return vec(v.x, v.y, v.z);
+}
+
+function makeVecTrack(initial: Vec3): VecTrack {
+  return {
+    current: cloneVec(initial),
+    p0: cloneVec(initial),
+    p1: cloneVec(initial),
+    m0: vec(0, 0, 0),
+    m1: vec(0, 0, 0),
+    duration: 0,
+    elapsed: 0,
+    mode: 0
+  };
+}
+
+function makeScalarTrack(initial: number): ScalarTrack {
+  return { current: initial, p0: initial, p1: initial, duration: 0, elapsed: 0, mode: 0 };
+}
+
+// FUN_004043d0 uses the inverse numbering of ANM's formula table.
+export function applyStdFormula(t: number, mode: number): number {
+  switch (mode) {
+    case 1: return 1 - (1 - t) ** 2;
+    case 2: return 1 - (1 - t) ** 3;
+    case 3: return 1 - (1 - t) ** 4;
+    case 4: return t * t;
+    case 5: return t * t * t;
+    case 6: return t * t * t * t;
+    default: return t;
+  }
 }
 
 // Camera position + orientation basis for one frame, precomputed once so
@@ -116,14 +179,26 @@ export class Std {
   readonly songPaths: string[] = [];
   readonly objects: StdObject[] = [];
   readonly instances: StdInstance[] = [];
-  private cameraEvents: EaseEvent<Vec3>[] = [];
-  private facingEvents: EaseEvent<Vec3>[] = [];
-  private fogEvents: EaseEvent<FogState>[] = [];
-  // Script-authored jumps (ins_4): scriptFrame -> targetFrame. Stage 1 uses
-  // exactly one, to loop the boss-fight dolly, but this is handled generically.
-  private jumps = new Map<number, number>();
-  fov = 30 * DEG;
+  private instructions: StdInstruction[] = [];
+  private labels = new Map<number, number>();
+  private scriptIndex = 0;
+  private pausedAt = -1;
+  private pendingResume = 0;
+  private cameraTrack = makeVecTrack(vec(0, 0, 0));
+  private facingTrack = makeVecTrack(vec(0, 1, 0));
+  private upTrack = makeVecTrack(vec(0, 1, 0));
+  private fovTrack = makeScalarTrack(30 * DEG);
+  private fogCurrent: FogState = { r: 16, g: 0, b: 32, near: 200, far: 500 };
+  private fogStart: FogState = { ...this.fogCurrent };
+  private fogTarget: FogState = { ...this.fogCurrent };
+  private fogDuration = 0;
+  private fogElapsed = 0;
   frame = 0;
+  // Unlike the script clock, object/special ANM VMs tick through op3 pauses
+  // and never rewind at op4 jumps (FUN_004046f0 tail / FUN_00406850).
+  animationFrame = 0;
+  primaryAnm: StdSpecialAnmState | null = null;
+  secondaryAnm: StdSpecialAnmState | null = null;
 
   constructor(source: string | Uint8Array) {
     this.view = new BinaryView(source);
@@ -135,6 +210,7 @@ export class Std {
       this.songPaths.push(this.view.shiftJis(pathOff, this.cstrEnd(pathOff, 128)));
     }
     this.parse();
+    this.reset();
   }
 
   private cstrEnd(off: number, max: number): number {
@@ -157,23 +233,6 @@ export class Std {
       this.instances.push({ id, x: v.f32(off + 4), y: v.f32(off + 8), z: v.f32(off + 12) });
     }
 
-    const defaultCamera: Vec3 = { x: 0, y: 0, z: 0 };
-    // No yaw/tilt (facing straight down +y) until the first ins_7 fires.
-    const defaultFacing: Vec3 = { x: 0, y: 1, z: 0 };
-    const defaultFog: FogState = { r: 16, g: 0, b: 32, near: 200, far: 500 };
-    this.cameraEvents.push({ frame: 0, start: defaultCamera, target: defaultCamera, duration: 0, mode: 0 });
-    this.facingEvents.push({ frame: 0, start: defaultFacing, target: defaultFacing, duration: 0, mode: 0 });
-    this.fogEvents.push({ frame: 0, start: defaultFog, target: defaultFog, duration: 0, mode: 0 });
-
-    let currentCamera = defaultCamera;
-    let currentFacing = defaultFacing;
-    let currentFog = defaultFog;
-    let pendingCameraDuration = 0;
-    let pendingCameraMode = 0;
-    let pendingFacingDuration = 0;
-    let pendingFacingMode = 0;
-    let pendingFogDuration = 0;
-
     for (let off = scriptOffset, guard = 0; off + 20 <= v.length && guard < 512; off += 20, guard++) {
       const rawFrame = v.i32(off);
       const op = v.i16(off + 4);
@@ -188,64 +247,10 @@ export class Std {
       const z = v.f32(off + 16);
       const i0 = v.i32(off + 8);
       const i1 = v.i32(off + 12);
-
-      switch (op) {
-        case 5: { // camera position keyframe
-          const target: Vec3 = { x, y, z };
-          this.cameraEvents.push({ frame, start: currentCamera, target, duration: pendingCameraDuration, mode: pendingCameraMode });
-          currentCamera = target;
-          pendingCameraDuration = 0;
-          pendingCameraMode = 0;
-          break;
-        }
-        case 6: // camera position interpolation duration + easing mode
-          pendingCameraDuration = Math.max(0, i0);
-          pendingCameraMode = i1;
-          break;
-        case 7: { // camera facing keyframe (camera-relative look direction)
-          const target: Vec3 = { x, y, z };
-          this.facingEvents.push({ frame, start: currentFacing, target, duration: pendingFacingDuration, mode: pendingFacingMode });
-          currentFacing = target;
-          pendingFacingDuration = 0;
-          pendingFacingMode = 0;
-          break;
-        }
-        case 8: // facing interpolation duration + easing mode
-          pendingFacingDuration = Math.max(0, i0);
-          pendingFacingMode = i1;
-          break;
-        case 1: { // fog keyframe: ARGB color + near/far fog distances
-          const color = i0 >>> 0;
-          const target: FogState = {
-            r: (color >> 16) & 0xff,
-            g: (color >> 8) & 0xff,
-            b: color & 0xff,
-            near: y,
-            far: z
-          };
-          this.fogEvents.push({ frame, start: currentFog, target, duration: pendingFogDuration, mode: 0 });
-          currentFog = target;
-          pendingFogDuration = 0;
-          break;
-        }
-        case 2: // fog interpolation duration (no easing-mode argument: linear)
-          pendingFogDuration = Math.max(0, i0);
-          break;
-        case 4: // jump: target frame is the raw int bits of the 2nd slot
-          this.jumps.set(frame, i1);
-          break;
-        case 11: // vertical field of view, radians
-          this.fov = x;
-          break;
-        default:
-          // ins_0 / ins_9 and anything else observed in stage 1's script are
-          // documented no-ops for our purposes.
-          break;
-      }
+      const ins = { frame, op, f0: x, f1: y, f2: z, i0, i1, i2: v.i32(off + 16) };
+      this.instructions.push(ins);
+      if (op === 31 && !this.labels.has(i0)) this.labels.set(i0, this.instructions.length - 1);
     }
-    this.cameraEvents.sort((a, b) => a.frame - b.frame);
-    this.facingEvents.sort((a, b) => a.frame - b.frame);
-    this.fogEvents.sort((a, b) => a.frame - b.frame);
   }
 
   private parseObject(off: number): StdObject {
@@ -284,76 +289,254 @@ export class Std {
 
   reset(): void {
     this.frame = 0;
+    this.animationFrame = 0;
+    this.scriptIndex = 0;
+    this.pausedAt = -1;
+    this.pendingResume = 0;
+    this.cameraTrack = makeVecTrack(vec(0, 0, 0));
+    this.facingTrack = makeVecTrack(vec(0, 1, 0));
+    this.upTrack = makeVecTrack(vec(0, 1, 0));
+    this.fovTrack = makeScalarTrack(30 * DEG);
+    this.fogCurrent = { r: 16, g: 0, b: 32, near: 200, far: 500 };
+    this.fogStart = { ...this.fogCurrent };
+    this.fogTarget = { ...this.fogCurrent };
+    this.fogDuration = 0;
+    this.fogElapsed = 0;
+    this.primaryAnm = null;
+    this.secondaryAnm = null;
   }
 
-  // The STD script clock simply free-runs, one frame per call; the only
-  // redirection is a script-authored jump (ins_4), handled generically here
-  // (stage 1 uses this to loop the boss-fight camera dolly forever).
-  advance(): void {
-    this.frame++;
-    for (let guard = 0; guard < 8; guard++) {
-      const target = this.jumps.get(this.frame);
-      if (target == null) break;
-      this.frame = target;
+  get paused(): boolean {
+    return this.pausedAt >= 0;
+  }
+
+  get fov(): number {
+    return this.fovTrack.current;
+  }
+
+  // Th07.exe FUN_004046f0 @ 0x404719-0x4047e7 searches op31's argument,
+  // then resumes immediately after that label at the label's script time.
+  requestResume(label: number): void {
+    if (label > 0) this.pendingResume = label;
+  }
+
+  // Script time may pause or jump. Object and special-ANM time is monotonic,
+  // and all interpolation tracks continue through op3 pauses.
+  advance(rate = 1): void {
+    // Both STD clocks advance at the global slow-motion rate
+    // (spec-slowmo.md §3.2, FUN_004043d0/FUN_0041de20).
+    this.animationFrame += rate;
+    if (this.primaryAnm) this.primaryAnm.age += rate;
+    if (this.secondaryAnm) this.secondaryAnm.age += rate;
+
+    if (this.pendingResume > 0) {
+      const labelIndex = this.labels.get(this.pendingResume);
+      this.pendingResume = 0;
+      if (labelIndex != null) {
+        this.scriptIndex = labelIndex + 1;
+        this.frame = this.instructions[labelIndex].frame;
+        this.pausedAt = -1;
+      }
+    }
+
+    if (!this.paused) this.dispatchDueInstructions();
+    this.tickTracks(rate);
+    if (!this.paused) this.frame += rate;
+  }
+
+  private dispatchDueInstructions(): void {
+    for (let guard = 0; guard < 1024; guard++) {
+      const ins = this.instructions[this.scriptIndex];
+      if (!ins || ins.frame > this.frame) return;
+      if (ins.op === 3) {
+        this.pausedAt = this.scriptIndex;
+        return;
+      }
+      if (ins.op === 4) {
+        // op4's first argument is the destination instruction index; its
+        // second is the destination script clock (FUN_004046f0 @ 0x4057fb).
+        this.scriptIndex = Math.max(0, ins.i0);
+        this.frame = Math.max(0, ins.i1);
+        this.cameraTrack.duration = 0;
+        continue;
+      }
+      this.executeInstruction(ins);
+      this.scriptIndex++;
+    }
+    throw new Error('STD instruction dispatch guard exhausted');
+  }
+
+  private executeInstruction(ins: StdInstruction): void {
+    const value = vec(ins.f0, ins.f1, ins.f2);
+    switch (ins.op) {
+      case 1: {
+        const color = ins.i0 >>> 0;
+        this.fogTarget = {
+          r: (color >> 16) & 0xff,
+          g: (color >> 8) & 0xff,
+          b: color & 0xff,
+          near: ins.f1,
+          far: ins.f2
+        };
+        if (this.fogDuration === 0) this.fogCurrent = { ...this.fogTarget };
+        return;
+      }
+      case 2:
+        this.fogStart = { ...this.fogCurrent };
+        this.fogDuration = Math.max(0, ins.i0);
+        this.fogElapsed = 0;
+        return;
+      case 5: this.setVecKeyframe(this.cameraTrack, value); return;
+      case 6: this.setVecDuration(this.cameraTrack, ins.i0, ins.i1); return;
+      case 7: this.setVecKeyframe(this.facingTrack, value); return;
+      case 8: this.setVecDuration(this.facingTrack, ins.i0, ins.i1); return;
+      case 9: this.setVecKeyframe(this.upTrack, value); return;
+      case 10: this.setVecDuration(this.upTrack, ins.i0, ins.i1); return;
+      case 11: this.setScalarKeyframe(this.fovTrack, ins.f0); return;
+      case 12: this.setScalarDuration(this.fovTrack, ins.i0, ins.i1); return;
+      case 14: this.cameraTrack.p0 = value; return;
+      case 15: this.cameraTrack.p1 = value; return;
+      case 16: this.cameraTrack.m0 = value; return;
+      case 17: this.cameraTrack.m1 = value; return;
+      case 18: this.setVecDuration(this.cameraTrack, ins.i0, 7); return;
+      case 19: this.facingTrack.p0 = value; return;
+      case 20: this.facingTrack.p1 = value; return;
+      case 21: this.facingTrack.m0 = value; return;
+      case 22: this.facingTrack.m1 = value; return;
+      case 23: this.setVecDuration(this.facingTrack, ins.i0, 7); return;
+      case 24: this.upTrack.p0 = value; return;
+      case 25: this.upTrack.p1 = value; return;
+      case 26: this.upTrack.m0 = value; return;
+      case 27: this.upTrack.m1 = value; return;
+      case 28: this.setVecDuration(this.upTrack, ins.i0, 7); return;
+      case 29: this.primaryAnm = ins.i0 < 0 ? null : { script: ins.i0, age: 0 }; return;
+      case 30: this.secondaryAnm = ins.i0 < 0 ? null : { script: ins.i0, age: 0 }; return;
+      default: return;
     }
   }
 
-  private static pick<T extends { frame: number }>(events: T[], frame: number): T {
-    let event = events[0];
-    for (const e of events) {
-      if (e.frame <= frame) event = e;
-      else break;
+  private setVecKeyframe(track: VecTrack, target: Vec3): void {
+    track.p0 = cloneVec(track.p1);
+    track.p1 = target;
+    if (track.duration === 0) track.current = cloneVec(target);
+  }
+
+  private setVecDuration(track: VecTrack, duration: number, mode: number): void {
+    track.duration = Math.max(0, duration);
+    track.elapsed = 0;
+    track.mode = mode;
+    if (track.duration === 0) track.current = cloneVec(track.p1);
+  }
+
+  private setScalarKeyframe(track: ScalarTrack, target: number): void {
+    track.p0 = track.p1;
+    track.p1 = target;
+    if (track.duration === 0) track.current = target;
+  }
+
+  private setScalarDuration(track: ScalarTrack, duration: number, mode: number): void {
+    track.duration = Math.max(0, duration);
+    track.elapsed = 0;
+    track.mode = mode;
+    if (track.duration === 0) track.current = track.p1;
+  }
+
+  private static hermite(p0: number, p1: number, m0: number, m1: number, t: number): number {
+    const oneMinus = 1 - t;
+    const h00 = (1 + 2 * t) * oneMinus * oneMinus;
+    const h10 = t * oneMinus * oneMinus;
+    const h01 = t * t * (3 - 2 * t);
+    const h11 = t * t * (t - 1);
+    return h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1;
+  }
+
+  private tickVec(track: VecTrack, rate = 1): void {
+    if (track.duration <= 0) return;
+    track.elapsed = Math.min(track.duration, track.elapsed + rate);
+    const t0 = clamp(track.elapsed / track.duration, 0, 1);
+    if (track.mode === 7) {
+      track.current = {
+        x: Std.hermite(track.p0.x, track.p1.x, track.m0.x, track.m1.x, t0),
+        y: Std.hermite(track.p0.y, track.p1.y, track.m0.y, track.m1.y, t0),
+        z: Std.hermite(track.p0.z, track.p1.z, track.m0.z, track.m1.z, t0)
+      };
+    } else {
+      const t = applyStdFormula(t0, track.mode);
+      track.current = {
+        x: lerp(track.p0.x, track.p1.x, t),
+        y: lerp(track.p0.y, track.p1.y, t),
+        z: lerp(track.p0.z, track.p1.z, t)
+      };
     }
-    return event;
+    if (track.elapsed >= track.duration) track.duration = 0;
   }
 
-  private static easeVec3(event: EaseEvent<Vec3>, frame: number): Vec3 {
-    const t = event.duration > 0 ? applyFormula(clamp((frame - event.frame) / event.duration, 0, 1), event.mode) : 1;
-    return {
-      x: lerp(event.start.x, event.target.x, t),
-      y: lerp(event.start.y, event.target.y, t),
-      z: lerp(event.start.z, event.target.z, t)
-    };
+  private tickScalar(track: ScalarTrack, rate = 1): void {
+    if (track.duration <= 0) return;
+    track.elapsed = Math.min(track.duration, track.elapsed + rate);
+    const t = applyStdFormula(clamp(track.elapsed / track.duration, 0, 1), track.mode);
+    track.current = lerp(track.p0, track.p1, t);
+    if (track.elapsed >= track.duration) track.duration = 0;
   }
 
-  camera(frame: number): Vec3 {
-    return Std.easeVec3(Std.pick(this.cameraEvents, frame), frame);
+  private tickTracks(rate = 1): void {
+    this.tickVec(this.cameraTrack, rate);
+    this.tickVec(this.facingTrack, rate);
+    this.tickVec(this.upTrack, rate);
+    this.tickScalar(this.fovTrack, rate);
+    if (this.fogDuration > 0) {
+      this.fogElapsed = Math.min(this.fogDuration, this.fogElapsed + rate);
+      const t = clamp(this.fogElapsed / this.fogDuration, 0, 1);
+      this.fogCurrent = {
+        r: lerp(this.fogStart.r, this.fogTarget.r, t),
+        g: lerp(this.fogStart.g, this.fogTarget.g, t),
+        b: lerp(this.fogStart.b, this.fogTarget.b, t),
+        near: lerp(this.fogStart.near, this.fogTarget.near, t),
+        far: lerp(this.fogStart.far, this.fogTarget.far, t)
+      };
+      if (this.fogElapsed >= this.fogDuration) this.fogDuration = 0;
+    }
   }
 
-  facing(frame: number): Vec3 {
-    return Std.easeVec3(Std.pick(this.facingEvents, frame), frame);
+  camera(_frame = this.frame): Vec3 {
+    return cloneVec(this.cameraTrack.current);
   }
 
-  fog(frame: number): { r: number; g: number; b: number; near: number; far: number; css: string } {
-    const event = Std.pick(this.fogEvents, frame);
-    // ins_2 carries no easing-mode argument: fog always interpolates linearly.
-    const t = event.duration > 0 ? clamp((frame - event.frame) / event.duration, 0, 1) : 1;
-    const r = Math.round(lerp(event.start.r, event.target.r, t));
-    const g = Math.round(lerp(event.start.g, event.target.g, t));
-    const b = Math.round(lerp(event.start.b, event.target.b, t));
-    return { r, g, b, near: lerp(event.start.near, event.target.near, t), far: lerp(event.start.far, event.target.far, t), css: `rgb(${r}, ${g}, ${b})` };
+  facing(_frame = this.frame): Vec3 {
+    return cloneVec(this.facingTrack.current);
   }
 
-  // Camera position + orthonormal (right, up, forward) basis for `frame`,
-  // built from the facing vector with no roll (world "up" = -z). Cheap
-  // enough (a couple of cross products) to call once per rendered frame and
-  // reuse for every project() call that frame.
+  upHint(_frame = this.frame): Vec3 {
+    return cloneVec(this.upTrack.current);
+  }
+
+  fog(_frame = this.frame): { r: number; g: number; b: number; near: number; far: number; css: string } {
+    const r = Math.round(this.fogCurrent.r);
+    const g = Math.round(this.fogCurrent.g);
+    const b = Math.round(this.fogCurrent.b);
+    return { r, g, b, near: this.fogCurrent.near, far: this.fogCurrent.far, css: `rgb(${r}, ${g}, ${b})` };
+  }
+
+  // FUN_00407310 @ 0x40736d passes authored +0x5210 directly as D3DX
+  // LookAt's up argument. Keep the raw STD axes: right = upHint x forward,
+  // then screen-up = forward x right. This is Stage 4's roll/flip track.
   cameraFrame(frame: number): CameraFrame {
     const pos = this.camera(frame);
     const face = this.facing(frame);
+    const upHint = this.upHint(frame);
     const flen = Math.hypot(face.x, face.y, face.z) || 1;
     const fx = face.x / flen;
     const fy = face.y / flen;
     const fz = face.z / flen;
-    // right = normalize(worldUp × forward), worldUp = (0,0,-1).
-    let rx = fy;
-    let ry = -fx;
-    let rz = 0;
+    let rx = upHint.y * fz - upHint.z * fy;
+    let ry = upHint.z * fx - upHint.x * fz;
+    let rz = upHint.x * fy - upHint.y * fx;
     let rlen = Math.hypot(rx, ry, rz);
     if (rlen < 1e-6) {
-      // Degenerate only if forward is ~vertical (never happens in stage 1's
-      // data); fall back to a level right vector.
-      rx = 1; ry = 0; rz = 0; rlen = 1;
+      // Defensive only: the original Stage 1-8 authored vectors are valid.
+      rx = fy; ry = -fx; rz = 0;
+      rlen = Math.hypot(rx, ry, rz);
+      if (rlen < 1e-6) { rx = 1; ry = 0; rz = 0; rlen = 1; }
     }
     rx /= rlen; ry /= rlen; rz /= rlen;
     // up = forward × right completes the right-handed basis.

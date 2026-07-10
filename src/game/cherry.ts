@@ -16,7 +16,7 @@
 //   (§4); it never touches cherryPlus during grazes (§3, graze feeds
 //   cherryMax/cherry only) nor during star/cancel items (§3 — those have
 //   NO cherry effect at all, score-only).
-// - Cherry drops on death (§3d, rate UNRESOLVED, flagged PROBABLE) and on
+// - Cherry drops on death (§3d, selected SHT header rate, CONFIRMED) and on
 //   boss timeout (§3e, CONFIRMED exactly 25%). Bombing has NO cherry
 //   penalty (§3 — it only ends an active border).
 // - Cherry+ rises only via the same add-helper as cherry (dc6f); at 50,000
@@ -32,7 +32,7 @@
 //   exceeds 50000. The exe's internal score field is added-to at the same
 //   scale it is displayed at (no ×10 anywhere in the HUD digit path —
 //   confirmed via the raw "%.8d"/"%.9d" format strings backing the score
-//   readout; see EXECUTION-LOG.md's score-unit adjudication), so every
+//   readout), so every
 //   `score +=` below is already in the port's `this.score` units.
 export const CHERRY_PLUS_MAX = 50000;
 export const BORDER_DURATION = 540;
@@ -57,9 +57,12 @@ function floor10(v: number): number {
 }
 
 export type BorderEnd = 'none' | 'survived' | 'broken';
+export type BorderStartAction = 'start' | 'defer' | 'cancel';
 
 export interface CherryEvents {
+  borderStartAction?(): BorderStartAction;
   onBorderStart?(): void;
+  onBorderCancel?(): void;
   onBorderEnd?(result: 'survived' | 'broken', bonus: number): void;
 }
 
@@ -68,6 +71,7 @@ export class CherrySystem {
   cherryMax = INITIAL_CHERRY_MAX_BY_DIFFICULTY[1];
   cherryPlus = 0;
   borderTimer = 0; // frames remaining while the border is active
+  borderPending = false;
   // The exe's *(stats+0x1c) per-run counter driving the case-7 "big
   // Cherry" item amount (spec §3b). CONFIRMED = spell-capture count: the
   // op-91 award path increments it on a valid capture (all.c:6689).
@@ -83,22 +87,22 @@ export class CherrySystem {
     return this.borderTimer > 0;
   }
 
+  get borderEngaged(): boolean {
+    return this.borderActive || this.borderPending;
+  }
+
   // Th07.exe FUN_0042dc6f (spec §2): cherry += amount (capped at
   // cherryMax); cherryPlus += amount (capped at 50000, -> startBorder when
   // reached). The exe's actual cherryPlus gate (`DAT_004b5ec5`) is a
-  // write-site-less dead flag, permanently open in retail — this port's
-  // `!borderActive` gate is a different mechanism that happens to be
-  // behaviorally equivalent given the cap/reset mechanics (spec §2: once
-  // cherryPlus hits 50000 the only path past it is startBorder, which
-  // resets it, so gating further gain on "border not active" changes
-  // nothing observable) — kept for that reason, not because it mirrors
-  // the exe's (nonexistent) real gate.
+  // write-site-less dead flag, permanently open in retail. `borderEngaged`
+  // models player marker +0x240d: state 1 active or state 2 pending; the
+  // accumulator stays capped while either marker is set.
   private gain(amount: number): void {
     if (amount <= 0) return;
     this.cherry = Math.min(this.cherryMax, this.cherry + amount);
-    if (!this.borderActive) {
+    if (!this.borderEngaged) {
       this.cherryPlus = Math.min(CHERRY_PLUS_MAX, this.cherryPlus + amount);
-      if (this.cherryPlus >= CHERRY_PLUS_MAX) this.startBorder();
+      if (this.cherryPlus >= CHERRY_PLUS_MAX) this.requestBorder();
     }
   }
 
@@ -109,24 +113,48 @@ export class CherrySystem {
     this.cherry = Math.min(this.cherryMax, this.cherry + amount);
   }
 
+  private requestBorder(): void {
+    const action = this.events.borderStartAction?.() ?? 'start';
+    if (action === 'defer') {
+      this.borderPending = true;
+      return;
+    }
+    if (action === 'cancel') {
+      this.borderPending = false;
+      this.cherryPlus = 0;
+      this.events.onBorderCancel?.();
+      return;
+    }
+    this.startBorder();
+  }
+
   private startBorder(): void {
+    this.borderPending = false;
     this.borderTimer = BORDER_DURATION;
     this.cherryPlus = 0;
     this.events.onBorderStart?.();
   }
 
+  // Th07.exe FUN_0043d9a0 retries marker state 2 once per player update,
+  // before the lifecycle timer advances. StageScene calls this at that point.
+  retryBorderStart(): void {
+    if (this.borderPending) this.requestBorder();
+  }
+
   // Advances the border timer; returns the score bonus when it completes.
-  tick(): number {
+  tick(rate = 1): number {
     if (!this.borderActive) return 0;
-    this.borderTimer--;
+    // Border countdown ticks at the global slow-motion rate
+    // (exe FUN_0043e2e0 via FUN_00436a06; spec-slowmo.md §3.2).
+    this.borderTimer = Math.max(0, this.borderTimer - rate);
     if (this.borderTimer === 0) {
       // Th07.exe FUN_0043e620 (spec §4, CONFIRMED instruction-by-instruction
-      // @ 0x43e64e-0x43e680): +10000 to both cherryMax (de56) and cherry
-      // (de03); score += cherry (the exe's `(cherry*10)/10` is a lossless
-      // compiler no-op, NOT a ×10 bonus — corrects this file's prior claim).
-      const bonus = this.cherry;
+      // @ 0x43e62b-0x43e68e): +10000 to both cherryMax (de56) and cherry
+      // (de03), then score += the POST-add cherry. The popup receives that
+      // same value ×10; only the score division is a lossless compiler no-op.
       this.cherryMax += 10000;
       this.cherry = Math.min(this.cherryMax, this.cherry + 10000);
+      const bonus = this.cherry;
       this.events.onBorderEnd?.('survived', bonus);
       return bonus;
     }
@@ -136,8 +164,9 @@ export class CherrySystem {
   // Breaks the border (player hit or bomb). Returns true if a hit was
   // absorbed by the border.
   breakBorder(): boolean {
-    if (!this.borderActive) return false;
+    if (!this.borderEngaged) return false;
     this.borderTimer = 0;
+    this.borderPending = false;
     this.cherryPlus = 0;
     this.events.onBorderEnd?.('broken', 0);
     return true;
@@ -260,32 +289,22 @@ export class CherrySystem {
   }
 
   // Th07.exe FUN_0043dca0 (spec §3d): penalty = floor10(min(cap,
-  // round(cherry*RATE))); cherry -= penalty. `RATE` is
-  // `*(DAT_0056b928+0x1c)`, a per-stage/difficulty config float whose
-  // write site wasn't traced (spec §5 item 1) — 0.5 is a flagged PROBABLE
-  // placeholder ("dying costs about half your cherry"), not
-  // disassembly-confirmed. `cap` = 60000 when `DAT_00625625 == 2` else
-  // 100000. `DAT_00625625` was previously PROBABLE-flagged as the
-  // difficulty index; the homing second-target code settles it as the
-  // CHARACTER index instead — its `== 2` branch selects the Sakuya-only
-  // upward-cone target using the -π/3..-2π/3 window (rdata floats @
-  // 0x48edc0/0x48edc4, read from the exe binary), which only makes sense
-  // for character==Sakuya. So the death cap is Sakuya-specific.
-  //
-  // The previous per-character `lossRatio` arg (SHT `cherryLossOnDeath`,
-  // src/formats/sht.ts) is dropped: the exe's traced rate source is the
-  // per-stage config float above, not a per-character SHT field. The SHT
-  // field is real data (still parsed) but nothing here confirms it's the
-  // same knob — see EXECUTION-LOG.md for the discrepancy note.
-  onDeath(isSakuya: boolean): void {
+  // round(cherry*RATE))); cherry -= penalty. DAT_0056b928 is the currently
+  // selected 52-byte SHT header, so +0x1c is exactly Sht.cherryLossOnDeath
+  // (FUN_0043a820 reads the same pointer's +8 deathbomb window, +0xc hitbox,
+  // +0x10 grazebox, and +0x20 PoC line). The twelve original SHT files carry
+  // 0.5 for Reimu/Marisa and 0.33 for Sakuya. `cap` = 60000 when
+  // DAT_00625625 == 2 (Sakuya), otherwise 100000.
+  onDeath(lossRatio: number, isSakuya: boolean): void {
     const cap = isSakuya ? 60000 : 100000;
-    const rate = 0.5; // PROBABLE, spec §5 item 1 — see doc comment above
-    const penalty = Math.min(cap, Math.round(this.cherry * rate));
+    const penalty = Math.min(cap, Math.round(this.cherry * lossRatio));
     this.cherry = Math.max(0, this.cherry - floor10(penalty));
     // Border progress reset on death is not itself in the decompiled §3d
     // snippet, but matches well-established PCB behavior (dying zeroes the
     // Cherry+ meter) and was already this file's behavior; kept.
     this.cherryPlus = 0;
+    this.borderPending = false;
+    this.borderTimer = 0;
   }
 
   // Th07.exe FUN_0041e6b0 (spec §3e, CONFIRMED — DAT_0048ed1c == 0.25 via
