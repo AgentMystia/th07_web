@@ -48,7 +48,7 @@ const ITEM_SPRITES: Record<ItemType, number> = {
   life: 9,
   cherry: 10, // type 6: grey cancel-item box (FUN_00421a40 writes type 6)
   bigCherry: 11, // type 7: boxed pink petal
-  pointBullet: 12 // type 8: retail-unused second petal row
+  pointBullet: 12 // type 8: unboxed petal used by the Border-break circle
 };
 // Per-type offscreen indicator arrows sit 10 embedded ids after their item
 // (emb14-21, same order) — drawn while an item is still above the top edge.
@@ -1297,16 +1297,16 @@ export class StageScene implements GameHost {
       }
     }
     for (const b of this.enemyBullets) {
-      if (b.dead) continue;
+      if (b.dead || (b.flags & 0x1000) !== 0) continue;
       for (const s of this.bombEngine.activeSlots()) {
         if (Math.abs(b.x - s.x) <= s.radiusX / 2 && Math.abs(b.y - s.y) <= s.radiusY / 2) {
-          // Bomb-touched bullets spawn item type DAT_004b5ebc — BSS, never
-          // written, so 0 = a power item (bullet tick @ all.c:16160), which
-          // FUN_00430970/spawnItem converts to a big cherry (+1000+100c) at
-          // power >= 128. That conversion IS the vanilla bomb-to-charge-
-          // border economy. Cancellation is the same spatial slot touch as
-          // damage (exe-bombs.md §4) — never a full-screen sweep.
-          this.spawnItem('power', b.x, b.y, { state: 1 });
+          // Bomb attack-slot contact is a spiritual-strike cancel. Normal
+          // Bomb zones pass type 6 to FUN_0043e730/e7e0; FUN_0043b040 then
+          // writes it to player+0x2404 (DAT_004b5ebc), read by the bullet loop
+          // at all.c:16160. Unlike the Border-break circle's type 8, this is
+          // the grey type-6 item; both bypass full-power promotion. The touch
+          // stays spatial (exe-bombs.md §4), never a full-screen sweep.
+          this.spawnItem('cherry', b.x, b.y, { state: 1 });
           b.dead = true;
           break;
         }
@@ -1760,6 +1760,16 @@ export class StageScene implements GameHost {
     // unreachable.)
     for (const b of this.enemyBullets) {
       if (b.dead) continue;
+      // Zone result 2 has precedence over graze/player AABB. A 0x1000-
+      // immune bullet inside the Border-break circle is therefore neither
+      // converted nor allowed to fall through into the player test.
+      // Th07.exe bullet loop @ all.c:16153-16170.
+      const wave = this.borderClearWave;
+      if (wave) {
+        const wx = b.x - wave.x;
+        const wy = b.y - wave.y;
+        if (wx * wx + wy * wy < wave.radius * wave.radius) continue;
+      }
       const dx = Math.abs(b.x - px);
       const dy = Math.abs(b.y - py);
       // Th07.exe FUN_0043b350: bulletFull/2 + sht.grazebox/2 + flat 20.0 pad.
@@ -1770,6 +1780,14 @@ export class StageScene implements GameHost {
       }
       // exe FUN_004241c0: kill test runs from spawn; only graze has a min age (outer gate +0xbf0 unresolved)
       if (dx <= b.grazeW / 2 + hit && dy <= b.grazeH / 2 + hit) {
+        // FUN_0043b200 returns result 1 in player states 1/2/3; the caller
+        // consumes the bullet without an item. This applies to ordinary
+        // spawn/respawn/bomb invulnerability as well as the 40f Border
+        // aftermath, not only to Border state (all.c:27785-27791).
+        if (p.invulnFrames > 0 || p.bombInvuln > 0 || p.deathTimer >= 0) {
+          b.dead = true;
+          continue;
+        }
         this.onPlayerHit(b);
         return;
       }
@@ -1844,7 +1862,10 @@ export class StageScene implements GameHost {
   private applyBorderBreakEffects(sourceBullet: EnemyBullet | null, rescueDeathbomb: boolean): void {
     const p = this.playerObj;
     // Direct collision result 1 deletes the touching bullet without an item;
-    // only later result-2 contacts with the expanding field drop power.
+    // later result-2 contacts with the expanding field yield type-8 unboxed
+    // Cherry items. FUN_0043eb00 passes 8 at all.c:28984; FUN_0043b040 writes
+    // it through player+0x2404 / DAT_004b5ebc before the spawn at
+    // all.c:16160/16169.
     if (sourceBullet) sourceBullet.dead = true;
     if (rescueDeathbomb) p.deathTimer = -1;
     this.voidSpellCapture();
@@ -1867,7 +1888,7 @@ export class StageScene implements GameHost {
       const dx = b.x - wave.x;
       const dy = b.y - wave.y;
       if (dx * dx + dy * dy < wave.radius * wave.radius) {
-        this.spawnItem('power', b.x, b.y, { state: 1 });
+        this.spawnItem('pointBullet', b.x, b.y, { state: 1 });
         b.dead = true;
       }
     }
@@ -1919,9 +1940,9 @@ export class StageScene implements GameHost {
         const dx = b.x - wave.x;
         const dy = b.y - wave.y;
         // FUN_0043b040 uses a strict center-distance circle test; swept
-        // bullets become auto-collecting type-0 power items.
+        // bullets become auto-collecting type-8 unboxed Cherry items.
         if (dx * dx + dy * dy < wave.radius * wave.radius) {
-          this.spawnItem('power', b.x, b.y, { state: 1 });
+          this.spawnItem('pointBullet', b.x, b.y, { state: 1 });
           b.dead = true;
         }
       }
@@ -2260,12 +2281,9 @@ export class StageScene implements GameHost {
         break;
       }
       case 'pointBullet':
-        // Exe item type 8 ("cancel star"): +30 cherry&cherryPlus (dc6f)
-        // and +70 cherry-only (dd6c), NO score (FUN_00430c10 case 8).
-        // Retail never spawns it — the only type-8 spawner is
-        // FUN_00422ea0(3..8), which has no caller — and after the cancel
-        // paths above were rewired to their true types (6 / 0), neither do
-        // we; the handler stays for completeness.
+        // Exe item type 8 (the Border-break circle's unboxed petal): +30
+        // cherry&cherryPlus (dc6f) and +70 cherry-only (dd6c), NO score
+        // (FUN_00430c10 case 8; FUN_0043eb00 @ all.c:28984).
         this.cherry.onBigCherryItem();
         break;
       case 'bomb':

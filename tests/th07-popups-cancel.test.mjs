@@ -124,3 +124,25 @@ test('FUN_00423100 sweep converts immune lasers but excludes laser items from sc
   assert.equal(scene.items.length, 4);
   assert.equal(scene.enemyLasers[0].state, 2);
 });
+
+test('bomb attack slots convert bullets to small cherry even at full power', () => {
+  const scene = cancelScene();
+  scene.playerObj.power = 128;
+  scene.slowRate = 1;
+  scene.bombFrame = 0;
+  scene.enemies = [];
+  scene.enemyBullets.push(
+    { x: 12, y: 34, flags: 0, dead: false },
+    { x: 12, y: 34, flags: 0x1000, dead: false }
+  );
+  scene.tickBombChoreography = () => {};
+  scene.bombEngine = {
+    activeSlots: () => [{ x: 12, y: 34, radiusX: 16, radiusY: 16, damage: 1, hitTally: 0 }]
+  };
+
+  scene.applyBombEffects();
+
+  assert.equal(scene.enemyBullets[0].dead, true);
+  assert.equal(scene.enemyBullets[1].dead, false);
+  assert.deepEqual(scene.items.map((it) => [it.type, it.state]), [['cherry', 1]]);
+});

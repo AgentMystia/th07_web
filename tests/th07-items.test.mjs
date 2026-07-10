@@ -32,7 +32,7 @@ test('item sprites resolve to 16x16 etama2 rects in the item row', () => {
     9: [80, 64], // life (1up)
     10: [96, 64], // cherry / type-6 cancel item (grey box)
     11: [112, 64], // bigCherry / type 7 (boxed petal)
-    12: [0, 80] // pointBullet / type 8 (retail-unused)
+    12: [0, 80] // pointBullet / type 8 (Border-break unboxed petal)
   };
   for (const [emb, [x, y]] of Object.entries(expected)) {
     const s = etama.sprites.get(base + Number(emb));

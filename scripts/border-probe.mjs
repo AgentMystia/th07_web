@@ -60,7 +60,7 @@ async function advance(page, frames, setup = {}) {
 
 try {
   // Hit break: source bullet vanishes without an item; the expanding field
-  // later converts only the non-immune bullet at 160px.
+  // later converts only the non-immune bullet at 160px to its type-8 petal.
   const hitPage = await openStage();
   for (let frame = 0; frame < 1800; frame += 30) {
     await advance(hitPage, 30, { lives: 8, invuln: 60 });
@@ -92,8 +92,50 @@ try {
   const immune = hitWave.bulletDump.find((bullet) => bullet.id === immuneId);
   assert.ok(immune, '0x1000-immune fixture bullet must survive the expanding field');
   assert.equal(immune.flags & 0x1000, 0x1000);
+  assert.equal(hitWave.cherry.plus, 0);
+  assert.equal(hitWave.cherry.border, 0);
+  const waveItem = hitWave.itemDump.find((item) => item.type === 'pointBullet');
+  assert.ok(waveItem, 'Border-break circle must spawn the exe type-8 petal');
+
+  // Collect the petal and pin its exact economy. The 0x1000 fixture shares
+  // the wave region; zone-result precedence keeps it alive even on contact.
+  await hitPage.evaluate(({ x, y }) => window.__TH07_TEST__.setPlayer(x, y), waveItem);
+  const pickupBefore = await snapshot(hitPage);
+  await advance(hitPage, 1);
+  const pickupAfter = await snapshot(hitPage);
+  assert.equal(pickupAfter.items, pickupBefore.items - 1);
+  assert.equal(pickupAfter.cherry.plus, pickupBefore.cherry.plus + 30);
+  assert.equal(pickupAfter.cherry.c, pickupBefore.cherry.c + 100);
+  assert.equal(pickupAfter.bulletDump.find((bullet) => bullet.id === immuneId)?.dead, false);
+  await advance(hitPage, 120);
+  const noLoop = await snapshot(hitPage);
+  assert.equal(noLoop.cherry.border, 0);
+  assert.ok(noLoop.cherry.plus < 50000);
   await hitPage.screenshot({ path: '/tmp/border-break.png' });
   await hitPage.close();
+
+  // Player states 1/2/3 consume a touching bullet without an item. This is
+  // the generic FUN_0043b200 behavior, not a Border-only shield.
+  const shieldPage = await openStage();
+  for (let frame = 0; frame < 1800; frame += 30) {
+    await advance(shieldPage, 30, { lives: 8, invuln: 60 });
+    if ((await snapshot(shieldPage)).bullets > 0) break;
+  }
+  await shieldPage.evaluate(() => {
+    window.__TH07_TEST__.setInvuln(40);
+    if (!window.__TH07_TEST__.primeBorderCollision()) throw new Error('no real bullet template');
+  });
+  const shieldBefore = await snapshot(shieldPage);
+  const shieldBulletId = shieldBefore.bulletDump[0].id;
+  await advance(shieldPage, 1);
+  const shieldContact = await snapshot(shieldPage);
+  assert.equal(shieldContact.bulletDump.find((bullet) => bullet.id === shieldBulletId)?.dead, true);
+  assert.equal(shieldContact.items, shieldBefore.items);
+  assert.equal(shieldContact.cherry.border, 0);
+  await advance(shieldPage, 1);
+  const shieldAfter = await snapshot(shieldPage);
+  assert.equal(shieldAfter.bulletDump.some((bullet) => bullet.id === shieldBulletId), false);
+  await shieldPage.close();
 
   // Bomb break: free cancel. Because the bomb input runs after the zone
   // updater in the exe, the creation frame remains radius 32/ticks 50.
@@ -155,6 +197,10 @@ try {
       invuln: hitAfter.player.invuln,
       initialWave: hitAfter.cherry.clearWave,
       expandedWave: hitWave.cherry.clearWave,
+      waveItemTypes: hitWave.itemDump.map((item) => item.type),
+      cherryPlusAfterPickup: pickupAfter.cherry.plus,
+      immuneSurvivedWaveContact:
+        pickupAfter.bulletDump.find((bullet) => bullet.id === immuneId)?.dead === false,
       fixtureIds: { directId, sweptId, immuneId },
       remainingFixtureIds: hitWave.bulletDump
         .filter((bullet) => [directId, sweptId, immuneId].includes(bullet.id))
@@ -165,6 +211,9 @@ try {
       bombsAfter: bombAfter.player.bombs,
       invuln: bombAfter.player.invuln,
       wave: bombAfter.cherry.clearWave
+    },
+    invulnerability: {
+      consumedWithoutItem: !shieldAfter.bulletDump.some((bullet) => bullet.id === shieldBulletId)
     },
     natural: {
       scoreDelta: bonusAfter.score - bonusBefore.score,

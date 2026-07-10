@@ -213,3 +213,15 @@ test('initial cherryMax is per-difficulty (Th07.exe FUN_0042cf2f @ 0x42cf2f)', (
   assert.equal(new CherrySystem({}, 2).cherryMax, 250000); // Hard
   assert.equal(new CherrySystem({}, 3).cherryMax, 300000); // Lunatic
 });
+
+test('Extra and Phantasm preload cherry while keeping the 400000 cap', () => {
+  const extra = new CherrySystem({}, 4);
+  assert.equal(extra.cherry, 200000);
+  assert.equal(extra.cherryMax, 400000);
+  assert.equal(extra.cherryPlus, 0);
+
+  const phantasm = new CherrySystem({}, 5);
+  assert.equal(phantasm.cherry, 300000);
+  assert.equal(phantasm.cherryMax, 400000);
+  assert.equal(phantasm.cherryPlus, 0);
+});

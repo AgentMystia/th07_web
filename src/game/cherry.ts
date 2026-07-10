@@ -13,9 +13,8 @@
 //   simplification.
 // - Cherry rises from shot-hits on enemies (§3a, damage/divisor formula,
 //   boss-aware), cherry items (§3b, a 4-case table), and border-survive
-//   (§4); it never touches cherryPlus during grazes (§3, graze feeds
-//   cherryMax/cherry only) nor during star/cancel items (§3 — those have
-//   NO cherry effect at all, score-only).
+//   (§4). Grazes feed cherryMax/cherry only, never cherryPlus. Ordinary
+//   power/star item cases 0/2 are score/combo-only with no cherry effect.
 // - Cherry drops on death (§3d, selected SHT header rate, CONFIRMED) and on
 //   boss timeout (§3e, CONFIRMED exactly 25%). Bombing has NO cherry
 //   penalty (§3 — it only ends an active border).
@@ -38,15 +37,14 @@ export const CHERRY_PLUS_MAX = 50000;
 export const BORDER_DURATION = 540;
 // Th07.exe run-init FUN_0042cf2f @ 0x42cf2f (all.c:19765-19796): cherryMax
 // starts per difficulty — Easy/Normal 200000, Hard 250000, Lunatic 300000
-// (Extra/Phantasm 400000 with cherry pre-loaded — outside this port's
-// range). cherry and cherryPlus start at 0 (base-collapsed, spec §1a).
+// Extra/Phantasm start at 400000 with cherry pre-loaded to 200000/300000.
+// cherryPlus starts at 0 (base-collapsed, spec §1a).
 // The previous INITIAL_CHERRY_MAX = 50000 conflated the cherryPlus border
 // trigger with the cherry cap; the vanilla HUD gauge reads
 // cherry/cherryMax (e.g. 86120/310000 on Lunatic after one border's
 // +10000), not cherryPlus/50000.
 // Indices 4/5 = Extra/Phantasm: cherryMax 400000 (FUN_0042cf2f's upper
-// tier; those runs also pre-load some cherry — handled by the run-init
-// carry, not here).
+// tier); their initial cherry values are applied in the constructor below.
 export const INITIAL_CHERRY_MAX_BY_DIFFICULTY = [200000, 200000, 250000, 300000, 400000, 400000];
 
 // Floors a non-negative integer to the nearest multiple of 10 — the exe's
@@ -81,6 +79,9 @@ export class CherrySystem {
     this.cherryMax =
       INITIAL_CHERRY_MAX_BY_DIFFICULTY[difficultyIndex] ??
       INITIAL_CHERRY_MAX_BY_DIFFICULTY[1];
+    // Th07.exe (v1.00b) FUN_0042cf2f @ 0x42cf2f (all.c:19775-19781).
+    if (difficultyIndex === 4) this.cherry = 200000;
+    else if (difficultyIndex === 5) this.cherry = 300000;
   }
 
   get borderActive(): boolean {
@@ -227,11 +228,12 @@ export class CherrySystem {
     this.gain(this.largeCherryItemGain());
   }
 
-  // Th07.exe FUN_00430c10 case 8 (spec §3b): the bullet-cancel star item —
+  // Th07.exe FUN_00430c10 case 8 (spec §3b): the unboxed Cherry item used
+  // by the Border-break circle —
   // +30 cherry+cherryPlus (dc6f) AND +70 cherry-only (dd6c), for +100
   // total cherry / +30 cherryPlus. No score effect. (Previously mislabeled
   // "Big Cherry" and wired to the 'bigCherry' ItemType — that item is exe
-  // case 7 above; the mixup starved the border trigger.)
+  // case 7 above.)
   onBigCherryItem(): void {
     this.gain(30);
     this.gainCherryOnly(70);
