@@ -351,7 +351,8 @@ export class StageRuntime {
       orbitDuration: 0,
       orbitLeft: 0,
       bulletProps: null,
-      bulletSfx: -1,
+      bulletSfx: 0,
+      bulletSfxInterval: 0,
       bulletExSlots: [null, null, null, null, null],
       shootDisabled: false,
       shootInterval: 0,
@@ -1564,14 +1565,20 @@ export class StageRuntime {
         }
         return null;
       }
-      case 81: { // bullet fire SFX (id, unknown)
-        const sfx = v.i32(a);
-        s.bulletSfx = sfx;
+      case 81: { // Configure the current FIRE template's sound flag/index.
+        const sfx = gi(0);
         if (s.bulletProps) {
-          s.bulletProps.sfx = sfx;
-          if (sfx >= 0) s.bulletProps.flags |= 0x200;
-          else s.bulletProps.flags &= ~0x200;
+          if (sfx < 0) s.bulletProps.flags &= ~0x200;
+          else {
+            s.bulletProps.sfx = sfx;
+            s.bulletProps.flags |= 0x200;
+          }
         }
+        // Th07.exe case 0x50 @ 0x414df1-0x414ea4 (all.c:8688-8714): a
+        // negative arg0 clears only template bit 0x200 and preserves the
+        // last index; non-negative arg0 writes enemy+0x2c9c and sets it.
+        if (sfx >= 0) s.bulletSfx = sfx;
+        s.bulletSfxInterval = gi(4);
         return null;
       }
       case 90: { // spell card start: (variant s16, spellId u16, XOR-0xAA shift-jis name)
@@ -1963,7 +1970,7 @@ export class StageRuntime {
         speed2,
         angle1: normalizeAngle(this.getFloat(game, e, a + 20)),
         angle2: this.getFloat(game, e, a + 24),
-        flags: this.ecl.view.i32(a + 28) | (s.bulletSfx >= 0 ? 0x200 : 0),
+        flags: this.ecl.view.i32(a + 28),
         sfx: s.bulletSfx,
         exSlots: s.bulletExSlots.slice(),
         aimMode
@@ -1981,7 +1988,7 @@ export class StageRuntime {
       speed2: Math.max(0.3, speed2 + rankSpeed / 2),
       angle1: normalizeAngle(this.getFloat(game, e, a + 20)),
       angle2: this.getFloat(game, e, a + 24),
-      flags: this.ecl.view.i32(a + 28) | (s.bulletSfx >= 0 ? 0x200 : 0),
+      flags: this.ecl.view.i32(a + 28),
       sfx: s.bulletSfx,
       exSlots: s.bulletExSlots.slice(),
       aimMode
@@ -2095,7 +2102,10 @@ export class StageRuntime {
         });
       }
     }
-    if (p.flags & 0x200 && p.sfx >= 0) game.playSfx(p.sfx);
+    // Th07.exe FUN_00423480 @ 0x423530-0x423553: template bit 0x200 is
+    // the sole gate; the sound index comes from template+0xc8 and defaults
+    // to zero with the enemy struct's zero-fill.
+    if (p.flags & 0x200) game.playSfx(p.sfx);
   }
 
   // Clears trash mobs; each cleared enemy still runs its death callback (so

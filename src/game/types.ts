@@ -270,6 +270,9 @@ export interface EclState {
   orbitLeft: number;
   bulletProps: BulletProps | null;
   bulletSfx: number;
+  // Th07.exe enemy+0x2ca0, written by op81 arg1 (all.c:8714). No consumer
+  // has been traced; retain the exact state without inventing behavior.
+  bulletSfxInterval: number;
   // op-79 template slots, indexed by arg0 (0..4). Persist across FIREs (exe
   // enemy+0x2bf4 table); snapshotted into BulletProps.exSlots at each FIRE.
   bulletExSlots: (BulletExSlot | null)[];
