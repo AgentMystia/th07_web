@@ -13,8 +13,9 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const source = join(root, 'reference/th07-original');
 const outDir = join(root, 'assets/audio/th07');
 
-// Tracks required by the current game scope (title, stage 1, stage 1 boss).
-const TRACK_WHITELIST = new Set(['th07_01', 'th07_02', 'th07_03']);
+// All tracks present in thbgm.fmt / thbgmogg.dat (title through Phantasm).
+// Null whitelist = export every track; keep as a Set only if scoping is needed.
+const TRACK_WHITELIST = null;
 
 export function parseThbgmFmt(buf) {
   const tracks = [];
@@ -44,7 +45,7 @@ function main() {
   const wav = join(tmpdir(), 'th07-thbgm-full.wav');
   execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', join(source, 'thbgmogg.dat'), wav]);
   for (const t of fmt) {
-    if (!TRACK_WHITELIST.has(t.name)) continue;
+    if (TRACK_WHITELIST && !TRACK_WHITELIST.has(t.name)) continue;
     const startSample = Math.floor(t.start / 4);
     const endSample = Math.floor((t.start + t.lengthBytes) / 4);
     const out = join(outDir, `${t.name}.ogg`);

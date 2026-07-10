@@ -259,10 +259,17 @@ export class StageRuntime {
       ecl: this.makeEnemyState(subId, mirrored, item, parent)
     };
     game.enemies.push(e);
-    this.runEcl(game, e);
+    // Apply the timeline life/score BEFORE the initial ECL run so a t=0
+    // op110 (set HP) is not clobbered by the spawn-event life afterwards.
+    // Bosses ship with life=1 as a placeholder; their real HP comes from
+    // op110 inside the entry sub. The old post-run overwrite reset every
+    // stage-4+ multi-slot boss back to 1 and let the first player shot
+    // fire its death-callback (op99(-1)) on frame 1.
     if (hasLife) e.hp = e.maxHp = life | 0;
-    else e.maxHp = Math.max(1, e.hp);
     if (hasScore) e.score = score | 0;
+    this.runEcl(game, e);
+    if (!hasLife) e.maxHp = Math.max(1, e.hp);
+    else e.maxHp = Math.max(e.maxHp, e.hp);
     return e;
   }
 
@@ -856,6 +863,14 @@ export class StageRuntime {
       case 7: setVar(v.i32(a), game.rng.u32InRange(Math.max(1, gi(4))) + gi(8)); return null;
       case 8: setVar(Math.trunc(v.f32(a)), game.rng.range(gf(4))); return null;
       case 9: setVar(Math.trunc(v.f32(a)), game.rng.range(gf(4)) + gf(8)); return null;
+      // Op 10 (exe case 9 @ all.c:7486-7503): dest = ±src with a random
+      // sign (FUN_0042ff30 bit0 → +1 / -1). paramMask bit1 selects
+      // var-resolved src (standard gf path). Used by stage-3 Alice dolls.
+      case 10: {
+        const sign = (game.rng.u32() & 1) === 0 ? -1 : 1;
+        setVar(Math.trunc(v.f32(a)), sign * gf(4));
+        return null;
+      }
       case 11: // TH07-TODO: single use in stage 1; treated as float assignment
         setVar(Math.trunc(v.f32(a)), gf(4));
         return null;
@@ -1285,15 +1300,19 @@ export class StageRuntime {
         s.deathAnm2 = v.i8(a + 1);
         s.deathAnm3 = v.i8(a + 2);
         return null;
-      case 99: { // boss slot registration
+      case 99: { // boss slot registration (multi-slot: stage 4+ helpers
+        // register slots 1..N alongside the main boss in slot 0).
         const slot = v.i32(a) | 0;
         if (s.bossSlot != null && this.bossSlots[s.bossSlot] === e) this.bossSlots[s.bossSlot] = null;
         s.bossSlot = slot >= 0 ? slot : null;
         s.isBoss = slot >= 0;
         if (s.isBoss) this.bossSlots[slot] = e;
-        // Th07.exe DAT_00495bf4: global flag, set on register, cleared on ins_99(-1).
-        this.bossRegistered = slot >= 0;
-        game.setBossPresent?.(s.isBoss, s.isBoss ? e : null);
+        // Th07.exe DAT_00495bf4: true while ANY boss slot is occupied.
+        // setBossPresent prefers slot 0 (main) so helper registration does
+        // not steal the UI/damageBoss pointer from the primary boss, and
+        // so a helper's later release cannot blank the marker while the
+        // main boss still lives (stage-4 Prismriver-style multi-slot).
+        this.syncBossPresence(game);
         return null;
       }
       case 100: // boss aura effect: (colorId, x, y, z, distance) — approximated
@@ -1739,17 +1758,33 @@ export class StageRuntime {
 
   private executingEnemy: Enemy | null = null;
 
+  // Recompute bossRegistered + setBossPresent from the live bossSlots table.
+  // Slot 0 is the primary (UI marker / damageBoss target); if empty, fall
+  // through to the lowest occupied slot. No occupied slots → clear.
+  private syncBossPresence(game: GameHost): void {
+    let primary: Enemy | null = null;
+    let any = false;
+    for (let i = 0; i < this.bossSlots.length; i++) {
+      const b = this.bossSlots[i];
+      if (!b || b.dead) continue;
+      any = true;
+      if (primary == null || i === 0) primary = b;
+      if (i === 0) break;
+    }
+    this.bossRegistered = any;
+    game.setBossPresent?.(any, primary);
+  }
+
   // Must be called whenever an enemy is removed from the game for any reason,
   // so boss slots and presence flags don't go stale.
   releaseEnemy(game: GameHost, e: Enemy): void {
     const s = e.ecl;
     if (s.bossSlot != null && this.bossSlots[s.bossSlot] === e) {
       this.bossSlots[s.bossSlot] = null;
-      game.setBossPresent?.(false, null);
     }
-    // Th07.exe FUN_0041ea00: releasing/culling a registered boss entity clears
-    // the global bossRegistered flag too.
-    if (s.isBoss) this.bossRegistered = false;
+    // Only clear presence if no other slot still holds a live boss — a
+    // helper in slot 1/2/3 dying must not blank the main boss in slot 0.
+    if (s.isBoss) this.syncBossPresence(game);
   }
 
   killEnemy(game: GameHost, e: Enemy): boolean {
@@ -1791,7 +1826,7 @@ export class StageRuntime {
     }
     game.addScore(e.score || 0);
     if (s.isBoss && s.bossSlot != null && this.bossSlots[s.bossSlot] === e) this.bossSlots[s.bossSlot] = null;
-    if (s.isBoss) game.setBossPresent?.(false, null);
+    if (s.isBoss) this.syncBossPresence(game);
     // Op 105 is an IMMEDIATE PlaySE (see its case above) -- the exe stores
     // no per-enemy value for automatic replay at death, so a scripted
     // death-callback sub's own op105 call already played its SE when that
