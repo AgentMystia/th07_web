@@ -7,6 +7,50 @@ stage-1 ECL dump (`reference/re-specs/stage1-ecl-dump.txt`). Newest first.
 
 ---
 
+## 2026-07-10 — ALL 8 STAGES: data pipeline, progression, lasers, op27, effect ops, Extra/Phantasm (commits 763b50f + d52523b)
+
+Two commits landing the "implement all stages" batch. RE was produced by a
+4-agent Sonnet-5 ultracode pass, audited, and archived in the repo:
+`reference/re-specs/spec-{ui-stageclear,op27-effects,lasers,extra-phantasm}.md`.
+**Handover for the remaining steps: `reference/re-specs/GLM-PLAN-2.md`.**
+
+Highlights (full details in the specs + commit messages):
+- Stage data 1-8 embedded; STD quad script ids resolve through the exe's
+  per-file virtual bases (0x300 + 16/file, all.c:2909-2943).
+- Stage flow: exe-exact clear tally (internal = stage·100000 + graze·50 +
+  point·5000 + cherry; ×{0.5,1,1.2,1.5,2,1}; All Clear + Player/Bomb rows
+  on stage ≥6; display = internal×10) → Z → next stage with carry.
+- Score HUD displays internal×10 (the exe's "%8d0" appended-zero trick) —
+  supersedes the earlier "no ×10" adjudication in EXECUTION-LOG.md.
+- `DAT_0062583c` is the STAGE NUMBER, not a difficulty tier: cherry
+  divisor local14 = min(stage·2,10) (all.c:13997-14003) and the stage-4
+  (×11/16) / stage-5-6 (×1/2) type-A non-boss shot-damage reductions
+  (all.c:14200-14209) now implemented.
+- Full laser system per spec-lasers.md: ops 82-89/134/152/156-158,
+  grow-hold-shrink states, exe box collision (kill box spans the beam only
+  during HOLD; width/2 extent halved again by the 0.5 factor; graze +48
+  pad on 12-frame ticks = the exe's phaseFrame%12 flag), FUN_00422ea0
+  laser-clear + 10-frame post-clear spawn suppression.
+- op27 8-slot interp (LERP/Hermite, 7 eases) with float-path writes incl.
+  own position; op121/122 effect table (ids 0/5/10/11/20 real; decorative
+  no-ops); op144 periodic gosub (NOT death-spawn); op145 remote sub;
+  op143/146 cancels; op151 polar→XY; op155 wall-aware random angle
+  (constants 96/288/π-fractions read from the binary); op159 lerp;
+  op160 = cherry gain (was a wrong awardSpellValue guess).
+- SPELL_BONUS_BASE = full int32[141] @ 0x4951a8; Extra/Phantasm: menu
+  entry, difficulty 4/5, lives 2 (all.c:19715), power 128 (PROBABLE),
+  cherryMax 400000, BGM tracks 16-19 (14/15 are ending themes).
+
+### Verification
+25/25 tests; all 8 stages boot and run headlessly with live enemy/bullet
+counts; stage-3 Alice doll spell fires 16 tracked lasers
+(screenshot-verified); stage-2 intro matches the vanilla reference
+screenshot (stdNtxt.anm scripts played verbatim). NOT yet verified: full
+clears of stages 2-8 (GLM-PLAN-2 step 1), enemy marker, spell-bonus text
+presentation, effect ids 7/8/17/18, stage-4 bg bank switch (STD op 29).
+
+---
+
 ## 2026-07-10 — exe FIRE pipeline (rank 0), bullet cancel/sweep economy, hitbox type 3, border activation (fixes "border never activates" + universal-fidelity pass)
 
 One batch commit (hunks inseparable in stage-scene.ts); concerns below.
