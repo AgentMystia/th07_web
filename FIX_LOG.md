@@ -7,6 +7,157 @@ stage-1 ECL dump (`reference/re-specs/stage1-ecl-dump.txt`). Newest first.
 
 ---
 
+## 2026-07-10 — exe FIRE pipeline (rank 0), bullet cancel/sweep economy, hitbox type 3, border activation (fixes "border never activates" + universal-fidelity pass)
+
+One batch commit (hunks inseparable in stage-scene.ts); concerns below.
+Everything here is re-derived from the exe per the "fix from RE so fixes
+are universal" directive; claims from the interim RE handoff doc
+(`reference/re-specs/RE-2026-07-10.md`) were independently re-verified
+against all.c / the binary before landing.
+
+### 1. Rank is 0, not 16 — and op73/74 intervals are rank-scaled
+
+`DAT_00625884` (rank) sits in `.data`'s zero-fill tail (offset 0x193884 >
+rawSize 0x3800 — read from the PE headers), i.e. **BSS, default 0**; its
+only writes are the replay-header round-trip (all.c:29606/29725), and no
+stage ECL ever touches its var 10017 (grep over all 8 decompiled ECLs).
+Retail therefore plays the whole game at rank 0. Our hardcoded 16 made
+every non-spell pattern +0.5 px/f faster (rankSpd identity is at 16) and
+fire 20% more often — because op73/74 (cases 0x48/0x49) scale the interval
+at set time: `iv' = iv + trunc(iv/5) + trunc(-2·trunc(iv/5)·rank/32)`
+(identity at 16, ×1.2 at 0). Both fixed: `rank = 0` + the interval formula
+in the op73/74 handler.
+
+### 2. op75/76 gate only the immediate FIRE; op77 = re-fire; op80 = cancel
+
+- The auto-shoot tick (all.c:7194-7208) checks only `interval>0 && hp>0`
+  — never the op75 bit (0x20 of +0x2e28); that bit gates just the
+  immediate fire inside FIRE ops 64-72 (all.c:8545). Our `shootDisabled`
+  early-out in updateAutoShoot silenced every op75-then-op73 pattern —
+  removed.
+- **op77** (case 0x4c) = refresh shoot pos + `FUN_00423480` re-fire of the
+  current template. Was missing entirely.
+- **op80** (case 0x4f) = `FUN_00422ea0(1)` bullet cancel — we had it as a
+  re-fire. See §4 for what the cancel spawns.
+
+### 3. Bullet hitbox table: type 3 is 6.0
+
+`FUN_004256d0` classifies by primary-sprite width (thresholds 8/16/32 @
+0x48eacc/d0/d4) then special-cases by anm script id; in the 8<w≤16
+bracket only ids 0x202/204/205/206 (rice/kunai/crystal/knife) get 4.0,
+the default is 6.0 — and type 3's primary script is 0x203 (id table @
+0x48b160 read from the binary). Full table now
+`[4,6,4,6,4,4,4,10,5,8,24]` (index 3 was 4). Kill and graze share the
+value; graze adds the flat +20 pad (0x48ebf4) at the test site — both
+already correct in checkPlayerCollision.
+
+### 4. Cancel/sweep economy — what bullets turn into, exactly
+
+- The cancel item type (+0x37a160) is baked to **6 = small cherry** by the
+  bullet-manager constructor (`mov [eax+0x37a160], 6` @ va 0x421a76 in
+  FUN_00421a40) and never changed. So `FUN_00422ea0(1)` — op80, the op90
+  spell declare (all.c:6511), and the full-power crossing inside item
+  collect — converts every live bullet into an auto-collecting small
+  cherry item (+20 cherry/+20 cherryPlus each on pickup), no score sweep.
+- **Phase-end scored sweep** (op91 spell end via FUN_0040f340, and boss
+  death outside a spell @ all.c:14343): `FUN_00423100(8000,1)` pops an
+  escalating 2000/+20-per-bullet value per converted bullet, then
+  `FUN_004217c0(8000,·)` sweeps non-boss helpers (2000/+30, item gated on
+  the op136 bit5 flag — verified at all.c:14884), `score += total/10`.
+  op94 calls the same helper sweep but DISCARDS the total (all.c:9029).
+  The sweep is skipped when the phase timed out — the timeout path
+  (all.c:13831) instead fades bullets with NO items (`FUN_00422ea0(10)`)
+  and bumps the spell state so op91 knows.
+- **Bomb-touched bullets** spawn item type `DAT_004b5ebc` — BSS, no
+  writes, so **0 = power** (bullet tick @ all.c:16160), which
+  `FUN_00430970` converts to a **big cherry (+1000+100×captures)** at
+  power ≥ 128. That conversion is the vanilla bomb-to-charge-border
+  economy; our old 'pointBullet' spawn starved it.
+- Our 'pointBullet' collect is rewired to its true exe semantics (type 8
+  cancel star: +30 dc6f / +70 dd6c, no score — FUN_00430c10 case 8) and
+  is now unspawned, matching retail (the only type-8 spawner,
+  `FUN_00422ea0(3..8)`, has no caller).
+- op136 renamed `bodyRegrazeFlag` → `sweepItemFlag` (bit5's two consumers:
+  sweep drop + body re-graze).
+
+### 5. Border activation (the actual "never activates" chain)
+
+Two independent bugs starved it:
+1. 'bigCherry' collect was wired to exe case 8 (+30 cherryPlus) instead
+   of case 7 (+1000+100×captures) — fixed in this tree earlier.
+2. `onPlayerHit()` called `cherry.breakBorder()` BEFORE the
+   invulnerability check, so a contact during ANY invuln window (spawn,
+   bomb, or the 30 frames granted by a previous border absorb) still
+   destroyed a fresh border the frame it started. The exe's kill outcome
+   never runs while invulnerable. Border-break now happens only for a
+   genuinely hittable player.
+
+### Verification
+
+`tsc` clean, build clean, 25/25 unit tests. Border probe (Lunatic, max
+power, PoC camping, 5400 frames): cherryPlus 0→50000 in ~40s of stage
+play, **border #1 activates at frame 2407** and runs its full 540 frames
+(vanilla economy estimate: 1-2 borders/stage). Full-fight pacing probe
+completes all 6 boss phases with no page errors (Frost Columns 17.9s,
+Lingering Cold 21.9s, Table Turning 31.9s — same band as the previously
+verified vanilla pacing).
+
+**Letty nonspell-1 "few aimed bullets": NOT a bug** — her main fans fire
+aimMode 1 (absolute angles, no player aim); only the every-4th sub34 ring
+is aimMode 2 (aimed). Confirmed against the FIRE dispatcher aimMode
+semantics; no aim hack added, per the universal-fidelity directive.
+
+---
+
+## 2026-07-10 — SE system: exact exe slot table + restart-not-stack voices (fixes "too loud, like broken headphones")
+
+**Symptom reported:** sound effects wrong and far too loud ("就像耳机坏掉
+了").
+
+**Root cause:** the port played every SE at full volume and stacked
+overlapping copies of the same sound. Th07.exe's SE system
+(FUN_00446970/FUN_00446c20): 38 slots @ 0x494a78, each `{wavIndex i16,
+millibels i16, priority i16}` → amplitude `10^(mB/2000)` (e.g. slot 7
+se_tan00 −1500 mB = 0.178, slot 20 se_damage00 −1400 = 0.200); one
+DirectSound duplicated buffer per slot — retriggering RESTARTS the slot's
+voice instead of layering a new one; ECL/engine sound ids index the SLOT
+table, not the wav list.
+
+**Fix:** `SFX_SLOTS` table (38 exact `[wav, amplitude]` entries read from
+the exe rdata), `audio.ts` keeps one voice per slot key and stops it on
+retrigger, and every call site remapped to its true slot id (death 2/3
+alternating per exe disasm @ 0x420379, damage tick 20, graze 30, spell
+declare 14, capture 33, border start 32 / survive 36, item 21, extend 28,
+menu select/ok/cancel 12/10/11 in title-scene).
+
+---
+
+## 2026-07-10 — dialogue: exe MSG wait semantics + live player shots (fixes "bullets freeze in dialog" / "end dialog can't be skipped")
+
+Th07.exe MSG interpreter FUN_00428392 @ 0x428392, case 4 (all.c:
+17849-17858): a wait ends on (a) timeout, (b) a **Z press edge once the
+wait is ≥12 frames old — NOT gated by op 13**, or (c) CTRL fast-forward
+(input bit 0x100), which IS gated by op 13 and jumps the clock to the
+next instruction's timestamp. The old runner gated Z on op 13, making the
+post-boss tail waits (300/900/1200f) unskippable. Player shots also kept
+flying during dialogue in the exe — the stage tick now updates player
+bullets (collision off) while dialogue blocks, instead of freezing them
+on screen.
+
+---
+
+## 2026-07-10 — core loop: bounded catch-up (fixes "Sakuya seems too slow")
+
+Movement math was verified exe-exact (FUN_0043be00: four pre-baked SHT
+header floats, diagonal = speed/√2 in DATA, Sakuya unfocused 4.0 = Reimu;
+no runtime ×0.707). The real cause was the render loop: one sim step per
+rAF tick, so any sub-60Hz rAF delivery (throttling, 48/50 Hz displays,
+jitter) slowed the WHOLE game uniformly. The loop now runs up to 3 catch-up steps
+per tick against a fixed 60Hz accumulator and banks at most one step of
+debt (no post-stall spiral).
+
+---
+
 ## 2026-07-10 — cherry gauge: per-difficulty cherryMax + vanilla HUD display (fixes "should be 300000 not 50000")
 
 **Symptom reported:** the cherry gauge shows `N/50000`; vanilla shows

@@ -36,6 +36,28 @@ const ITEM_SPRITES: Record<ItemType, number> = {
 // (emb14-21, same order) — drawn while an item is still above the top edge.
 const ITEM_ARROW_OFFSET = 10;
 
+// SE slot table, Th07.exe @ 0x494a78 (38 entries × 8 bytes: {i32 wavIndex,
+// i16 volume_millibels, i16 priority}), read from the exe binary. Sound ids
+// in ECL data / SHT records / engine code index THIS table, not the 30-wav
+// filename list @ 0x494ba8 — several slots share a wav at different
+// volumes (e.g. 2/3 = se_enep00 at −1200/−1500 mB; enemy deaths alternate
+// them, disasm @ 0x420379). Init loop @ 0x4468xx duplicates the source
+// buffer per slot and calls IDirectSoundBuffer::SetVolume(mB) (vtable
+// +0x3c), so amp = 10^(mB/2000). Playing a slot restarts its duplicated
+// buffer — one voice per slot.
+const SFX_SLOTS: [string, number][] = [
+  ['se_plst00', 0.1], ['se_plst00', 0.056], ['se_enep00', 0.251], ['se_enep00', 0.178],
+  ['se_pldead00', 0.316], ['se_power0', 0.631], ['se_power1', 0.631], ['se_tan00', 0.178],
+  ['se_tan01', 0.141], ['se_tan02', 0.112], ['se_ok00', 0.316], ['se_cancel00', 0.316],
+  ['se_select00', 0.141], ['se_gun00', 0.251], ['se_cat00', 0.355], ['se_tan00', 0.178],
+  ['se_lazer00', 0.355], ['se_lazer01', 0.355], ['se_enep01', 0.355], ['se_nep00', 0.794],
+  ['se_damage00', 0.2], ['se_item00', 0.224], ['se_tan00', 0.891], ['se_tan01', 0.126],
+  ['se_tan02', 0.126], ['se_kira00', 0.398], ['se_kira01', 0.316], ['se_kira02', 0.224],
+  ['se_extend', 0.708], ['se_timeout', 0.355], ['se_graze', 0.355], ['se_powerup', 0.562],
+  ['se_border', 0.708], ['se_bonus', 0.708], ['se_graze', 0.708], ['se_kira00', 1],
+  ['se_bonus2', 0.708], ['se_pause', 0.708]
+];
+
 // front.png sprite rects [x,y,w,h], recovered from front.anm's entry0 sprite
 // table (see the HUD spec derived by thanm -l7 disassembly). The original
 // HUD blits these directly rather than typesetting text, so we do the same.
@@ -70,7 +92,14 @@ const BG_MAX_CELL_STEPS = 24;
 export class StageScene implements GameHost {
   rng = new Rng();
   difficulty = 1;
-  rank = 16;
+  // Th07.exe DAT_00625884 lives in .data's zero-fill tail (BSS) — retail
+  // rank is 0 for the whole game: nothing writes it during play and no
+  // stage ECL touches its var (10017); replays just round-trip the 0. At
+  // rank 0 the non-spell FIRE scale contributes spdLo (default -0.5) and
+  // countLo, and op73/74 intervals stretch x1.2 (see eclvm). The previous
+  // hardcoded 16 made every non-spell pattern 0.5 px/f faster and fire 20%
+  // more often than vanilla.
+  rank = 0;
   frame = 0;
   id = 1;
   player = { x: 192, y: 384 };
@@ -138,6 +167,10 @@ export class StageScene implements GameHost {
   } | null = null;
   private spellBanner = 0;
   private bonusPopup: { text: string; timer: number } | null = null;
+  // Mirrors Th07.exe DAT_012f40a8's 1 -> 2 "phase failed by timeout" bump:
+  // set by the timer-callback path, consumed by endBossSpell to skip the
+  // scored field sweep, cleared by the next declare.
+  private phaseTimedOut = false;
   bossActive: Enemy | null = null;
   bossLifeCount = 0;
   spellName = '';
@@ -162,9 +195,9 @@ export class StageScene implements GameHost {
     this.difficulty = difficulty;
     this.cherry = new CherrySystem(
       {
-        onBorderStart: () => this.playSfx(27),
+        onBorderStart: () => this.playSfx(32),
         onBorderEnd: (result) => {
-          if (result === 'survived') this.playSfx(28);
+          if (result === 'survived') this.playSfx(36);
         }
       },
       difficulty
@@ -231,18 +264,8 @@ export class StageScene implements GameHost {
     // per-bullet se_damage00 spam).
     if (this.sfxPlayedThisFrame.has(id)) return;
     this.sfxPlayedThisFrame.add(id);
-    // Original SE index mapping (TH07-TODO: verify full table). Index into
-    // the se_* files by the original sound ids used in ECL data.
-    const SFX_BY_INDEX = [
-      'se_plst00', 'se_enep00', 'se_pldead00', 'se_power0', 'se_power1',
-      'se_tan00', 'se_tan01', 'se_tan02', 'se_ok00', 'se_cancel00',
-      'se_select00', 'se_gun00', 'se_cat00', 'se_lazer00', 'se_lazer01',
-      'se_enep01', 'se_nep00', 'se_damage00', 'se_item00', 'se_kira00',
-      'se_kira01', 'se_kira02', 'se_extend', 'se_timeout', 'se_graze',
-      'se_powerup', 'se_pause', 'se_border', 'se_bonus', 'se_bonus2'
-    ];
-    const file = SFX_BY_INDEX[id];
-    if (file) this.audio.sfx(file);
+    const slot = SFX_SLOTS[id];
+    if (slot) this.audio.sfx(slot[0], slot[1], id);
   }
 
   startDialogue(index: number): void {
@@ -286,6 +309,7 @@ export class StageScene implements GameHost {
     const base = SPELL_BONUS_BASE[spellId] ?? 2000000;
     const timerFrames = this.bossActive?.ecl.timerCallbackThreshold ?? -1;
     const timerSec = timerFrames > 0 ? Math.trunc(timerFrames / 60) : 50;
+    this.phaseTimedOut = false;
     this.spellcard = {
       name,
       id: spellId,
@@ -302,12 +326,12 @@ export class StageScene implements GameHost {
     const tally = this.spellHistory.get(spellId) ?? { seen: 0, got: 0 };
     tally.seen++;
     this.spellHistory.set(spellId, tally);
-    this.playSfx(12);
+    this.playSfx(14);
     // Declaration charge burst at the boss (se_cat00 above is the charge SE).
     if (this.bossActive) this.spawnEffectParticles(3, this.bossActive.x, this.bossActive.y, 24, 0xffffffff);
   }
 
-  endBossSpell(): void {
+  endBossSpell(): boolean {
     if (this.spellcard?.capturing) {
       // Th07.exe FUN_0040f340 @ 0x40f340: award = decayed base + graze
       // additions; the banner shows the full value while the score field
@@ -319,12 +343,18 @@ export class StageScene implements GameHost {
       const tally = this.spellHistory.get(this.spellcard.id);
       if (tally) tally.got++;
       this.bonusPopup = { text: `Spell Card Bonus! ${bonus.toLocaleString('en-US')}`, timer: 180 };
-      this.playSfx(28);
+      this.playSfx(33);
     } else if (this.spellcard) {
       this.bonusPopup = { text: 'Bonus failed...', timer: 120 };
     }
     this.spellName = '';
     this.spellcard = null;
+    // Exe FUN_0040f340: the scored phase-end field sweep only runs when the
+    // spell did not time out (DAT_012f40a8 still 1). Getting HIT during the
+    // spell voids the bonus but NOT the sweep.
+    const sweep = !this.phaseTimedOut;
+    this.phaseTimedOut = false;
+    return sweep;
   }
 
   voidSpellCapture(): void {
@@ -333,6 +363,11 @@ export class StageScene implements GameHost {
 
   onBossPhaseTimeout(): void {
     this.cherry.onBossTimeout();
+    // Exe timeout path (all.c:13831): FUN_00422ea0(10) — every bullet fades
+    // out with NO item conversion — and the spell is marked failed
+    // (DAT_012f40a8 -> 2) so the op91 that follows skips the scored sweep.
+    this.phaseTimedOut = true;
+    this.enemyBullets.length = 0;
   }
 
   setBossPresent(present: boolean, enemy: Enemy | null): void {
@@ -360,11 +395,31 @@ export class StageScene implements GameHost {
     this.spawnEffectParticles(3, e.x, e.y, 12, 0xffffffff);
   }
 
-  turnBulletsIntoPointItems(): void {
+  // Th07.exe FUN_00422ea0(1) (op80, spell declare, full-power crossing):
+  // every live enemy bullet becomes an auto-collecting small cherry item
+  // (type 6 = the cancel type FUN_00421a40 bakes into +0x37a160; mode 1
+  // sets the item's autocollect byte +0x27f). No score popups on this path.
+  cancelBulletsToItems(): void {
     for (const b of this.enemyBullets) {
-      this.spawnItem('pointBullet', b.x, b.y, { state: 1 });
+      this.spawnItem('cherry', b.x, b.y, { state: 1 });
     }
     this.enemyBullets.length = 0;
+  }
+
+  // Th07.exe FUN_00423100(8000,1) (op91 spell end, boss nonspell death):
+  // same conversion, but each bullet also pops an escalating score value —
+  // 2000, +20 per bullet, capped at 8000 — summed and returned for the
+  // caller to bank as total/10 (all.c:6632-6645 / 14343-14349).
+  sweepBulletsToItems(): number {
+    let total = 0;
+    let value = 2000;
+    for (const b of this.enemyBullets) {
+      this.spawnItem('cherry', b.x, b.y, { state: 1 });
+      total += value;
+      value = Math.min(8000, value + 20);
+    }
+    this.enemyBullets.length = 0;
+    return total;
   }
 
   // ECL op 125 ("STD unpause") is a no-op here: stage1.std's script clock
@@ -482,6 +537,11 @@ export class StageScene implements GameHost {
       this.updatePlayerBullets();
       this.updateBullets();
       this.checkPlayerCollision();
+    } else {
+      // Dialogue up: in-flight player shots keep moving and leave the
+      // screen (the exe's shot manager keeps running; only firing and
+      // damage are suspended). collide=false skips the enemy hit tests.
+      this.updatePlayerBullets(false);
     }
     this.updateItems();
     this.updateParticles();
@@ -500,7 +560,7 @@ export class StageScene implements GameHost {
   }
 
   private onBombUsed(): void {
-    this.playSfx(12);
+    this.playSfx(14);
     this.spawnEffectParticles(3, this.playerObj.x, this.playerObj.y, 24, 0xffffffff);
     // Th07.exe FUN_00431d10: bombing flags every live item for collection
     // (same state=1 autocollect the border uses in updateItems).
@@ -599,7 +659,12 @@ export class StageScene implements GameHost {
     for (const b of this.enemyBullets) {
       if (b.dead) continue;
       if (Math.abs(b.x - p.x) <= 128 && Math.abs(b.y - p.y) <= 128) {
-        this.spawnItem('pointBullet', b.x, b.y, { state: 1 });
+        // Bomb-touched bullets spawn item type DAT_004b5ebc — BSS, never
+        // written, so 0 = a power item (bullet tick @ all.c:16160), which
+        // FUN_00430970/spawnItem converts to a big cherry (+1000+100c) at
+        // power >= 128. That conversion IS the vanilla bomb-to-charge-
+        // border economy; the old 'pointBullet' spawn starved it.
+        this.spawnItem('power', b.x, b.y, { state: 1 });
         b.dead = true;
       }
     }
@@ -633,7 +698,7 @@ export class StageScene implements GameHost {
     // CherrySystem#onDeath).
     this.cherry.onDeath(p.character.startsWith('sakuya'));
     this.voidSpellCapture();
-    this.playSfx(2);
+    this.playSfx(4);
     this.spawnEffectParticles(3, p.x, p.y, 32, 0xffffffff);
     for (let i = 0; i < 5; i++) {
       this.spawnItem('power', p.x + this.rng.range(64) - 32, p.y - this.rng.range(32));
@@ -684,7 +749,7 @@ export class StageScene implements GameHost {
     this.gameOver = false;
     this.gameOverTimer = 0;
     this.continueScreen = null;
-    this.playSfx(8); // se_ok00
+    this.playSfx(10); // se_ok00
   }
 
   private declineContinue(): void {
@@ -751,7 +816,7 @@ export class StageScene implements GameHost {
     e.hp -= dmg;
   }
 
-  private updatePlayerBullets(): void {
+  private updatePlayerBullets(collide = true): void {
     // Th07.exe FUN_0043edc0/FUN_0041ed50 (exe-player-funcs1.md §2): the homing
     // target is a single per-frame cache shared by every ReimuA amulet/orb —
     // the eligible enemy minimizing |e.x - player.x| (Y ignored entirely).
@@ -787,7 +852,7 @@ export class StageScene implements GameHost {
         if (b.hitAge > 16) b.dead = true;
       }
       if (b.state !== 'fired') continue;
-      for (const e of this.enemies) {
+      for (const e of collide ? this.enemies : []) {
         // Exe shot gate is bit0 (interactable) && bit4 (shotCollision) —
         // NOT bit1 (collisionEnabled), which only covers body-vs-player.
         if (!e.ecl.shotCollision || !e.ecl.interactable || e.ecl.invisible || e.dead) continue;
@@ -808,7 +873,7 @@ export class StageScene implements GameHost {
               b.vx /= 8;
               b.vy /= 8;
             }
-            this.playSfx(17);
+            this.playSfx(20);
           }
           break;
         }
@@ -934,10 +999,10 @@ export class StageScene implements GameHost {
     }
     // Th07.exe FUN_0041ebc0: enemy bodies are grazable, region hitbox/1.4
     // (= *(1/0.7)/2), re-attempted every 6 frames while touching -- only
-    // when op136 armed `bodyRegrazeFlag` (`+0x2e29` bit5, see the
+    // when op136 armed `sweepItemFlag` (`+0x2e29` bit5, see the
     // borderActive branch above for the full citation).
     for (const e of this.enemies) {
-      if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.bodyRegrazeFlag) continue;
+      if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.sweepItemFlag) continue;
       const cd = this.bodyGrazeCooldown.get(e.id) ?? 0;
       if (cd > 0) { this.bodyGrazeCooldown.set(e.id, cd - 1); continue; }
       if (Math.abs(e.x - px) <= e.ecl.hitbox.x / 1.4 + p.grazeboxHalf + 20 &&
@@ -960,17 +1025,24 @@ export class StageScene implements GameHost {
     if (this.spellcard) {
       this.spellcard.grazeBonus += 2500 + Math.trunc(this.cherry.cherry / 1500) * 20;
     }
-    this.playSfx(24);
+    this.playSfx(30);
   }
 
   private onPlayerHit(): void {
+    const p = this.playerObj;
+    // An invulnerable player (spawn/bomb invuln, or already in the
+    // deathbomb window) takes no hit outcome at all in the exe — in
+    // particular a contact during invuln must NOT break the border.
+    // (Breaking it before this check let one absorbed hit's 30 invuln
+    // frames chain-eat every subsequent border the instant it started.)
+    if (p.invulnFrames > 0 || p.bombInvuln > 0 || p.deathTimer >= 0) return;
     if (this.cherry.breakBorder()) {
       // The border absorbs the hit.
-      this.playerObj.invulnFrames = Math.max(this.playerObj.invulnFrames, 30);
+      p.invulnFrames = Math.max(p.invulnFrames, 30);
       return;
     }
-    const result = this.playerObj.hit();
-    if (result === 'deathbomb-window') this.playSfx(17);
+    const result = p.hit();
+    if (result === 'deathbomb-window') this.playSfx(20);
   }
 
   private updateEnemies(): void {
@@ -1143,12 +1215,15 @@ export class StageScene implements GameHost {
   private collectItem(it: ItemEntity): void {
     const p = this.playerObj;
     it.dead = true;
-    this.playSfx(18);
+    this.playSfx(21);
     switch (it.type) {
       case 'power':
         if (p.power < 128) {
           p.power = Math.min(128, p.power + 1);
-          if (p.power === 128) this.turnBulletsIntoPointItems();
+          // Crossing to full power clears the field: FUN_00422ea0(1)
+          // inside the collect handler (all.c:22031/22139) — plain cancel
+          // to cherry items, no score sweep.
+          if (p.power === 128) this.cancelBulletsToItems();
         } else {
           this.addScore(12800);
         }
@@ -1165,27 +1240,38 @@ export class StageScene implements GameHost {
         break;
       }
       case 'pointBullet':
-        // exe-cherry-border.md §3/§6: star/cancel items (cases 0/2) never
-        // touch any cherry accumulator — score/graze-combo only.
-        this.addScore(this.graze * 10 + 500);
+        // Exe item type 8 ("cancel star"): +30 cherry&cherryPlus (dc6f)
+        // and +70 cherry-only (dd6c), NO score (FUN_00430c10 case 8).
+        // Retail never spawns it — the only type-8 spawner is
+        // FUN_00422ea0(3..8), which has no caller — and after the cancel
+        // paths above were rewired to their true types (6 / 0), neither do
+        // we; the handler stays for completeness.
+        this.cherry.onBigCherryItem();
         break;
       case 'bomb':
         p.bombs = Math.min(8, p.bombs + 1);
         break;
       case 'life':
         p.lives = Math.min(8, p.lives + 1);
-        this.playSfx(22);
+        this.playSfx(28);
         break;
       case 'cherry':
         // exe case 6 (spec §3b): +20 cherry, score = grazeScaledValue/10.
         this.addScore(this.cherry.grazeScaledItemScore(this.graze));
         this.cherry.onSmallCherryItem();
         break;
-      case 'bigCherry':
-        // exe case 8 (spec §3b): +100 cherry total (30 dc6f + 70 dd6c), no
-        // score effect at all.
-        this.cherry.onBigCherryItem();
+      case 'bigCherry': {
+        // This ItemType is exe item TYPE 7 (the drop-table entry, and what
+        // power drops convert to at power>=128, FUN_00430970 all.c:21819) —
+        // exe collect case 7: cherry AND cherryPlus += 1000 + 100×spell
+        // captures (all.c:22236), plus a height-falloff score bonus when
+        // cherry is already saturated. The previous onBigCherryItem() call
+        // was exe case 8 (+30 cherryPlus, a DIFFERENT item) — that 33×+
+        // under-award starved the border trigger (never reached 50000).
+        this.addScore(this.cherry.largeCherryItemScore(it.y, this.playerObj.sht.pocLineY, it.state === 1));
+        this.cherry.onLargeCherryItem();
         break;
+      }
     }
   }
 
@@ -1807,7 +1893,16 @@ export class StageScene implements GameHost {
     const cherryStr = String(Math.max(0, Math.trunc(this.cherry.cherry)));
     this.drawNumber(r, this.cherry.cherry, PLAYFIELD.x + 84 - cherryStr.length * DIGIT_W, 450);
     this.drawNumber(r, this.cherry.cherryMax, PLAYFIELD.x + 96, 450);
-    r.text(`+${Math.max(0, Math.trunc(this.cherry.cherryPlus))}`, PLAYFIELD.x + 46, 446, { size: 10, color: '#c080b0' });
+    // Exe layout (all.c:1846-1850 + rdata 0x48ec7c/0x48eac0): cherryPlus is
+    // drawn one text row ABOVE the cherry/cherryMax line (base+2 vs base+11),
+    // in the purple B/G/R 0xb0/0x80/0xc0 — right-aligned over the cherry
+    // field so it never collides with cherryMax.
+    // While a border is up, the exe repurposes the display as the border
+    // countdown = 50000 * timerLeft / 540 (mode-4 recompute, all.c:28735).
+    const plusVal = this.cherry.borderActive
+      ? Math.trunc((50000 * this.cherry.borderTimer) / BORDER_DURATION)
+      : Math.max(0, Math.trunc(this.cherry.cherryPlus));
+    r.text(`+${plusVal}`, PLAYFIELD.x + 84, 444, { size: 10, color: '#c080b0', align: 'right' });
 
     if (this.bossActive) {
       const hp = Math.max(0, this.bossActive.hp);

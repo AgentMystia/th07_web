@@ -85,12 +85,17 @@ const RANDOM_ITEMS: ItemType[] = [
   'point', 'power', 'bigCherry', 'point', 'point', 'point', 'power', 'bigPower'
 ];
 
-// Th07.exe FUN_004256d0 @ 0x4256d0 builds 11 bullet templates; the graze
-// hitbox is a per-shape FULL width read from the size brackets
-// (0x425a3b/0x425aa5/0x425c14), NOT derived from the sprite rect. Index is the
-// ECL sprite/shape id 0-10. Out-of-table ids fall back to the sprite-fraction
+// Th07.exe FUN_004256d0 @ 0x4256d0 builds 11 bullet templates; the kill AND
+// graze hitbox share one per-shape FULL width, classified by primary sprite
+// width (thresholds 8/16/32 @ 0x48eacc/d0/d4) then special-cased by anm
+// script id: w<=8 -> 4; 8<w<=16 -> ids 0x202/204/205/206 (rice/kunai/
+// crystal/knife) 4, default 6; 16<w<=32 -> 0x208 (ring) 5, 0x209 (amulet) 8,
+// default 10; w>32 -> 24. Index is the ECL sprite/shape id 0-10 (type 3's
+// primary script is 0x203 -> the 6.0 default branch, previously wrong here
+// as 4). Graze adds a flat +20 pad (DAT_0048ebf4) at the test site, not in
+// this table. Out-of-table ids fall back to the sprite-fraction
 // approximation at point of use (flagged per AGENTS.md §7).
-const BULLET_HITBOX_BY_SPRITE = [4, 6, 4, 4, 4, 4, 4, 10, 5, 8, 24];
+const BULLET_HITBOX_BY_SPRITE = [4, 6, 4, 6, 4, 4, 4, 10, 5, 8, 24];
 
 // Special variable ids (reads resolved from game state). Writable general
 // variables live in EclState.vars. Th07.exe: 10000-10015 are FIXED per-enemy
@@ -339,7 +344,7 @@ export class StageRuntime {
       shouldClamp: false,
       spellName: '',
       seen: false,
-      bodyRegrazeFlag: false,
+      sweepItemFlag: false,
       offscreenCullExempt: false,
       damageShield: 0
     };
@@ -612,7 +617,11 @@ export class StageRuntime {
 
   private updateAutoShoot(game: GameHost, e: Enemy): void {
     const s = e.ecl;
-    if (!s.shootInterval || s.shootDisabled || !s.bulletProps) return;
+    // Exe auto-shoot tick (all.c:7194-7208) fires purely on interval>0 &&
+    // hp>0 — it does NOT consult the op75/76 bit (that bit only suppresses
+    // the immediate fire inside FIRE ops 64-72). Checking shootDisabled here
+    // silenced every op75-then-op73 pattern.
+    if (!s.shootInterval || !s.bulletProps) return;
     s.shootTimer++;
     if (s.shootTimer >= s.shootInterval) {
       s.shootTimer = 0;
@@ -882,12 +891,32 @@ export class StageRuntime {
         return null;
       }
       case 73: case 74: { // auto-fire interval (74 randomizes phase)
-        s.shootInterval = gi(0);
-        s.shootTimer = op === 74 && s.shootInterval > 0 ? game.rng.u32InRange(s.shootInterval) : 0;
+        // Exe cases 0x48/0x49: the interval is rank-scaled at set time:
+        // iv' = iv + trunc(iv/5) + trunc(-2*trunc(iv/5)*rank / 32)
+        // (the exe's `+ (v>>31 & 31) >> 5` idiom is truncation toward zero).
+        // Identity at rank 16; x1.2 at rank 0 — the retail value, since
+        // DAT_00625884 is BSS (defaults 0), no gameplay event moves it, and
+        // no stage ECL ever writes its var (10017).
+        let iv = gi(0);
+        if (iv !== 0) {
+          const fifth = Math.trunc(iv / 5);
+          iv = iv + fifth + Math.trunc((-2 * fifth * game.rank) / 32);
+        }
+        s.shootInterval = iv;
+        s.shootTimer = op === 74 && iv > 0 ? game.rng.u32InRange(iv) : 0;
         return null;
       }
+      // Ops 75/76 (exe 0x4a/0x4b) set/clear enemy flag bit 0x20, which gates
+      // ONLY the immediate fire inside FIRE ops 64-72 (all.c:8545). The
+      // auto-shoot interval tick (all.c:7194-7208) never consults it — see
+      // updateAutoShoot.
       case 75: s.shootDisabled = true; return null;
       case 76: s.shootDisabled = false; return null;
+      case 77: { // re-fire (exe case 0x4c): refresh shoot pos, fire the
+        // current template again without re-reading FIRE args.
+        if (s.bulletProps) this.spawnBullets(game, e, s.bulletProps);
+        return null;
+      }
       case 78: s.shootOffset = { x: gf(0), y: gf(4), z: gf(8) }; return null;
       case 79: { // BULLET_EX: write one op-79 template slot (arg0 = slot index)
         // exe FUN_0040f6c0 case 0x4e: arg0 selects one of 5 per-enemy slots;
@@ -900,7 +929,12 @@ export class StageRuntime {
         if (s.bulletProps) s.bulletProps.exSlots = s.bulletExSlots.slice();
         return null;
       }
-      case 80: if (s.bulletProps) this.spawnBullets(game, e, s.bulletProps); return null;
+      case 80: // bullet cancel (exe case 0x4f = FUN_00422ea0(1)): every live
+        // enemy bullet becomes an auto-collecting small cherry item (type 6,
+        // the constructor-set cancel type at +0x37a160), no score popups.
+        // Previously mislabeled as a re-fire — that is op 77.
+        game.cancelBulletsToItems();
+        return null;
       case 81: { // bullet fire SFX (id, unknown)
         const sfx = v.i32(a);
         s.bulletSfx = sfx;
@@ -922,14 +956,22 @@ export class StageRuntime {
         s.spellName = new TextDecoder('shift_jis').decode(decoded);
         s.spellCardActive = true; // Th07.exe DAT_012f40a8 = 1 (all.c:6520)
         game.startBossSpell?.(spellId, v.i16(a), s.spellName);
-        this.turnBulletsIntoPointItems(game);
+        // The declare handler cancels the field's bullets into cherry items
+        // with NO score sweep (all.c:6511 = FUN_00422ea0(1)); the scored
+        // 2000+20i sweep belongs to spell END / boss death only.
+        game.cancelBulletsToItems();
         return null;
       }
-      case 91:
+      case 91: {
         s.spellName = '';
         s.spellCardActive = false; // Th07.exe DAT_012f40a8 = 0 (all.c:6692)
-        game.endBossSpell?.();
-        this.turnBulletsIntoPointItems(game);
+        // Exe FUN_0040f340: only a spell that is still "live" (DAT_012f40a8
+        // == 1 — i.e. it did not time out; a timeout bumps it to 2 and fades
+        // the bullets itemlessly at all.c:13831) gets the phase-end sweep:
+        // bullets -> cherry items with escalating 2000/+20 popups, then the
+        // helper-enemy sweep (FUN_004217c0, 2000/+30), score += total/10.
+        // The capture bonus (if any) is awarded on top. endBossSpell returns
+        // whether the sweep applies.
         // Ending a spell also shatters the spell's helper enemies (Letty's
         // ice orbs, snowflake spinners). Evidence in ecldata1: hp-interrupt
         // transitions clean helpers with an explicit ins_94 at the next
@@ -937,8 +979,16 @@ export class StageRuntime {
         // ins_91 itself — Letty's death sub (Sub51) has no ins_94, yet her
         // Sub50 orbs die with the boss in the original. Cirno's Sub27 pairs
         // ins_91 with a redundant ins_94, so this stays a no-op there.
-        this.killNonBossEnemies(game);
+        const sweep = game.endBossSpell?.() ?? true;
+        if (sweep) {
+          let total = game.sweepBulletsToItems();
+          total = this.killNonBossEnemies(game, this.executingEnemy, total);
+          if (total > 0) game.addScore(Math.trunc(total / 10));
+        } else {
+          this.killNonBossEnemies(game);
+        }
         return null;
+      }
       case 93: { // spawn child enemy relative to parent: (sub, x, y, z, life, item, score)
         this.spawnEclEnemy(game, {
           subId: v.i32(a),
@@ -963,7 +1013,9 @@ export class StageRuntime {
         });
         return null;
       }
-      case 94: this.killNonBossEnemies(game); return null;
+      // Op 94 (exe case 0x5d = FUN_004217c0(8000,0), return DISCARDED):
+      // sweep helpers with cherry drops but no score bank.
+      case 94: this.killNonBossEnemies(game, this.executingEnemy, 0); return null;
       case 95: this.setCurrentAnm(e, v.i32(a)); return null;
       case 96: { // directional pose scripts
         s.anmExDefaults = v.i16(a);
@@ -1076,13 +1128,13 @@ export class StageRuntime {
         game.enemyLasers.length = 0;
         return null;
       case 135: s.spellTimeoutFlag = !!v.i32(a); return null;
-      // Op 136 (exe case 0x87 -> `+0x2e29` bit5 = arg&1): periodic
+      // Op 136 (exe case 0x87 -> `+0x2e29` bit5 = arg&1): gates the
+      // FUN_004217c0 sweep's cherry drop (all.c:14884) AND periodic
       // body-graze re-eligibility (exe-collision.md §6, ~every 6 frames
-      // while touching) AND the op94/killNonBossEnemies sweep-cherry-drop
-      // gate (exe-ecl-boss.md op94 section) share this one bit
-      // (exe-misc-ecl-ops.md §3). `+0x2e2f=2` (draw-order bucket, no
-      // scoring/collision effect) is not modeled.
-      case 136: s.bodyRegrazeFlag = !!(v.i32(a) & 1); return null;
+      // while touching) — one bit, both consumers (exe-misc-ecl-ops.md §3).
+      // `+0x2e2f=2` (draw-order bucket, no scoring/collision effect) is
+      // not modeled.
+      case 136: s.sweepItemFlag = !!(v.i32(a) & 1); return null;
       // Op 137 (exe case 0x88 -> `+0x2e2a` bit7 = arg&1): exempts this
       // enemy from updateEnemies()'s offscreen auto-cull (exe-misc-ecl-ops.md §4).
       case 137: s.offscreenCullExempt = !!(v.i32(a) & 1); return null;
@@ -1286,19 +1338,11 @@ export class StageRuntime {
   }
 
   // Clears trash mobs; each cleared enemy still runs its death callback (so
-  // item-drop subs execute), matching the original. Th07.exe FUN_004217c0
-  // (op94's handler, also called from op91/spell-end): each cleared,
-  // non-boss occupied slot conditionally drops a cherry item, gated on the
-  // same per-entity flag op136 arms (`+0x2e29` bit5) -- confidence
-  // PROBABLE, the exe's own "diminishing budget" spend-per-drop mechanism
-  // was not pinned (stage1-fidelity-audit.md item 2 / exe-ecl-boss.md
-  // op94 section), so only the confirmed part (one drop per flagged, swept
-  // enemy, no budget decay) is ported; item type 6 = cherry per the
-  // existing ITEM_TABLE/FUN_00430970 mapping.
-  private clearNonBossEnemy(game: GameHost, enemy: Enemy): void {
+  // item-drop subs execute), matching the original.
+  private clearNonBossEnemy(game: GameHost, enemy: Enemy, sweepItems: boolean): void {
     enemy.hp = 0;
     const s = enemy.ecl;
-    if (s.bodyRegrazeFlag) game.spawnItem('cherry', enemy.x, enemy.y);
+    if (sweepItems && s.sweepItemFlag) game.spawnItem('cherry', enemy.x, enemy.y, { state: 1 });
     if (s.deathCallbackSub >= 0) {
       const sub = s.deathCallbackSub;
       s.deathCallbackSub = -1;
@@ -1310,17 +1354,36 @@ export class StageRuntime {
     }
   }
 
-  killNonBossEnemies(game: GameHost, owner: Enemy | null = this.executingEnemy): void {
+  // Th07.exe FUN_004217c0 (op94's handler, also called at op91/spell-end
+  // and boss nonspell death): sweeps every live non-boss enemy — hp = 0
+  // always; enemies flagged by op136 (`+0x2e29` bit5) additionally drop an
+  // auto-collecting cherry item (type 6, mode 1) with an escalating value
+  // popup: 2000 + 30 per drop, capped at 8000, all summed into a running
+  // total the CALLER may (op91/boss death: score += total/10, all.c:6632/
+  // 14343) or may not (op94: return discarded, all.c:9029) bank as score.
+  // Pass startTotal to run the item sweep and continue that accumulator;
+  // omit it for an itemless clear (spell-timeout op91, phase transitions —
+  // the exe has no engine-side helper sweep on those paths).
+  killNonBossEnemies(game: GameHost, owner: Enemy | null = this.executingEnemy, startTotal?: number): number {
+    const sweepItems = startTotal !== undefined;
+    let total = startTotal ?? 0;
+    let value = 2000;
     for (const enemy of game.enemies) {
       if (enemy === owner || enemy.ecl.isBoss) continue;
-      this.clearNonBossEnemy(game, enemy);
+      const drops = sweepItems && enemy.ecl.sweepItemFlag;
+      this.clearNonBossEnemy(game, enemy, sweepItems);
+      if (drops) {
+        total += value;
+        value = Math.min(8000, value + 30);
+      }
     }
+    return total;
   }
 
   private clearNonBossEnemies(game: GameHost, owner: Enemy): void {
     for (const enemy of game.enemies) {
       if (enemy === owner || enemy.ecl.isBoss) continue;
-      this.clearNonBossEnemy(game, enemy);
+      this.clearNonBossEnemy(game, enemy, false);
     }
   }
 
@@ -1357,7 +1420,7 @@ export class StageRuntime {
       // Boss phase / spell end: the big explosion SE. TH07-TODO: the exact
       // per-phase sound is not exe-verified; se_enep01 matches the audible
       // original boss-phase boom.
-      game.playSfx(15);
+      game.playSfx(18);
       game.spawnEnemyDeathEffect?.(e);
       e.hp = 1;
       // Damage off the instant the death callback starts, or shots landing
@@ -1383,15 +1446,28 @@ export class StageRuntime {
     // no per-enemy value for automatic replay at death, so a scripted
     // death-callback sub's own op105 call already played its SE when that
     // sub ran. This is the fallback for the no-death-callback path only:
-    // the generic se_enep00 "pop" the original plays on a plain kill
-    // (exe-misc-ecl-ops.md §1 -- exact native default SE id unconfirmed,
-    // se_enep00/id 1 matches the audible original).
-    game.playSfx(1);
+    // Exe death SE (disasm @ 0x420379): slot 2 + (counter & 1) — plain
+    // kills alternate se_enep00's two volume slots (-1200/-1500 mB).
+    game.playSfx(2 + (e.id & 1));
     game.spawnEnemyDeathEffect?.(e);
     for (const drop of this.dropTypes(s.itemDrop)) {
       game.spawnItem(drop, e.x, e.y);
     }
-    if (s.isBoss) game.enemyBullets.length = 0;
+    if (s.isBoss) {
+      if (!s.spellCardActive) {
+        // Boss real death outside a spell (all.c:14343, gated on
+        // DAT_012f40a8 == 0): the scored field sweep — bullets to cherry
+        // items (2000/+20 popups) then flagged helpers (2000/+30), score
+        // += total/10. A spell final phase instead sweeps at its op91.
+        let total = game.sweepBulletsToItems();
+        total = this.killNonBossEnemies(game, e, total);
+        if (total > 0) game.addScore(Math.trunc(total / 10));
+      } else {
+        // Shouldn't happen (spells end via op91 before the death path),
+        // kept as a safety net so no bullets leak past a boss kill.
+        game.enemyBullets.length = 0;
+      }
+    }
     return false;
   }
 
@@ -1417,7 +1493,4 @@ export class StageRuntime {
     return type ? [type] : [];
   }
 
-  turnBulletsIntoPointItems(game: GameHost): void {
-    game.turnBulletsIntoPointItems();
-  }
 }

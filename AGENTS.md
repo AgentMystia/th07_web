@@ -278,10 +278,20 @@ comparisons against real play).
 - HUD star icon x positions; spell-timer and fps exact placement.
 - Cherry+ banner interrupt→state mapping (dim=charging, bright=border).
 - Bomb mechanics are functionally accurate first-pass; damage/cancel cadence
-  not yet exe-verified. Bomb visuals run the characters' own playerXX.anm
-  bomb scripts (Reimu scr133–143, Marisa scr71–78/98–104, Sakuya scr5–14 —
-  decoded from the embedded data), but the spawn cadence/anchor offsets in
+  not yet exe-verified (bomb-TOUCHED bullets now spawn the exe-correct item:
+  type 0 power → big cherry at power≥128, DAT_004b5ebc BSS=0 @ all.c:16160,
+  but the exe's per-orb touch test is approximated by a 128px radius). Bomb
+  visuals run the characters' own playerXX.anm bomb scripts (Reimu
+  scr133–143, Marisa scr71–78/98–104, Sakuya scr5–14 — decoded from the
+  embedded data), but the spawn cadence/anchor offsets in
   `StageScene#spawnBombEffects` approximate the exe's placement routine.
+- Phase-end sweep popups: the exe pops each escalating 2000/+20 (bullets)
+  and 2000/+30 (helpers) value at the converted entity (FUN_00402260); the
+  port banks the identical score total but draws no per-item popup text.
+- EX bullet behaviors activate all-at-once at spawn; the exe arms one op-79
+  slot per frame (≤N-frame phase error, N = #armed slots).
+- Move-then-ECL order differs from the exe's ECL-then-move by ≤1 frame of
+  aim skew on aimed FIREs.
 - Spell-bonus decay rounding: exe writes `floor10(ftol(<register-arg float
   expr>))` per frame (0x41f8a8 region); the port computes
   `floor10(base − decayPerSec·elapsed/60)`. Sub-10-point drift only.

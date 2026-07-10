@@ -124,14 +124,27 @@ export interface GameHost {
   isDialogueBlocking?(): boolean;
   consumeDialogueResume?(): boolean;
   startBossSpell?(spellId: number, arg0: number, name: string): void;
-  endBossSpell?(opts?: { fromBossDeath?: boolean }): void;
+  // Returns whether the phase-end field sweep applies — Th07.exe
+  // FUN_0040f340 runs it only when the spell did NOT time out
+  // (DAT_012f40a8 == 1; timeouts bump it to 2 and fade the field
+  // itemlessly at all.c:13831).
+  endBossSpell?(opts?: { fromBossDeath?: boolean }): boolean;
   voidSpellCapture?(): void;
   setBossPresent?(present: boolean, enemy: Enemy | null): void;
   setBossLifeCount?(count: number): void;
   dropPointItems?(e: Enemy, count: number): void;
   awardSpellValue?(value: number): void;
   spawnEnemyDeathEffect?(e: Enemy): void;
-  turnBulletsIntoPointItems(): void;
+  // FUN_00422ea0(1): every live enemy bullet becomes an auto-collecting
+  // small cherry item (type 6 — the constructor-set cancel type at
+  // +0x37a160, FUN_00421a40) with no score popup. Runs at op80, spell
+  // declare (op90) and the full-power crossing.
+  cancelBulletsToItems(): void;
+  // FUN_00423100(8000,1): like cancelBulletsToItems but each bullet also
+  // pops an escalating score value (2000, +20 per bullet, capped 8000);
+  // returns the summed total for the caller to bank as score/10 (op91
+  // spell end, boss nonspell death).
+  sweepBulletsToItems(): number;
   configureAmbience?(op: number, args: number[]): void;
   // Boss timer-callback fired with the ECL "timeout is normal" flag unset
   // (exe flags +0x2e2a bit6 == 0): cherry -25% (FUN_0041e6b0's
@@ -240,12 +253,13 @@ export interface EclState {
   shouldClamp: boolean;
   spellName: string;
   seen: boolean;
-  // Op 136 (exe case 0x87 @ 0x413.. -> `+0x2e29` bit5, arg&1): enables the
-  // enemy body's periodic re-graze (exe-collision.md §6, ~every 6 frames
-  // while touching) and gates op94/killNonBossEnemies' cherry drop on
-  // sweep (exe-ecl-boss.md op94 section) -- same bit, both consumers.
+  // Op 136 (exe case 0x87 @ 0x413.. -> `+0x2e29` bit5, arg&1): gates the
+  // FUN_004217c0 sweep's cherry-item drop (op94 / op91 spell-end / boss
+  // death — verified directly at all.c:14884) and enables the enemy body's
+  // periodic re-graze (exe-collision.md §6, ~every 6 frames while
+  // touching) -- same bit, both consumers.
   // Default false: no confirmed default-on case in stage 1's own data.
-  bodyRegrazeFlag: boolean;
+  sweepItemFlag: boolean;
   // Op 137 (exe case 0x88 @ 0x413.. -> `+0x2e2a` bit7, arg&1): exempts the
   // enemy from the off-screen auto-cull (exe-misc-ecl-ops.md §4). Default
   // false -- ordinary enemies get culled once seen-then-offscreen.

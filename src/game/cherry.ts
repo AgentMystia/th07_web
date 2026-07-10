@@ -65,11 +65,9 @@ export class CherrySystem {
   cherryMax = INITIAL_CHERRY_MAX_BY_DIFFICULTY[1];
   cherryPlus = 0;
   borderTimer = 0; // frames remaining while the border is active
-  // Stand-in for the exe's *(stats+0x1c) per-run counter driving the
-  // case-7 "large Cherry" item amount (spec §3b, write site UNRESOLVED —
-  // this port tracks spell captures instead, which is NOT confirmed to be
-  // the same counter; flagged PROBABLE, kept only because case 7 is
-  // currently unspawned in this port anyway, see onLargeCherryItem below).
+  // The exe's *(stats+0x1c) per-run counter driving the case-7 "big
+  // Cherry" item amount (spec §3b). CONFIRMED = spell-capture count: the
+  // op-91 award path increments it on a valid capture (all.c:6689).
   spellsCaptured = 0;
 
   constructor(private events: CherryEvents = {}, difficultyIndex = 1) {
@@ -184,11 +182,10 @@ export class CherrySystem {
     this.gain(20);
   }
 
-  // Th07.exe FUN_00430c10 case 7 (spec §3b): large "Cherry" item, amount =
-  // 1000 + 100 * (per-run counter @ stats+0x1c, UNRESOLVED — see
-  // spellsCaptured's doc comment above). UNSPAWNED in this port: no
-  // ItemType currently maps to case 7, kept for completeness per the
-  // spec's implementation guidance (§7).
+  // Th07.exe FUN_00430c10 case 7 (spec §3b): big "Cherry" item, amount =
+  // 1000 + 100 * spellsCaptured, to cherry AND cherryPlus (dc6f). This is
+  // the drop-table type 7 AND what power drops convert to at power>=128 —
+  // the main cherryPlus economy ('bigCherry' ItemType maps here).
   largeCherryItemGain(): number {
     return 1000 + 100 * this.spellsCaptured;
   }
@@ -197,10 +194,11 @@ export class CherrySystem {
     this.gain(this.largeCherryItemGain());
   }
 
-  // Th07.exe FUN_00430c10 case 8 (spec §3b): "Big Cherry" item, fixed
-  // amount, no gating at all — +30 cherry+cherryPlus (dc6f) AND +70
-  // cherry-only (dd6c), for +100 total cherry / +30 cherryPlus. No score
-  // effect (case 8 has none). This port's 'bigCherry' ItemType maps here.
+  // Th07.exe FUN_00430c10 case 8 (spec §3b): the bullet-cancel star item —
+  // +30 cherry+cherryPlus (dc6f) AND +70 cherry-only (dd6c), for +100
+  // total cherry / +30 cherryPlus. No score effect. (Previously mislabeled
+  // "Big Cherry" and wired to the 'bigCherry' ItemType — that item is exe
+  // case 7 above; the mixup starved the border trigger.)
   onBigCherryItem(): void {
     this.gain(30);
     this.gainCherryOnly(70);
@@ -318,8 +316,8 @@ export class CherrySystem {
 
   // Th07.exe FUN_00430c10 case 7 score bonus (spec §3b): only fires once
   // cherry is saturated at cherryMax; same height falloff shape as the
-  // point-item formula but no cherry-headroom bonus term. UNSPAWNED in
-  // this port (paired with onLargeCherryItem above), kept per §7.
+  // point-item formula but no cherry-headroom bonus term; fires with the
+  // 'bigCherry' ItemType (exe type 7) once cherry is saturated.
   largeCherryItemScore(y: number, pocLineY: number, autoCollected: boolean): number {
     if (this.cherry < this.cherryMax) return 0;
     const bonus = autoCollected || y <= pocLineY ? 50000 : 50000 - 100 * Math.round(y - pocLineY);
