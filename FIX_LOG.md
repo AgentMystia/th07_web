@@ -7,6 +7,40 @@ stage-1 ECL dump (`reference/re-specs/stage1-ecl-dump.txt`). Newest first.
 
 ---
 
+## 2026-07-10 — cherry gauge: per-difficulty cherryMax + vanilla HUD display (fixes "should be 300000 not 50000")
+
+**Symptom reported:** the cherry gauge shows `N/50000`; vanilla shows
+`N/300000`-scale values (user screenshot: `86120/310000` with purple
+`+18880`, Lunatic).
+
+**Root cause:** the port conflated two different constants. 50000 is the
+**cherryPlus** border trigger (correct, unchanged). The displayed gauge is
+`cherry/cherryMax`, and **initial cherryMax is per-difficulty** — Th07.exe
+run-init `FUN_0042cf2f @ 0x42cf2f` (all.c:19765-19796): Easy/Normal
+200000, Hard 250000, Lunatic 300000 (Extra 400000, Phantasm 400000 with
+cherry pre-loaded; practice mode adds +50000·(startStage−1) — both outside
+this port's scope). The user's 310000 = 300000 + one border-survive's
++10000 to cherryMax. ✓
+
+**HUD:** bottom-left banner now draws `cherry/cherryMax` (cherry
+right-aligned into the banner blank, cherryMax after the baked slash) with
+the small purple `+cherryPlus` above (exe draw @ all.c:1760-1870; vertex
+color B/G/R 0xb0/0x80/0xc0). Previously drew `cherryPlus/50000`.
+
+**Also:** `CherrySystem.onDeath`'s 60000 penalty cap was gated on
+`difficultyIndex === 2` ("Hard", flagged PROBABLE). The Sakuya-only
+second-homing-target code (upward cone −π/3..−2π/3, rdata @
+0x48edc0/0x48edc4) proves `DAT_00625625` is the CHARACTER index, so the
+cap is Sakuya-specific — now `onDeath(isSakuya)`.
+
+### Verification
+25/25 unit tests (new per-difficulty init test); Lunatic dev-shot at
+frame 900 shows `480/300480` + purple `+0` — base 300000 with 6 unfocused
+grazes' +480 to both cherry and cherryMax, cherryPlus untouched by graze,
+all matching the exe accumulator rules.
+
+---
+
 ## 2026-07-10 — exe-faithful damage pipeline (fixes "spell card HP melts too fast" for Cirno + Letty)
 
 **Symptom reported:** Cirno's spell card (and Letty's) die far too fast vs

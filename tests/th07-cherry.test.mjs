@@ -29,7 +29,9 @@ test('border triggers at 50000 cherry+ and survives with bonus (§4)', () => {
   let bonus = 0;
   for (let i = 0; i < BORDER_DURATION; i++) bonus += c.tick();
   assert.equal(c.borderActive, false);
-  assert.equal(c.cherryMax, 60000);
+  // default difficulty Normal: initial cherryMax 200000 (FUN_0042cf2f)
+  // + 10000 border-survive bump
+  assert.equal(c.cherryMax, 210000);
   // §4 CONFIRMED: survive bonus = cherry (×1, not ×10 -- the exe's
   // `bonus*10` immediately `/10` is a lossless compiler no-op).
   assert.equal(bonus, 50000);
@@ -42,7 +44,7 @@ test('border break absorbs hit, no bonus, cherry+ resets', () => {
   assert.equal(c.borderActive, true);
   assert.equal(c.breakBorder(), true);
   assert.equal(c.borderActive, false);
-  assert.equal(c.cherryMax, 50000);
+  assert.equal(c.cherryMax, 200000);
   assert.equal(c.cherryPlus, 0);
   assert.equal(c.breakBorder(), false);
 });
@@ -52,7 +54,7 @@ test('border grazes raise cherry max by 30/80', () => {
   for (let i = 0; i < CHERRY_PLUS_MAX / 10; i++) fodderHit(c, 28);
   c.onGraze(true);
   c.onGraze(false);
-  assert.equal(c.cherryMax, 50110);
+  assert.equal(c.cherryMax, 200110);
 });
 
 // exe-cherry-border.md §3a (all.c 14181-14220), retail-simplified formula:
@@ -147,8 +149,8 @@ test('point item score gets a cherry-headroom bonus below 50000, capped down abo
 test('death loses floor10(min(cap, round(cherry*0.5))); cherry never exceeds max (§3d, RATE PROBABLE)', () => {
   const c = new CherrySystem();
   for (let i = 0; i < CHERRY_PLUS_MAX / 10; i++) fodderHit(c, 28);
-  assert.equal(c.cherry, 50000); // capped at max
-  c.onDeath(1); // difficultyIndex=1 (Normal): cap=100000, not binding here
+  assert.equal(c.cherry, 50000); // 5000 hits x 10
+  c.onDeath(false); // not Sakuya: cap=100000, not binding here
   assert.equal(c.cherry, 25000); // floor10(round(50000*0.5))
   assert.equal(c.cherryPlus, 0);
 });
@@ -159,4 +161,11 @@ test('boss timeout costs exactly 25% of cherry, floored to 10, no cap (§3e CONF
   assert.equal(c.cherry, 50000);
   c.onBossTimeout();
   assert.equal(c.cherry, 37500); // 50000 - floor10(round(50000*0.25))
+});
+
+test('initial cherryMax is per-difficulty (Th07.exe FUN_0042cf2f @ 0x42cf2f)', () => {
+  assert.equal(new CherrySystem({}, 0).cherryMax, 200000); // Easy
+  assert.equal(new CherrySystem({}, 1).cherryMax, 200000); // Normal
+  assert.equal(new CherrySystem({}, 2).cherryMax, 250000); // Hard
+  assert.equal(new CherrySystem({}, 3).cherryMax, 300000); // Lunatic
 });

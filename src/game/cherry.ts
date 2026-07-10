@@ -36,7 +36,15 @@
 //   `score +=` below is already in the port's `this.score` units.
 export const CHERRY_PLUS_MAX = 50000;
 export const BORDER_DURATION = 540;
-export const INITIAL_CHERRY_MAX = 50000;
+// Th07.exe run-init FUN_0042cf2f @ 0x42cf2f (all.c:19765-19796): cherryMax
+// starts per difficulty — Easy/Normal 200000, Hard 250000, Lunatic 300000
+// (Extra/Phantasm 400000 with cherry pre-loaded — outside this port's
+// range). cherry and cherryPlus start at 0 (base-collapsed, spec §1a).
+// The previous INITIAL_CHERRY_MAX = 50000 conflated the cherryPlus border
+// trigger with the cherry cap; the vanilla HUD gauge reads
+// cherry/cherryMax (e.g. 86120/310000 on Lunatic after one border's
+// +10000), not cherryPlus/50000.
+export const INITIAL_CHERRY_MAX_BY_DIFFICULTY = [200000, 200000, 250000, 300000];
 
 // Floors a non-negative integer to the nearest multiple of 10 — the exe's
 // recurring `v = v - v % 10` idiom (point items §3c, death §3d, boss
@@ -54,7 +62,7 @@ export interface CherryEvents {
 
 export class CherrySystem {
   cherry = 0;
-  cherryMax = INITIAL_CHERRY_MAX;
+  cherryMax = INITIAL_CHERRY_MAX_BY_DIFFICULTY[1];
   cherryPlus = 0;
   borderTimer = 0; // frames remaining while the border is active
   // Stand-in for the exe's *(stats+0x1c) per-run counter driving the
@@ -64,7 +72,11 @@ export class CherrySystem {
   // currently unspawned in this port anyway, see onLargeCherryItem below).
   spellsCaptured = 0;
 
-  constructor(private events: CherryEvents = {}) {}
+  constructor(private events: CherryEvents = {}, difficultyIndex = 1) {
+    this.cherryMax =
+      INITIAL_CHERRY_MAX_BY_DIFFICULTY[difficultyIndex] ??
+      INITIAL_CHERRY_MAX_BY_DIFFICULTY[1];
+  }
 
   get borderActive(): boolean {
     return this.borderTimer > 0;
@@ -251,19 +263,20 @@ export class CherrySystem {
   // write site wasn't traced (spec §5 item 1) — 0.5 is a flagged PROBABLE
   // placeholder ("dying costs about half your cherry"), not
   // disassembly-confirmed. `cap` = 60000 when `DAT_00625625 == 2` else
-  // 100000; `DAT_00625625` is PROBABLE-identified as the raw numeric
-  // difficulty index (spec §3d) but not confirmed to a difficulty *name*
-  // — this port has no Extra/Phantasm tier to cross-check against, so
-  // `difficultyIndex === 2` (this port's "Hard") is implemented literally
-  // per the numeric relationship, flagged uncertain.
+  // 100000. `DAT_00625625` was previously PROBABLE-flagged as the
+  // difficulty index; the homing second-target code settles it as the
+  // CHARACTER index instead — its `== 2` branch selects the Sakuya-only
+  // upward-cone target using the -π/3..-2π/3 window (rdata floats @
+  // 0x48edc0/0x48edc4, read from the exe binary), which only makes sense
+  // for character==Sakuya. So the death cap is Sakuya-specific.
   //
   // The previous per-character `lossRatio` arg (SHT `cherryLossOnDeath`,
   // src/formats/sht.ts) is dropped: the exe's traced rate source is the
   // per-stage config float above, not a per-character SHT field. The SHT
   // field is real data (still parsed) but nothing here confirms it's the
   // same knob — see EXECUTION-LOG.md for the discrepancy note.
-  onDeath(difficultyIndex: number): void {
-    const cap = difficultyIndex === 2 ? 60000 : 100000;
+  onDeath(isSakuya: boolean): void {
+    const cap = isSakuya ? 60000 : 100000;
     const rate = 0.5; // PROBABLE, spec §5 item 1 — see doc comment above
     const penalty = Math.min(cap, Math.round(this.cherry * rate));
     this.cherry = Math.max(0, this.cherry - floor10(penalty));

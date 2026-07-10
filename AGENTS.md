@@ -237,8 +237,12 @@ Bullet hitboxW/H are full widths; enemy-vs-player-bullet AABB is
 comments): unfocused orb offsets (∓24, 0), focused (∓8, −32); SakuyaB-only
 option orbit fully decoded (rate vx·π/200, clamp ±36°, focused cluster
 ±π/14 at r=24); focus-toggle glide is 8 frames (x lerp, y eased); cherry
-border trigger 50000 (0xC350), border duration 540 frames (0x21C) with
-30-frame fades; border-survive score bonus is `cherry` (×1, not ×10 — the
+border trigger 50000 (0xC350) on **cherryPlus** (not the displayed gauge
+cap!), border duration 540 frames (0x21C) with 30-frame fades; initial
+**cherryMax** is per difficulty — 200000 E/N, 250000 H, 300000 L
+(FUN_0042cf2f @ 0x42cf2f); the bottom-left gauge displays
+`cherry/cherryMax` plus a small purple cherryPlus; border-survive score
+bonus is `cherry` (×1, not ×10 — the
 exe's `bonus*10` immediately `/10` is a lossless compiler no-op); point
 item score (case 1 of the item-collect switch) is `v = 50000 − 100·round(y
 − pocLine)` (or flat 50000 at/above the line), `+= floor((cherry−50000)/5)`
@@ -256,9 +260,10 @@ column x=432, digit font = ascii.png 8×12 glyphs at texture y=208 (digit d
 at x=8d, pitch 8, no comma glyph), 東方妖々夢 logo at (480,208), caption at
 (448,336), frame tiled from the 32×32 maroon tile + 128×16 strip (exact
 integer fit), boss nameplates are ename.png rows (row 0 Cirno, row 1 Letty)
-composited at (32,26), Cherry+ banner at (32,448) with the value
-right-aligned into the blank slot ending at in-sprite x≈84 and the 50000
-cap after the slash.
+composited at (32,26), cherry banner at (32,448) showing `cherry/cherryMax`
+(cherry right-aligned into the blank slot ending at in-sprite x≈84,
+cherryMax after the slash) with the small purple cherryPlus above the
+blank (exe draw @ all.c:1760-1870).
 
 ## 7. Approximations registry (known, flagged, improvable)
 

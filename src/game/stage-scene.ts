@@ -113,12 +113,7 @@ export class StageScene implements GameHost {
   private gameOverTimer = 0;
   private stageClearTimer = 0;
   private exitFired = false;
-  cherry = new CherrySystem({
-    onBorderStart: () => this.playSfx(27),
-    onBorderEnd: (result) => {
-      if (result === 'survived') this.playSfx(28);
-    }
-  });
+  cherry: CherrySystem;
   hiScore = 100000;
   dialogue: DialogueRunner | null = null;
   private dialogueResume = false;
@@ -165,6 +160,15 @@ export class StageScene implements GameHost {
 
   constructor(private assets: GameAssets, private audio: AudioBus, difficulty = 1, character: CharacterId = 'reimuA') {
     this.difficulty = difficulty;
+    this.cherry = new CherrySystem(
+      {
+        onBorderStart: () => this.playSfx(27),
+        onBorderEnd: (result) => {
+          if (result === 'survived') this.playSfx(28);
+        }
+      },
+      difficulty
+    );
     this.runtime = new StageRuntime(TH07_DATA.stages[1], {
       etama: assets.anms.etama,
       enemy: assets.anms.stg1enm,
@@ -627,7 +631,7 @@ export class StageScene implements GameHost {
     // config float, not the SHT's per-character cherryLossOnDeath field
     // (still parsed on `p.unfocused` but unused here — see cherry.ts
     // CherrySystem#onDeath).
-    this.cherry.onDeath(this.difficulty);
+    this.cherry.onDeath(p.character.startsWith('sakuya'));
     this.voidSpellCapture();
     this.playSfx(2);
     this.spawnEffectParticles(3, p.x, p.y, 32, 0xffffffff);
@@ -1790,17 +1794,20 @@ export class StageScene implements GameHost {
     label(FRONT.point, 176);
     this.drawNumber(r, this.pointItems, valueX, 178);
 
-    // Cherry+ readout hugging the screen's bottom-left (ascii.anm script4):
-    // the banner sprite reads "Cherry+ [blank]/" — the current Cherry+ value
-    // is composited right-aligned into the blank slot ending at the slash
-    // (in-sprite x≈84), and the 50000 cap goes after it. The banner itself
+    // Cherry readout hugging the screen's bottom-left (ascii.anm script4;
+    // exe draw @ all.c:1760-1870): the main row is `cherry / cherryMax`
+    // (the vanilla gauge — e.g. 86120/310000 on Lunatic), with the current
+    // cherry right-aligned into the banner sprite's blank slot ending at
+    // the baked slash (in-sprite x≈84) and cherryMax after it. The small
+    // purple `+cherryPlus` (border progress toward 50000, exe vertex color
+    // B/G/R = 0xb0/0x80/0xc0) floats above the blank. The banner sprite
     // dims to alpha 64/255 while charging and runs full-bright while the
-    // border is up (the script's interrupt-2/3 states); the engine-drawn
-    // digits stay opaque.
+    // border is up; the engine-drawn digits stay opaque.
     this.blit(r, 'ascii', [0, 224, 96, 16], PLAYFIELD.x, 448, this.cherry.borderActive ? 1 : 64 / 255);
-    const plusStr = String(Math.max(0, Math.trunc(this.cherry.cherryPlus)));
-    this.drawNumber(r, this.cherry.cherryPlus, PLAYFIELD.x + 84 - plusStr.length * DIGIT_W, 450);
-    this.drawNumber(r, CHERRY_PLUS_MAX, PLAYFIELD.x + 96, 450);
+    const cherryStr = String(Math.max(0, Math.trunc(this.cherry.cherry)));
+    this.drawNumber(r, this.cherry.cherry, PLAYFIELD.x + 84 - cherryStr.length * DIGIT_W, 450);
+    this.drawNumber(r, this.cherry.cherryMax, PLAYFIELD.x + 96, 450);
+    r.text(`+${Math.max(0, Math.trunc(this.cherry.cherryPlus))}`, PLAYFIELD.x + 46, 446, { size: 10, color: '#c080b0' });
 
     if (this.bossActive) {
       const hp = Math.max(0, this.bossActive.hp);
