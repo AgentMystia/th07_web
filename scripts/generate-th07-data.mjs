@@ -79,12 +79,19 @@ function readCString(buf, offset) {
 const b64 = (name) => readFileSync(join(source, name)).toString('base64');
 const anm = (name) => stripAnmTextures(readFileSync(join(source, name)), name).toString('base64');
 
-// ANM files needed for stage 1 + menus. Keys are used by the runtime to
+// ANM files needed for stages 1-8 + menus. Keys are used by the runtime to
 // resolve entry texture names (data/xxx/yyy.png) to assets/th07-img/yyy.png.
 const ANM_FILES = [
-  'etama', 'stg1enm', 'stg1bg', 'player00', 'player01', 'player02',
-  'eff01', 'ascii', 'text', 'title01', 'std1txt', 'capture', 'face_01_00',
-  'face_rm00', 'face_mr00', 'face_sk00', 'front'
+  'etama', 'player00', 'player01', 'player02',
+  'ascii', 'text', 'title01', 'capture', 'front',
+  'face_rm00', 'face_mr00', 'face_sk00',
+  'stg1enm', 'stg2enm', 'stg3enm', 'stg4enm', 'stg5enm', 'stg6enm', 'stg7enm', 'stg8enm',
+  'stg1bg', 'stg2bg', 'stg3bg', 'stg4bg', 'stg4bg2', 'stg4bg3', 'stg4bg4', 'stg4bg5',
+  'stg5bg', 'stg6bg', 'stg7bg', 'stg8bg',
+  'eff01', 'eff02', 'eff03', 'eff04', 'eff04b', 'eff05', 'eff06', 'eff07', 'eff08',
+  'std1txt', 'std2txt', 'std3txt', 'std4txt', 'std5txt', 'std6txt', 'std7txt', 'std8txt',
+  'face_01_00', 'face_02_00', 'face_03_00', 'face_04_00', 'face_05_00', 'face_06_00',
+  'face_07_00', 'face_08_00'
 ];
 
 const SHT_FILES = [
@@ -101,9 +108,31 @@ const bgmTracks = parseThbgmFmt(readFileSync(join(source, 'thbgm.fmt'))).map((t)
   totalSamples: t.lengthBytes / 4
 }));
 
+// One entry per stage 1-8 (7 = Extra, 8 = Phantasm). extraBgAnms: stage 4
+// swaps between five background ANM banks mid-stage (stg4bg2..5); stage 6's
+// second texture lives inside stg6bg.anm itself so needs no extra entry.
+const stageEntry = (n, extraBgAnms = []) => ({
+  ecl: b64(`ecldata${n}.ecl`),
+  std: b64(`stage${n}.std`),
+  msg: b64(`msg${n}.dat`),
+  enemyAnm: `stg${n}enm`,
+  bgAnm: `stg${n}bg`,
+  extraBgAnms,
+  effectAnm: `eff0${n}`,
+  stdTxtAnm: `std${n}txt`,
+  faceAnm: `face_0${n}_00`
+});
+
 const data = {
   stages: {
-    1: { ecl: b64('ecldata1.ecl'), std: b64('stage1.std'), msg: b64('msg1.dat'), enemyAnm: 'stg1enm', bgAnm: 'stg1bg', effectAnm: 'eff01', stdTxtAnm: 'std1txt', faceAnm: 'face_01_00' }
+    1: stageEntry(1),
+    2: stageEntry(2),
+    3: stageEntry(3),
+    4: stageEntry(4, ['stg4bg2', 'stg4bg3', 'stg4bg4', 'stg4bg5']),
+    5: stageEntry(5),
+    6: stageEntry(6),
+    7: stageEntry(7),
+    8: stageEntry(8)
   },
   anm: Object.fromEntries(ANM_FILES.map((n) => [n, anm(`${n}.anm`)])),
   sht: Object.fromEntries(SHT_FILES.map((n) => [n, b64(`${n}.sht`)])),

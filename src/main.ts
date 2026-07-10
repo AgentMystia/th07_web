@@ -126,10 +126,25 @@ async function boot(): Promise<void> {
 
   // Shared by both the menu's "confirm" callback and the direct (?test=1,
   // no ?menu=1) boot path below, so BGM/preload behavior is identical either
-  // way. Track 1 (th07_01) is the title theme, per musiccmt.txt; the stage
-  // tracks were already wired up as-is.
-  function startStage(difficulty: number, character: CharacterId): StageScene {
-    const s = new StageScene(assets, audio, difficulty, character);
+  // way. Track 1 (th07_01) is the title theme, per musiccmt.txt.
+  //
+  // Per-stage BGM: thbgm track layout is stage theme = 2n, boss theme =
+  // 2n+1 for stages 1-6; Extra (7) = 14/15, Phantasm (8) = 16/17. The
+  // repo only ships tracks 01-03 (the thbgmogg.dat source is absent), so
+  // AudioBus falls back gracefully when a track file is missing.
+  function stageTracks(stageNumber: number): [string, string] {
+    const base = stageNumber <= 6 ? stageNumber * 2 : 14 + (stageNumber - 7) * 2;
+    const pad = (n: number) => `th07_${String(n).padStart(2, '0')}`;
+    return [pad(base), pad(base + 1)];
+  }
+
+  function startStage(
+    difficulty: number,
+    character: CharacterId,
+    stageNumber = 1,
+    carry: import('./game/stage-scene').RunCarry | null = null
+  ): StageScene {
+    const s = new StageScene(assets, audio, difficulty, character, stageNumber, carry);
     // Headless probes (?test=1 without ?menu=1) keep the scene alive forever;
     // real play gets the arcade flow: continue screen + return to title.
     s.mode = useMenu ? 'arcade' : 'test';
@@ -137,25 +152,39 @@ async function boot(): Promise<void> {
     s.onExitToTitle = () => {
       sessionHiScore = Math.max(sessionHiScore, s.hiScore);
       stage = null;
-      menu = new MenuFlow(assets, audio, startStage);
+      menu = new MenuFlow(assets, audio, startFromMenu);
       audio.preloadBgm(['th07_01']);
       audio.playBgm('th07_01');
     };
+    // Stage clear tally advanced -> tear down and enter the next stage with
+    // the run state carried over (score/lives/bombs/power/graze/cherry).
+    s.onStageComplete = (c) => {
+      sessionHiScore = Math.max(sessionHiScore, c.hiScore);
+      startStage(difficulty, character, stageNumber + 1, c);
+    };
     stage = s;
     menu = null;
-    audio.preloadBgm(['th07_02', 'th07_03']);
-    audio.playBgm('th07_02');
+    const [stageTrack, bossTrack] = stageTracks(stageNumber);
+    audio.preloadBgm([stageTrack, bossTrack]);
+    audio.playBgm(stageTrack);
     return s;
   }
 
+  // Menu-initiated runs: difficulty 4 = Extra -> stage 7, 5 = Phantasm ->
+  // stage 8; main difficulties start at stage 1.
+  const startFromMenu = (difficulty: number, character: CharacterId) =>
+    startStage(difficulty, character, difficulty >= 4 ? difficulty + 3 : 1);
+
   if (useMenu) {
-    menu = new MenuFlow(assets, audio, startStage);
+    menu = new MenuFlow(assets, audio, startFromMenu);
     audio.preloadBgm(['th07_01']);
     audio.playBgm('th07_01');
   } else {
-    const difficulty = Math.min(3, Math.max(0, Number(params.get('difficulty') ?? 1)));
+    // ?difficulty=0..5 (4 = Extra, 5 = Phantasm), ?stage=1..8 for probes.
+    const difficulty = Math.min(5, Math.max(0, Number(params.get('difficulty') ?? 1)));
     const character = (params.get('shot') ?? 'reimuA') as CharacterId;
-    const s = startStage(difficulty, character);
+    const stageNumber = Math.min(8, Math.max(1, Number(params.get('stage') ?? 1)));
+    const s = startStage(difficulty, character, stageNumber);
     // Test-only override so scripts/dev-shot.mjs can snapshot a shot pattern
     // at an arbitrary power bracket without needing to grind for it in-game.
     if (params.has('power')) s.playerObj.power = Number(params.get('power'));

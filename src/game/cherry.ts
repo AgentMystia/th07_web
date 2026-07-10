@@ -44,7 +44,10 @@ export const BORDER_DURATION = 540;
 // trigger with the cherry cap; the vanilla HUD gauge reads
 // cherry/cherryMax (e.g. 86120/310000 on Lunatic after one border's
 // +10000), not cherryPlus/50000.
-export const INITIAL_CHERRY_MAX_BY_DIFFICULTY = [200000, 200000, 250000, 300000];
+// Indices 4/5 = Extra/Phantasm: cherryMax 400000 (FUN_0042cf2f's upper
+// tier; those runs also pre-load some cherry — handled by the run-init
+// carry, not here).
+export const INITIAL_CHERRY_MAX_BY_DIFFICULTY = [200000, 200000, 250000, 300000, 400000, 400000];
 
 // Floors a non-negative integer to the nearest multiple of 10 — the exe's
 // recurring `v = v - v % 10` idiom (point items §3c, death §3d, boss

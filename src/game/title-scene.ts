@@ -57,7 +57,7 @@ const DIFFICULTY_NAMES = ['Easy', 'Normal', 'Hard', 'Lunatic'] as const;
 // non-functional" allowance.
 const MAIN_MENU_ITEMS = [
   { name: 'Game Start', enabled: true },
-  { name: 'Extra Start', enabled: false },
+  { name: 'Extra Start', enabled: true },
   { name: 'Practice Start', enabled: false },
   { name: 'Replay', enabled: false },
   { name: 'Score', enabled: false },
@@ -163,7 +163,7 @@ class TitleMenu {
     this.items = MAIN_MENU_ITEMS.map((_, i) => new AnmRunner(anm, i, { entryIndex: ENTRY.mainMenu, spriteIndexOffset: base }));
   }
 
-  update(input: InputFrame, audio: AudioBus): 'confirm' | null {
+  update(input: InputFrame, audio: AudioBus): 'confirm' | 'confirm-extra' | null {
     this.logo.update();
     for (const it of this.items) it.update();
     const n = MAIN_MENU_ITEMS.length;
@@ -177,7 +177,7 @@ class TitleMenu {
     if (input.pressed.has('confirm')) {
       if (MAIN_MENU_ITEMS[this.cursor].enabled) {
         audio.sfx('se_ok00', 0.316, 10);
-        return 'confirm';
+        return this.cursor === 1 ? 'confirm-extra' : 'confirm';
       }
       audio.sfx('se_cancel00', 0.316, 11);
     }
@@ -212,21 +212,40 @@ class DifficultyMenu {
   private repeat = new KeyRepeater();
   private items: AnmRunner[];
   private header: AnmRunner;
+  private readonly count: number;
 
-  constructor(private anm: Anm) {
+  // extraMode: entered from "Extra Start" — offers Extra (stage 7) and
+  // Phantasm (stage 8) instead of the four main difficulties. The Extra
+  // banner is select01's script after Lunatic (-24); if absent the text
+  // labels below still identify the rows.
+  constructor(private anm: Anm, readonly extraMode = false) {
     const base = anm.entries[ENTRY.difficulty].spriteIds[0];
-    this.items = DIFFICULTY_IDS.map((id) => {
-      const runner = new AnmRunner(anm, id, { entryIndex: ENTRY.difficulty, spriteIndexOffset: base });
-      runner.interrupt(7); // "show/cascade in" (per-item stagger is baked into each script's own timing)
-      return runner;
-    });
+    const ids = extraMode ? [-24, -24] : [...DIFFICULTY_IDS];
+    this.items = [];
+    for (const id of ids) {
+      try {
+        const runner = new AnmRunner(anm, id, { entryIndex: ENTRY.difficulty, spriteIndexOffset: base });
+        runner.interrupt(7); // "show/cascade in" (per-item stagger is baked into each script's own timing)
+        this.items.push(runner);
+      } catch {
+        // Missing banner script (defensive for extraMode) — text-only row.
+      }
+    }
+    this.count = ids.length;
+    if (extraMode) this.cursor = 0;
     this.header = makeHeader(anm, 0);
+  }
+
+  // The run difficulty index this menu's cursor stands for (Extra=4,
+  // Phantasm=5 in extraMode).
+  resultDifficulty(): number {
+    return this.extraMode ? 4 + this.cursor : this.cursor;
   }
 
   update(input: InputFrame, audio: AudioBus): 'confirm' | 'back' | null {
     for (const it of this.items) it.update();
     this.header.update();
-    const n = DIFFICULTY_IDS.length;
+    const n = this.count;
     if (this.repeat.poll(input, 'down')) {
       this.cursor = (this.cursor + 1) % n;
       audio.sfx('se_select00', 0.141, 12);
@@ -248,6 +267,24 @@ class DifficultyMenu {
   draw(r: Renderer, frameCounter: number): void {
     r.drawImage('select00', 0, 0);
     r.drawAnmFrame(this.header.spriteFrame(), 0, 0);
+    if (this.extraMode) {
+      const labels = ['Extra', 'Phantasm'];
+      labels.forEach((label, i) => {
+        const focused = i === this.cursor;
+        const y = 200 + i * 56;
+        const frame = this.items[i]?.spriteFrame();
+        if (frame) {
+          r.drawAnmFrame(frame, 0, y - frame.vmY, focused ? { scaleMultiplier: 1.08 } : { alpha: 0.6 });
+        }
+        r.text(label, 260, y + (i === 1 ? 4 : 0), {
+          size: 22,
+          color: focused ? '#ffe0f0' : 'rgba(220,190,220,0.55)'
+        });
+        if (focused) drawCursorArrow(r, 236, y + 10, frameCounter);
+      });
+      hint(r, 'Up/Down Move    Z Decide    X Back');
+      return;
+    }
     this.items.forEach((runner, i) => {
       const frame = runner.spriteFrame();
       if (!frame) return;
@@ -435,16 +472,16 @@ export class MenuFlow {
     switch (this.phase) {
       case 'title': {
         const result = this.title.update(input, this.audio);
-        if (result === 'confirm') {
+        if (result === 'confirm' || result === 'confirm-extra') {
           this.phase = 'difficulty';
-          this.difficulty = new DifficultyMenu(this.anm);
+          this.difficulty = new DifficultyMenu(this.anm, result === 'confirm-extra');
         }
         break;
       }
       case 'difficulty': {
         const result = this.difficulty!.update(input, this.audio);
         if (result === 'confirm') {
-          this.chosenDifficulty = this.difficulty!.cursor;
+          this.chosenDifficulty = this.difficulty!.resultDifficulty();
           this.phase = 'select';
           this.select = new PlayerSelectMenu(this.anm);
         } else if (result === 'back') {
@@ -462,8 +499,9 @@ export class MenuFlow {
         } else if (result === 'back-to-difficulty') {
           this.phase = 'difficulty';
           this.select = null;
-          this.difficulty = new DifficultyMenu(this.anm);
-          this.difficulty.cursor = this.chosenDifficulty;
+          const wasExtra = this.chosenDifficulty >= 4;
+          this.difficulty = new DifficultyMenu(this.anm, wasExtra);
+          this.difficulty.cursor = wasExtra ? this.chosenDifficulty - 4 : this.chosenDifficulty;
         }
         break;
       }

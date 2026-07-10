@@ -117,6 +117,8 @@ export interface StageData {
   msg: string;
   enemyAnm: string;
   bgAnm: string;
+  // Stage 4 swaps between additional background ANM banks mid-stage.
+  extraBgAnms?: readonly string[];
   effectAnm: string;
   stdTxtAnm: string;
   faceAnm: string;

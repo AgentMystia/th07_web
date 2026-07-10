@@ -115,6 +115,19 @@ export class AudioBus {
     // the new track's fetch+decode took (bug 5).
     this.stopSourceOnly();
     void this.loadBgm(name).then((buffer) => {
+      if (!buffer && this.active === name) {
+        // Track file missing (the repo ships only tracks 01-03; the thbgm
+        // PCM source for the rest is not in reference/). Fall back to the
+        // stage-1 pair by parity — even track numbers are stage themes,
+        // odd are boss themes — instead of going silent.
+        const m = /^th07_(\d+)$/.exec(name);
+        const fallback = m && Number(m[1]) > 3 ? (Number(m[1]) % 2 === 0 ? 'th07_02' : 'th07_03') : null;
+        if (fallback) {
+          this.active = null;
+          this.playBgm(fallback, options);
+        }
+        return;
+      }
       if (!buffer || this.active !== name) return;
       const ctx = this.ensureCtx();
       if (!ctx || !this.bgmGain) return;

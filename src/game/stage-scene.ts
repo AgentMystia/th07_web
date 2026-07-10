@@ -1,11 +1,11 @@
-import { StageRuntime } from './eclvm';
+import { StageRuntime, type StageData } from './eclvm';
 import type { GameHost, Enemy, EnemyBullet, EnemyLaser, ItemEntity, ItemType, EffectParticle } from './types';
 import { Rng } from '../core/rng';
 import { normalizeAngle, clamp } from '../core/util';
 import type { InputFrame } from '../core/input';
 import { Renderer, PLAYFIELD, SCREEN_W } from '../gfx/renderer';
 import type { GameAssets } from './assets';
-import { AnmRunner, type AnmFrame } from '../formats/anm';
+import { Anm, AnmRunner, type AnmFrame } from '../formats/anm';
 import { TH07_DATA } from '../data/th07-data';
 import type { AudioBus } from '../audio/audio';
 import { CHARACTERS, Player, type CharacterId, type PlayerBullet } from './player';
@@ -13,8 +13,23 @@ import { PlayerEffects } from './player-effects';
 import { CherrySystem, BORDER_DURATION, CHERRY_PLUS_MAX } from './cherry';
 import { DialogueRunner, portraitSprite } from './dialogue';
 
-// Stage host. At the M3 milestone this runs the full stage 1 timeline with a
-// movable player stub (no collision yet) so ECL patterns can be verified.
+// Stage host. Runs any of the 8 stage timelines (1-6 main game, 7 Extra,
+// 8 Phantasm) with per-stage ECL/STD/MSG/ANM data resolved from TH07_DATA.
+
+// Everything that survives a stage transition within one credit.
+export interface RunCarry {
+  score: number;
+  hiScore: number;
+  graze: number;
+  pointItems: number;
+  lives: number;
+  bombs: number;
+  power: number;
+  cherry: number;
+  cherryMax: number;
+  cherryPlus: number;
+  spellsCaptured: number;
+}
 
 // Item sprites live in etama.anm entry 1 (the etama2.png sheet), addressed
 // here by their entry-embedded ids; add entries[1].spriteBase (168 — entry 0
@@ -137,11 +152,16 @@ export class StageScene implements GameHost {
   // return to the title after game over or the stage-clear tally.
   mode: 'arcade' | 'test' = 'arcade';
   onExitToTitle: (() => void) | null = null;
+  // Fired (arcade mode, stages 1-5) when the player advances past the
+  // stage-clear tally; the host tears this scene down and starts stage+1
+  // with carryState(). Null/unset → fall back to exitToTitle.
+  onStageComplete: ((carry: RunCarry) => void) | null = null;
   continueScreen: { cursor: number } | null = null;
   continuesUsed = 0;
   private gameOverTimer = 0;
   private stageClearTimer = 0;
   private exitFired = false;
+  private stageCompleteFired = false;
   cherry: CherrySystem;
   hiScore = 100000;
   dialogue: DialogueRunner | null = null;
@@ -149,6 +169,15 @@ export class StageScene implements GameHost {
   stageFrame = 0;
   stageClear = false;
   private clearTimer = 0;
+  readonly stageNumber: number;
+  private readonly bgScripts = new Map<number, { anm: Anm; entryIndex: number; localId: number; spriteBase: number }>();
+  private readonly enemyAnm: Anm;
+  private readonly bgAnm: Anm;
+  private readonly effectAnm: Anm;
+  private readonly stdTxtAnm: Anm;
+  private readonly faceAnm: Anm;
+  // Stage-clear bonus tally, computed once when the stage ends.
+  clearBonus: { clear: number; point: number; graze: number; cherry: number; mult: number; total: number } | null = null;
   spellcard: {
     name: string;
     id: number;
@@ -191,8 +220,41 @@ export class StageScene implements GameHost {
   private readonly playerEffects: PlayerEffects;
   private prevBombTimer = 0;
 
-  constructor(private assets: GameAssets, private audio: AudioBus, difficulty = 1, character: CharacterId = 'reimuA') {
+  constructor(
+    private assets: GameAssets,
+    private audio: AudioBus,
+    difficulty = 1,
+    character: CharacterId = 'reimuA',
+    stageNumber = 1,
+    carry: RunCarry | null = null
+  ) {
     this.difficulty = difficulty;
+    this.stageNumber = stageNumber;
+    const stageData = (TH07_DATA.stages as unknown as Record<number, StageData>)[stageNumber];
+    if (!stageData) throw new Error(`no data for stage ${stageNumber}`);
+    const anms = assets.anms as Record<string, Anm>;
+    this.enemyAnm = anms[stageData.enemyAnm];
+    this.bgAnm = anms[stageData.bgAnm];
+    this.effectAnm = anms[stageData.effectAnm];
+    this.stdTxtAnm = anms[stageData.stdTxtAnm];
+    this.faceAnm = anms[stageData.faceAnm];
+    // STD quad script indices are virtual ids over the stage's bg ANM
+    // files: Th07.exe loads them via FUN_00447c50 at bases 0x300 + 16 per
+    // file (stg4bg=0x300, stg4bg2=0x310 ... stg4bg5=0x340, all.c:2909-2943)
+    // and registers each file's scripts sequentially, so
+    // vid = fileIndex*16 + positionInFile (stage 4's STD really references
+    // 32=stg4bg3, 48..52=stg4bg4, 64=stg4bg5; stage 6's second entry gets
+    // positions 5..9 despite its duplicate stored ids).
+    const bgFiles = [this.bgAnm, ...((stageData.extraBgAnms ?? []).map((n) => anms[n]))];
+    bgFiles.forEach((anm, fi) => {
+      let pos = 0;
+      anm.entries.forEach((entry, entryIndex) => {
+        for (const localId of entry.scriptIds) {
+          this.bgScripts.set(fi * 16 + pos, { anm, entryIndex, localId, spriteBase: entry.spriteBase });
+          pos++;
+        }
+      });
+    });
     this.cherry = new CherrySystem(
       {
         onBorderStart: () => this.playSfx(32),
@@ -202,15 +264,68 @@ export class StageScene implements GameHost {
       },
       difficulty
     );
-    this.runtime = new StageRuntime(TH07_DATA.stages[1], {
+    this.runtime = new StageRuntime(stageData, {
       etama: assets.anms.etama,
-      enemy: assets.anms.stg1enm,
-      effect: assets.anms.eff01
+      enemy: this.enemyAnm,
+      effect: this.effectAnm
     });
     this.etamaItemBase = assets.anms.etama.entries[1].spriteBase;
     this.playerObj = new Player(character, assets.anms);
     this.playerEffects = new PlayerEffects(this.playerObj.anm);
     this.player = this.playerObj;
+    // Mid-run stage entry: score/lives/power/graze/cherry persist across
+    // stages within one credit (the exe keeps them in the run-global stats
+    // block; only per-stage state — enemies, items, spell state — resets).
+    if (carry) {
+      this.score = carry.score;
+      this.hiScore = carry.hiScore;
+      this.graze = carry.graze;
+      this.pointItems = carry.pointItems;
+      this.playerObj.lives = carry.lives;
+      this.playerObj.bombs = carry.bombs;
+      this.playerObj.power = carry.power;
+      this.cherry.cherry = carry.cherry;
+      this.cherry.cherryMax = carry.cherryMax;
+      this.cherry.cherryPlus = carry.cherryPlus;
+      this.cherry.spellsCaptured = carry.spellsCaptured;
+    }
+  }
+
+  // Stage-clear bonus per the vanilla result tally (observed on a stage-2
+  // Lunatic clear: Clear=1000000, Point=39x50000, Graze=303x500,
+  // Cherry=cherry x10, "Lunatic Rank *1.5", Total=(sum)*1.5). Clear base
+  // scales with stage number (stage 2 -> 1M => 500k per stage; Extra/
+  // Phantasm use the stage-6 tier). Display rows show full values; the
+  // score field gains total/10 per the port's score-unit convention
+  // (same 10:1 as the spell bonus / point items).
+  private computeClearBonus(): void {
+    const stageTier = Math.min(this.stageNumber, 7);
+    const clear = 500000 * stageTier;
+    const point = this.pointItems * 50000;
+    const graze = this.graze * 500;
+    const cherry = this.cherry.cherry * 10;
+    const MULT_BY_DIFFICULTY = [0.5, 1.0, 1.2, 1.5, 2.0, 2.0];
+    const mult = MULT_BY_DIFFICULTY[this.difficulty] ?? 1.0;
+    const total = Math.trunc((clear + point + graze + cherry) * mult);
+    this.clearBonus = { clear, point, graze, cherry, mult, total };
+    this.addScore(Math.trunc(total / 10));
+  }
+
+  // Snapshot of everything that persists across a stage transition.
+  carryState(): RunCarry {
+    return {
+      score: this.score,
+      hiScore: Math.max(this.hiScore, this.score),
+      graze: this.graze,
+      pointItems: this.pointItems,
+      lives: this.playerObj.lives,
+      bombs: this.playerObj.bombs,
+      power: this.playerObj.power,
+      cherry: this.cherry.cherry,
+      cherryMax: this.cherry.cherryMax,
+      cherryPlus: this.cherry.cherryPlus,
+      spellsCaptured: this.cherry.spellsCaptured
+    };
   }
 
   // -- GameHost --------------------------------------------------------------
@@ -275,9 +390,10 @@ export class StageScene implements GameHost {
     const entry = CHARACTERS[this.playerObj.character].family * 10 + index;
     this.dialogue = new DialogueRunner(this.runtime.msg, entry, {
       playBgm: (track) => {
-        const names = ['th07_01', 'th07_02', 'th07_03'];
-        const name = names[track];
-        if (name) this.audio.playBgm(name);
+        // MSG op 7's arg is the 0-based thbgm track index (stage 1's boss
+        // dialogue passes 2 = th07_03); generalize to th07_NN.
+        const name = `th07_${String(track + 1).padStart(2, '0')}`;
+        this.audio.playBgm(name);
       },
       fadeBgm: () => this.audio.fadeOutBgm(4)
     });
@@ -442,7 +558,20 @@ export class StageScene implements GameHost {
       if (++this.gameOverTimer > 240) this.exitToTitle();
     }
     if (this.stageClear && this.mode === 'arcade') {
-      if (++this.stageClearTimer > 480) this.exitToTitle();
+      this.stageClearTimer++;
+      // Advance on Z once the tally has been visible for a beat, or after
+      // the timeout. Stages 1-5 hand the run to the next stage; stage 6 /
+      // Extra / Phantasm end the credit back at the title.
+      const advance =
+        (this.stageClearTimer > 90 && input.pressed.has('shoot')) || this.stageClearTimer > 900;
+      if (advance && !this.stageCompleteFired) {
+        this.stageCompleteFired = true;
+        if (this.stageNumber < 6 && this.onStageComplete) {
+          this.onStageComplete(this.carryState());
+        } else {
+          this.exitToTitle();
+        }
+      }
     }
     const p = this.playerObj;
     this.sfxPlayedThisFrame.clear();
@@ -527,6 +656,7 @@ export class StageScene implements GameHost {
       if (this.clearTimer > 180) {
         this.stageClear = true;
         this.audio.fadeOutBgm(4);
+        this.computeClearBonus();
       }
     }
     const borderBonus = this.cherry.tick();
@@ -1422,12 +1552,53 @@ export class StageScene implements GameHost {
     if (this.bonusPopup) {
       r.text(this.bonusPopup.text, PLAYFIELD.x + 70, PLAYFIELD.y + 90, { size: 15, color: '#ffd700' });
     }
-    if (this.stageClear) {
-      r.text('STAGE CLEAR', PLAYFIELD.x + 128, PLAYFIELD.y + 190, { size: 22, color: '#ffa' });
-      r.text(`Stage Bonus  ${(this.graze * 10 + this.pointItems * 1000 + this.cherry.cherry).toLocaleString('en-US')}`, PLAYFIELD.x + 100, PLAYFIELD.y + 230, { size: 14 });
-    }
+    if (this.stageClear) this.drawStageClear(r);
     if (this.continueScreen) this.drawContinueScreen(r);
     else if (this.gameOver) r.text('GAME OVER', PLAYFIELD.x + 140, PLAYFIELD.y + 200, { size: 20, color: '#f66' });
+  }
+
+  // Vanilla result tally (reference screenshot: stage-2 Lunatic clear):
+  // yellow spaced "Stage Clear", then Clear/Point/Graze/Cherry rows with
+  // right-aligned values, the red "<Difficulty> Rank *<mult>" line, and
+  // Total. Rows reveal one by one; Z advances the stage once all shown.
+  private drawStageClear(r: Renderer): void {
+    const b = this.clearBonus;
+    if (!b) return;
+    const ox = PLAYFIELD.x;
+    const oy = PLAYFIELD.y;
+    const t = this.stageClearTimer || 1;
+    const ctx = r.ctx;
+    ctx.save();
+    ctx.globalAlpha = Math.min(0.45, t / 60);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(ox, oy + 110, PLAYFIELD.width, 210);
+    ctx.restore();
+    const spaced = (s: string) => s.split('').join(' ');
+    const labelX = ox + 74;
+    const valueEndX = ox + 310;
+    const num = (v: number) => v.toLocaleString('en-US').replace(/,/g, '');
+    const row = (label: string, value: number, y: number, color: string) => {
+      r.text(spaced(label), labelX, y, { size: 14, color });
+      const txt = num(value);
+      r.text(txt, valueEndX - txt.length * 9, y, { size: 14, color });
+    };
+    r.text(spaced('Stage Clear'), labelX, oy + 130, { size: 16, color: '#ffcc44' });
+    const reveal = Math.floor((t - 20) / 12); // rows appear one by one
+    const rows: [string, number][] = [
+      ['Clear', b.clear],
+      ['Point', b.point],
+      ['Graze', b.graze],
+      ['Cherry', b.cherry]
+    ];
+    rows.forEach(([label, value], i) => {
+      if (reveal > i) row(label + '  =', value, oy + 168 + i * 22, '#d8d8f8');
+    });
+    if (reveal > rows.length) {
+      const names = ['Easy', 'Normal', 'Hard', 'Lunatic', 'Extra', 'Phantasm'];
+      const mult = `*${b.mult.toFixed(1)}`;
+      r.text(spaced(`${names[this.difficulty] ?? ''} Rank ${mult}`), labelX, oy + 268, { size: 14, color: '#ff5566' });
+      row('Total  =', b.total, oy + 292, '#ffffff');
+    }
   }
 
   private drawContinueScreen(r: Renderer): void {
@@ -1500,7 +1671,12 @@ export class StageScene implements GameHost {
   private bgAnmFrame(scriptId: number, targetFrame: number): AnmFrame | null {
     let entry = this.bgAnmCache.get(scriptId);
     if (!entry || targetFrame < entry.frame) {
-      entry = { runner: new AnmRunner(this.assets.anms.stg1bg, scriptId), frame: 0 };
+      const ref = this.bgScripts.get(scriptId);
+      if (!ref) return null;
+      entry = {
+        runner: new AnmRunner(ref.anm, ref.localId, { entryIndex: ref.entryIndex, spriteIndexOffset: ref.spriteBase }),
+        frame: 0
+      };
       this.bgAnmCache.set(scriptId, entry);
     }
     while (entry.frame < targetFrame) {
@@ -1683,7 +1859,9 @@ export class StageScene implements GameHost {
   private drawSpellBackground(r: Renderer): void {
     const sc = this.spellcard;
     if (!sc) return;
-    const img = r.image('eff01');
+    // Per-stage effect sheet; resolved via the ANM entry's own texture name
+    // (eff07.anm's textures are eff07b/eff07c — there is no eff07.png).
+    const img = r.image(this.effectAnm.entries[0]?.imageKey ?? 'eff01');
     if (!img) return;
     if (!this.eff01Pattern) this.eff01Pattern = r.ctx.createPattern(img, 'repeat');
     if (!this.eff01Pattern) return;
@@ -1717,8 +1895,8 @@ export class StageScene implements GameHost {
       ctx.restore();
     }
     if (t < 110) {
-      const sprite = this.assets.anms.face_01_00.sprites.get(sc.portraitSprite);
-      const img = r.image('face_01_00');
+      const sprite = this.faceAnm.sprites.get(sc.portraitSprite);
+      const img = sprite ? r.image(sprite.imageKey) : null;
       if (sprite && img) {
         const p = t / 110;
         const scale = 0.85;
@@ -1781,7 +1959,7 @@ export class StageScene implements GameHost {
     const ctx = r.ctx;
     const family = CHARACTERS[this.playerObj.character].family;
     const playerFaceKey = (['face_rm00', 'face_mr00', 'face_sk00'] as const)[family];
-    const anms = [this.assets.anms[playerFaceKey], this.assets.anms.face_01_00];
+    const anms = [this.assets.anms[playerFaceKey], this.faceAnm];
     for (let side = 0; side < 2; side++) {
       const p = d.portraits[side];
       if (!p?.visible) continue;
