@@ -50,11 +50,10 @@ const DIFFICULTY_NAMES = ['Easy', 'Normal', 'Hard', 'Lunatic'] as const;
 // screen y 200..396 step 28, all left-aligned at x=432). Confirmed against
 // the extracted title01.png atlas: each item's "colored" sprite spells out
 // its label in stylized Latin text (Start / ExtraStart / Practice Start /
-// Replay / Result / MusicRoom / Option / Quit). Only Game Start is wired to
-// anything in this reimplementation (no save data/unlocks/replay storage
-// exist yet); the rest are fully navigable/visible like the original but a
-// confirm on them just plays the cancel buzz, per the task's "dimmed or
-// non-functional" allowance.
+// Replay / Result / MusicRoom / Option / Quit). Game Start and Extra Start
+// are wired in this reimplementation (no save data/unlocks/replay storage
+// exist yet); the rest are fully navigable and visible like the original,
+// but confirming one just plays the cancel buzz.
 const MAIN_MENU_ITEMS = [
   { name: 'Game Start', enabled: true },
   { name: 'Extra Start', enabled: true },

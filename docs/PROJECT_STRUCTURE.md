@@ -24,7 +24,8 @@ Browser code must not read from `reference/`, `tests/`, `scripts/`,
 
 - `main.ts` — boot, scene switching (menu flow ↔ stage), and the
   `window.__TH07_TEST__` deterministic test hook (`?test=1`; `?menu=1`
-  forces the menu flow under test; `?difficulty= ?shot= ?power=`).
+  forces the menu flow under test; direct probes also accept
+  `?difficulty= ?stage= ?shot= ?power= ?dialogue= ?arcade=1`).
 - `core/` — `loop.ts` fixed-step 60 FPS loop, `input.ts` keyboard state
   with pressed-edge tracking, `rng.ts` the original 16-bit RNG port,
   `util.ts` math helpers.
@@ -41,16 +42,19 @@ Browser code must not read from `reference/`, `tests/`, `scripts/`,
     HUD + screen frame). Largest file; background, HUD, and gameplay
     sections are deliberately grouped — coordinate file ownership when
     parallelizing work here.
-  - `player.ts` — SHT-driven player (movement, fire tables, orbs, bombs,
-    deathbomb), `cherry.ts` — Cherry/CherryMax/Cherry+ and the
-    Supernatural Border state machine, `dialogue.ts` — MSG runner with
-    portraits, `title-scene.ts` — title/difficulty/character menu flow from
-    `title01.anm`, `assets.ts` — ANM/image/SHT registry, `types.ts` —
-    shared entity types.
+  - `player.ts` — SHT-driven player movement, fire tables, shot ANM state,
+    option orbs, and deathbomb lifecycle; `player-bombs.ts` — the 112-slot
+    attack pool and all 12 focus-latched bomb state machines;
+    `player-effects.ts` — script-driven player/bomb visual effects.
+  - `cherry.ts` — Cherry/CherryMax/Cherry+ and the Supernatural Border state
+    machine; `dialogue.ts` — MSG runner with portraits; `title-scene.ts` —
+    title/difficulty/character menu flow from `title01.anm`; `bgm.ts` —
+    stage-local BGM slot mapping; `assets.ts` — ANM/image/SHT registry;
+    `types.ts` — shared entity types.
 - `gfx/renderer.ts` — Canvas2D renderer: `drawSprite`/`drawAnmFrame`
   (**centered** anchor), textured-quad cells + fog for the background,
-  tint cache, playfield clip. HUD blits convert to top-left anchoring at
-  the call site.
+  static tint cache, reusable runtime-capture tint surface, playfield capture,
+  and clipping. HUD blits convert to top-left anchoring at the call site.
 - `audio/audio.ts` — Web Audio BGM with sample-loop points + pooled SFX.
 - `data/th07-data.ts` — **generated** base64 bundle of the original
   binaries (ECL/STD/MSG/SHT + THTX-stripped ANMs) with the BGM loop table.
@@ -77,15 +81,26 @@ on the `legacy-vanilla` branch of
   color / brightness / texture % / distinct colors per region, so visual
   changes can be judged without viewing the image (baselines in
   AGENTS.md §5).
+- `border-probe.mjs` — deterministic Border trigger, break-wave, shield,
+  bomb-break, and natural-expiry assertions.
+- `stage-clear-probe.mjs` — drives a stage through its boss and records the
+  Stage Clear capture presentation at named checkpoints.
+- `arcade-transition-probe.mjs` — verifies Stage Clear → next-stage carry,
+  BGM routing, runtime capture, and the 12x14 tile transition.
 - `prepare-pages.mjs` — assembles the static-deploy tree in `dist/pages/`
   from runtime files only.
+- `deploy-pages.mjs` — builds that tree and publishes its orphan commit to
+  the `gh-pages` branch.
 
 ## Tests (`tests/`)
 
-- `th07-cherry.test.mjs` — Cherry/Border state machine unit tests.
-- `npm test` runs `node --test tests/*.test.mjs`; add new unit tests with
-  that suffix. Browser-level verification lives in the `scripts/dev-*`
-  tools rather than a test runner.
+- `npm test` runs `node --test tests/*.test.mjs`. The suites cover BGM and
+  Stage Clear routing, Cherry/Border, ECL waits and interrupts, bullet
+  effects/pool behavior, ANM/SHT shot data, item/popups, global slow motion,
+  and advanced STD cameras.
+- Add unit tests with the `.test.mjs` suffix. Browser-level verification lives
+  in the `scripts/dev-*` and dedicated `*-probe.mjs` tools rather than a
+  separate browser test runner.
 
 ## Reference corpus (`reference/`, git-ignored, local-only)
 

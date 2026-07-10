@@ -195,7 +195,7 @@ async function boot(): Promise<void> {
   // was measured starting 138.9ms (~8 frames) after stage frame 0 on a
   // zero-latency local server, and 8.9s/26.2s (~533/~1573 frames) under
   // throttled Slow-4G/Fast-3G — with the title theme still audibly looping
-  // for the entire gap (measurements retained in the July 10 handoff).
+  // for the entire gap (measured during the 2026-07-10 BGM preload audit).
   audio.preloadBgm(['th07_01', 'th07_02', 'th07_03']);
   const params = new URLSearchParams(location.search);
 
