@@ -7,6 +7,53 @@ stage-1 ECL dump (`reference/re-specs/stage1-ecl-dump.txt`). Newest first.
 
 ---
 
+## 2026-07-10 — GLM-PLAN-2 follow-up: full BGM, boss UI, multi-slot boss presence, op10, stage-clear probes
+
+### Symptom
+- Stages 2-8 fell back to stage-1 BGM themes (only tracks 01-03 shipped).
+- No boss X-position marker; Spell Card Bonus was a single gold line; failure
+  still printed "Bonus failed..." (exe draws nothing on failure).
+- Stage 4 Prismriver manager registered as boss then lost `bossActive` when
+  helper slots 1-3 registered / released (multi-slot `setBossPresent` race).
+- Timeline life=1 overwrote t=0 op110 HP after the initial ECL run, so a boss
+  could be death-callback'd on frame 1 by the first player shot.
+- Stage 3 logged `unhandled ECL op 10` (Alice dolls).
+
+### Root cause / fix
+1. **BGM**: `thbgmogg.dat` supplied; `TRACK_WHITELIST` opened; `npm run
+   generate-bgm` produced th07_01..19 + 13b under `assets/audio/th07/`.
+2. **Boss marker** (GLM-PLAN-2 §3 / spec-ui-stageclear.md §3): fallback
+   "Enemy" label at playfield bottom, x = clamp(boss.x), ~60% alpha — exact
+   sprite not recovered from front.anm.
+3. **Spell Card Bonus** (spec §4 / all.c:17171-17193): red label at y=80 +
+   2× light-salmon value, 280 frames; failure arms nothing.
+4. **`syncBossPresence`**: recompute from all bossSlots; prefer slot 0 for
+   UI/damageBoss; helper release no longer blanks the main boss.
+5. **Spawn HP order**: apply timeline life/score *before* the initial ECL
+   run so op110 sticks (all stages' bosses ship life=1 as placeholder).
+6. **op10**: random-sign float assign (all.c:7486-7503).
+7. **Probe tooling**: `scripts/stage-clear-probe.mjs` with dialogue skip +
+   damageBoss pump; visual verification via pixel-report against the user's
+   vanilla reference screenshots (stage-2 intro / stage-clear tally).
+
+### Verification
+- `npm run check && npm run build && npm test` → 25/25.
+- Smoke f900 all 8 stages: enemies>0, no PAGE ERRORS.
+- Stage 1 Lunatic clear ≈10680-18720f; stage 2 clear ≈16530f; stage 3 clear
+  ≈18360f (16 lasers); stage 4 clear under damageBoss ≈16637f.
+- Visual: stage-2 intro matches user ref (std2txt title/quote/BGM/cat icon);
+  Cirno fight shows "Enemy" marker under playfield; spell capture shows red
+  "Spell Card Bonus!" + salmon value; stage-clear tally layout intact.
+- Pixel-report: hud-labels texture≈37%, logo≥91%, frame tiles #400e20.
+
+### Still open (not blockers for this commit)
+- Stages 5-8 long-clear: some death-callback subs stall at hp=1 (needs per-
+  boss RE); stage-4 visible sisters (op145→sub0) incomplete.
+- Effect ids 17/18, 7/8; STD op 29 bg bank; arcade stage-transition carry
+  probe (test mode does not chain stages).
+
+---
+
 ## 2026-07-10 — ALL 8 STAGES: data pipeline, progression, lasers, op27, effect ops, Extra/Phantasm (commits 763b50f + d52523b)
 
 Two commits landing the "implement all stages" batch. RE was produced by a

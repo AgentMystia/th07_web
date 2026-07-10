@@ -116,10 +116,10 @@ export class AudioBus {
     this.stopSourceOnly();
     void this.loadBgm(name).then((buffer) => {
       if (!buffer && this.active === name) {
-        // Track file missing (the repo ships only tracks 01-03; the thbgm
-        // PCM source for the rest is not in reference/). Fall back to the
-        // stage-1 pair by parity — even track numbers are stage themes,
-        // odd are boss themes — instead of going silent.
+        // Track file missing: fall back to the stage-1 pair by parity
+        // (even = stage theme, odd = boss theme) instead of going silent.
+        // With a full thbgmogg.dat extract this path should not fire for
+        // tracks 01-19; kept as a defensive residual for partial assets.
         const m = /^th07_(\d+)$/.exec(name);
         const fallback = m && Number(m[1]) > 3 ? (Number(m[1]) % 2 === 0 ? 'th07_02' : 'th07_03') : null;
         if (fallback) {

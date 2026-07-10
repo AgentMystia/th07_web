@@ -230,7 +230,9 @@ export class StageScene implements GameHost {
     portraitSprite: number;
   } | null = null;
   private spellBanner = 0;
-  private bonusPopup: { text: string; timer: number } | null = null;
+  // Spell-card capture popup (spec-ui-stageclear.md §4): label + value on
+  // success only. Failure draws nothing (exe skips FUN_004264e3 entirely).
+  private bonusPopup: { bonus: number; timer: number } | null = null;
   // Mirrors Th07.exe DAT_012f40a8's 1 -> 2 "phase failed by timeout" bump:
   // set by the timer-callback path, consumed by endBossSpell to skip the
   // scored field sweep, cleared by the next declare.
@@ -532,10 +534,10 @@ export class StageScene implements GameHost {
       this.cherry.onSpellCapture();
       const tally = this.spellHistory.get(this.spellcard.id);
       if (tally) tally.got++;
-      this.bonusPopup = { text: `Spell Card Bonus! ${bonus.toLocaleString('en-US')}`, timer: 180 };
+      // Duration 280 frames (0x117+1 @ all.c:18302-18304). Failure path
+      // arms nothing — no banner, no score credit (all.c:6639-6692).
+      this.bonusPopup = { bonus, timer: 280 };
       this.playSfx(33);
-    } else if (this.spellcard) {
-      this.bonusPopup = { text: 'Bonus failed...', timer: 120 };
     }
     this.spellName = '';
     this.spellcard = null;
@@ -1809,12 +1811,47 @@ export class StageScene implements GameHost {
     this.drawSpellOverlay(r);
     this.drawDialogue(r);
     this.drawStageTitle(r);
-    if (this.bonusPopup) {
-      r.text(this.bonusPopup.text, PLAYFIELD.x + 70, PLAYFIELD.y + 90, { size: 15, color: '#ffd700' });
-    }
+    if (this.bonusPopup) this.drawSpellBonusPopup(r);
+    if (this.bossActive) this.drawBossMarker(r);
     if (this.stageClear) this.drawStageClear(r);
     if (this.continueScreen) this.drawContinueScreen(r);
     else if (this.gameOver) r.text('GAME OVER', PLAYFIELD.x + 140, PLAYFIELD.y + 200, { size: 20, color: '#f66' });
+  }
+
+  // Spell Card Bonus! popup — spec-ui-stageclear.md §4 / all.c:17171-17193.
+  // Label: opaque red, 16px-class, x = (384 - 17*16)/2 + 32 = 88, y = 80.
+  // Value: 2× scale light-salmon, re-centered on its own glyph width.
+  // Duration 280 frames (all.c:18302-18304). Failure arms nothing.
+  private drawSpellBonusPopup(r: Renderer): void {
+    const pop = this.bonusPopup;
+    if (!pop) return;
+    // Fade out over the last 30 frames so the hard cut is less jarring
+    // (exe fade path not fully decoded; cosmetic only).
+    const alpha = pop.timer < 30 ? pop.timer / 30 : 1;
+    const label = 'Spell Card Bonus!';
+    const value = Math.trunc(pop.bonus).toLocaleString('en-US').replace(/,/g, '');
+    // Label: 16px/glyph class → center over playfield width 384.
+    const labelX = PLAYFIELD.x + (PLAYFIELD.width - label.length * 10) / 2;
+    r.text(label, labelX, PLAYFIELD.y + 80, { size: 16, color: `rgba(255,0,0,${alpha})` });
+    // Value: ~2× scale (32px/glyph class in the exe) light salmon 0xffff8080.
+    const valueSize = 28;
+    const valueX = PLAYFIELD.x + (PLAYFIELD.width - value.length * (valueSize * 0.6)) / 2;
+    r.text(value, valueX, PLAYFIELD.y + 96, {
+      size: valueSize,
+      color: `rgba(255,128,128,${alpha})`
+    });
+  }
+
+  // Boss X-position marker at the playfield bottom edge. Exact sprite not
+  // recovered from front.anm (spec-ui-stageclear.md §3 — PROBABLE lead is
+  // _DAT_004b5ee0 feed); fall back to a small "Enemy" label at ~60% alpha
+  // tracking boss.x, clamped to the playfield (GLM-PLAN-2 step 3).
+  private drawBossMarker(r: Renderer): void {
+    const boss = this.bossActive;
+    if (!boss) return;
+    const x = PLAYFIELD.x + Math.max(0, Math.min(PLAYFIELD.width, boss.x));
+    const y = PLAYFIELD.y + PLAYFIELD.height - 2;
+    r.text('Enemy', x, y, { size: 11, color: 'rgba(255,80,80,0.6)', align: 'center' });
   }
 
   // Vanilla result tally (reference screenshot: stage-2 Lunatic clear):

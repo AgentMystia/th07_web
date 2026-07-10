@@ -135,9 +135,8 @@ async function boot(): Promise<void> {
   //
   // Per-stage BGM: thbgm track layout is stage theme = 2n, boss theme =
   // 2n+1 for stages 1-6; Extra (7) = 16/17, Phantasm (8) = 18/19 (14/15
-  // are the ending/staff-roll themes — musiccmt.txt). The repo only ships
-  // tracks 01-03 (the thbgmogg.dat source is absent), so AudioBus falls
-  // back by parity when a track file is missing.
+  // are the ending/staff-roll themes — musiccmt.txt). All tracks are
+  // generated from thbgmogg.dat via `npm run generate-bgm`.
   function stageTracks(stageNumber: number): [string, string] {
     const base = stageNumber <= 6 ? stageNumber * 2 : 16 + (stageNumber - 7) * 2;
     const pad = (n: number) => `th07_${String(n).padStart(2, '0')}`;

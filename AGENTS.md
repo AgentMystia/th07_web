@@ -306,6 +306,22 @@ comparisons against real play).
   name-banner gradient (text.anm textures not extractable) are hand-tuned;
   spell history is session-scoped (original persists in score.dat);
   ename nameplate row picked by the stage-1 dialogueSeen heuristic.
+- Boss X-position marker: exact sprite not recovered from front.anm
+  (spec-ui-stageclear.md §3); drawn as a small ~60% alpha "Enemy" label at
+  the playfield bottom edge tracking boss.x (GLM-PLAN-2 step 3 fallback).
+- Bullet-effect ids 1/2/4/6/7/8/9/12-19: decorative or unported; ids 0/5/
+  10/11/20 are real. Ids 17/18 (seed-bullet detonation) and 7/8 (bounce
+  off lasers) deferred — needed by late-game spells only.
+- Slowmo clock (op121 id10/11): one-shot bullet-velocity rescale, no global
+  timescale (spec-op27-effects.md).
+- op59 approximated via orbit window.
+- Stage-4 STD ops 24-29 (background bank switch / sway tween) unimplemented
+  (spec-extra-phantasm.md §4; semantics PROBABLE).
+- Extra/Phantasm starting bombs/power PROBABLE (community convention),
+  not exe-verified.
+- Stage-4 multi-slot sisters (op92 children + op145 remote-sub choreography)
+  still incomplete — slot-0 manager lives at (0,0); visible sisters despawn
+  via op145→sub0; damageBoss can still clear the manager.
 
 ## 8. Pitfall catalog (check these FIRST when something looks wrong)
 
