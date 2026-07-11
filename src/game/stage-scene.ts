@@ -171,6 +171,68 @@ const SPELL_BONUS_BASE = [
   4000000
 ];
 
+// Boss ownership tables (UI-001), decoded from the original per-stage ECL
+// (op90/op99 phase families BFS'd over HP/death/interrupt callbacks), MSG
+// op8 boss-intro text and a pixel read of ename.png — recon
+// ui-owner-table.md. Two independent consumers:
+//
+// 1. Spell cutin portrait: global face-ANM sprite id per spellId range. The
+//    12/12 empirical rule across every dialogue-bearing encounter is "the
+//    boss's dialogue opens on face 0 of her own entry"; the table stores
+//    that entry-0 global id per encounter. Stage-4 sisters resolve
+//    per-sister (Lunasa 0 / Merlin 4 / Lyrica 8 — order triangulated from
+//    the MSG intro listing + instrument spell themes, flagged INFERENCE);
+//    the shared trio spells use Lunasa's sheet.
+export function cutinFaceForSpell(spellId: number): number {
+  const OWNERS: [first: number, last: number, face: number][] = [
+    [0, 1, 3],      // Cirno midboss (ecldata1; existing decode)
+    [2, 9, 0],      // Letty
+    [10, 13, 0],    // Chen midboss
+    [14, 25, 0],    // Chen
+    [26, 27, 0],    // Alice midboss
+    [28, 43, 0],    // Alice
+    [44, 47, 0],    // Prismriver trio shared (Lunasa's sheet)
+    [48, 51, 0],    // Lunasa
+    [52, 55, 4],    // Merlin
+    [56, 59, 8],    // Lyrica
+    [60, 67, 0],    // ensemble spells (declared via Lunasa's family)
+    [68, 71, 0],    // Youmu midboss
+    [72, 87, 0],    // Youmu
+    [88, 91, 0],    // Youmu stage-6 rematch (face_06_00 entry 0 = her sheet)
+    [92, 115, 2],   // Yuyuko (face_06_00 entry 1 -> global 2)
+    [116, 117, 0],  // Chen (Extra midboss)
+    [118, 127, 4],  // Ran
+    [128, 129, 0],  // Ran (Phantasm midboss)
+    [130, 140, 2]   // Yukari
+  ];
+  for (const [first, last, face] of OWNERS) {
+    if (spellId >= first && spellId <= last) return face;
+  }
+  return 0;
+}
+
+// 2. Nameplate row: ename.png's 16 rows are exactly
+//    2*(stage-1) + (0 = early/mid encounter, 1 = final encounter) for all 8
+//    stages (pixel-read). The switch is keyed off which boss ROOT SUB is
+//    currently registered — NOT off "has any dialogue played" (stage 6 has
+//    two dialogue-bearing encounters, so the old dialogueSeen latch flipped
+//    to Yuyuko's row 11 during Youmu's own rematch).
+const FINAL_ENCOUNTER_ROOTS: Record<number, number[]> = {
+  1: [31],
+  2: [48],
+  3: [31],
+  4: [42, 53, 71, 88, 108, 115, 118], // conductor + sisters + prop slots
+  5: [47],
+  6: [28],
+  7: [67, 111],
+  8: [69, 115]
+};
+
+export function enameRowForBoss(stageNumber: number, rootSub: number): number {
+  const final = FINAL_ENCOUNTER_ROOTS[stageNumber]?.includes(rootSub) ? 1 : 0;
+  return 2 * (stageNumber - 1) + final;
+}
+
 export class StageScene implements GameHost {
   rng = new Rng();
   difficulty = 1;
@@ -330,9 +392,6 @@ export class StageScene implements GameHost {
   // line of the declaration banner. The original persists this in
   // score.dat across runs — out of scope here (AGENTS.md §7).
   private spellHistory = new Map<number, { seen: number; got: number }>();
-  // Each stage owns two consecutive ename.png rows: midboss, then boss.
-  // Dialogue starts only for the latter and latches the within-stage row.
-  private dialogueSeen = false;
   // Test-only observability (PLAN.md Phase 0): the ReimuA homing target
   // chosen this frame (enemy id, null when none eligible) and the total HP
   // actually removed from enemies this frame after all damage reductions.
@@ -861,10 +920,10 @@ export class StageScene implements GameHost {
 
   startBossSpell(spellId: number, arg0: number, name: string): void {
     this.spellName = name;
-    // Stage-1 spell ownership decoded from ecldata1 op 90: ids 0-1 are the
-    // Cirno midboss cards (霜符「フロストコラムス」), 2-9 Letty's — picks
-    // the face_01_00 cutin portrait (sprite 3 = Cirno, 0 = Letty).
-    const portraitSprite = spellId <= 1 ? 3 : 0;
+    // Explicit per-encounter cutin ownership (UI-001) — the old stage-1-only
+    // spellId<=1?3:0 ternary picked Youmu's reused sheet for every Yuyuko
+    // card ("妖夢的符卡释放立绘").
+    const portraitSprite = cutinFaceForSpell(spellId);
     // Per-spell base bonus, Th07.exe table @ 0x4951a8 (ids 0-9 = stage 1;
     // read from the exe binary): Cirno cards 2.0M, Ringing Cold 2.2M
     // (E/N) / 2.4M (H/L per id), finals 2.4M. Decay divisor uses the boss's
@@ -1216,7 +1275,6 @@ export class StageScene implements GameHost {
       for (const tile of this.stageTransitionTiles) tile.runner.update(this.slowRate);
     }
     if (this.dialogue) {
-      this.dialogueSeen = true;
       this.dialogue.update(input.pressed.has('shoot'), input.held.has('skip'));
       if (this.dialogue.resumeTicket) {
         this.dialogue.resumeTicket = false;
@@ -3663,9 +3721,11 @@ export class StageScene implements GameHost {
       }
       const seconds = Math.max(0, Math.trunc((this.timerThreshold() - this.bossActive.ecl.bossTimer) / 60));
       this.drawNumber(r, seconds, PLAYFIELD.x + PLAYFIELD.width - 20, PLAYFIELD.y + 4, 2);
-      // ename.png rows 0..15 are stage pairs: midboss, then dialogue boss.
+      // ename.png rows 0..15 are stage pairs (midboss, final boss) — the
+      // row follows the CURRENT boss's root sub (UI-001), not a
+      // dialogue-seen latch (stage 6 has two dialogue-bearing encounters).
       if (!this.dialogue) {
-        const row = 2 * (this.stageNumber - 1) + (this.dialogueSeen ? 1 : 0);
+        const row = enameRowForBoss(this.stageNumber, this.bossActive.ecl.subId);
         this.blit(r, 'ename', [0, row * 16, 128, 16], 32, 26);
       }
     }
