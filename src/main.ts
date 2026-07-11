@@ -278,15 +278,56 @@ async function boot(): Promise<void> {
     if (params.has('dialogue')) s.startDialogue(Number(params.get('dialogue')));
   }
 
+  // A throw escaping the rAF tick used to end the loop permanently (frozen
+  // canvas, BGM still playing, input dead — the stage-4 tester hard-lock).
+  // Halt the crashed phase but keep rAF alive, and rethrow asynchronously so
+  // the failure still surfaces as an uncaught page error for devtools and the
+  // headless probes' PAGE ERRORS reporting.
+  let simHalted = false;
+  let drawHalted = false;
+  const reportFatal = (phase: string, err: unknown): void => {
+    console.error(`[th07] ${phase} halted by uncaught error`, err);
+    setTimeout(() => {
+      throw err instanceof Error ? err : new Error(String(err));
+    });
+  };
+  const drawErrorBanner = (): void => {
+    const ctx = renderer.ctx;
+    const scale = ctx.canvas.width / 640;
+    ctx.save();
+    ctx.setTransform(scale, 0, 0, scale, 0, 0);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+    ctx.fillRect(0, 458, 640, 22);
+    ctx.fillStyle = '#ff6666';
+    ctx.font = '12px monospace';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('ERROR: simulation halted by an uncaught exception (see console)', 8, 469);
+    ctx.restore();
+  };
   const loop = new Loop({
     update: () => {
+      if (simHalted) return;
       const frame = input.frame();
-      if (menu) menu.update(frame);
-      else if (stage) stage.update(frame);
+      try {
+        if (menu) menu.update(frame);
+        else if (stage) stage.update(frame);
+      } catch (err) {
+        simHalted = true;
+        reportFatal('simulation', err);
+      }
     },
     draw: () => {
-      if (menu) menu.draw(renderer);
-      else if (stage) stage.draw(renderer);
+      if (!drawHalted) {
+        try {
+          if (menu) menu.draw(renderer);
+          else if (stage) stage.draw(renderer);
+        } catch (err) {
+          drawHalted = true;
+          if (!simHalted) reportFatal('rendering', err);
+          simHalted = true;
+        }
+      }
+      if (simHalted || drawHalted) drawErrorBanner();
     }
   });
 

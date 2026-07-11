@@ -5,6 +5,13 @@ import type { Rng } from '../core/rng';
 // TH07 ANM (version 2) parser and script runner.
 //
 // Entry header layout: anm_header06_t (64 bytes) — see thtk/extlib/thtypes.
+const warnedAnmOps = new Set<string>();
+function warnUnhandledOp(message: string): void {
+  if (warnedAnmOps.has(message)) return;
+  warnedAnmOps.add(message);
+  console.warn(`[anm] ${message}`);
+}
+
 // Sprite/script tables hold offsets relative to the entry start. Script
 // instructions use the "new" encoding: {u16 type, u16 length (total incl.
 // 8-byte header), i16 time, u16 paramMask, args...}.
@@ -623,8 +630,23 @@ export class AnmRunner {
         this.waitTimeout = this.frame + duration;
         break;
       }
+      case 80: { // timed hold: arm a frame counter from a float arg
+        // Th07.exe (v1.00b) FUN_0044aa20 case 0x50: the argument is read as a
+        // float and the hold persists while its int truncation stays > 0.
+        // The game's single use (stg4bg2 script 0, arg 2^-14) truncates to 0
+        // and never holds — implemented faithfully for any argument anyway.
+        const duration = Math.trunc(this.getVal(v.f32(a)));
+        if (duration <= 0) break;
+        this.waiting = true;
+        this.waitTimeout = this.frame + duration;
+        break;
+      }
       default:
-        throw new Error(`${this.anm.name}: unhandled ANM v2 opcode ${type} in script ${this.scriptId}`);
+        // Skip unknown ops (the encoding is length-prefixed, so the stream
+        // stays in sync) — a throw here escapes the rAF tick and freezes the
+        // whole game, which is exactly how stg4bg2's ins_80 hard-locked
+        // stage 4 before it was implemented.
+        warnUnhandledOp(`${this.anm.name}: unhandled ANM v2 opcode ${type} in script ${this.scriptId}`);
     }
   }
 
