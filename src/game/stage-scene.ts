@@ -689,17 +689,29 @@ export class StageScene implements GameHost {
             : sprite === 10 ? 80 : 128 + ((sprite - 11) % 10) * 8;
           const sy = sprite >= 21 ? 8 : 0;
           const sw = sprite === 10 ? 48 : 8;
-          r.drawSprite('ascii', sx, sy, sw, 8,
+          r.drawSpriteInBatch('ascii', sx, sy, sw, 8,
             ox + startX + i * 8, oy + pop.y,
-            { alpha: alphaByte / 255, color: pop.color });
+            0, 1, alphaByte / 255, 'source-over', pop.color);
         }
       }
     };
+    // A full-field sweep legitimately activates the whole 720-slot large
+    // pool at once (~4000 glyphs/frame for 60 frames) — bracketed batch
+    // drawing keeps that survivable; the per-glyph save/restore path froze
+    // Lunatic phase ends.
+    r.ctx.save();
     drawPool(this.popupsLarge);
     drawPool(this.popupsSmall);
+    r.ctx.restore();
   }
 
   spawnItem(type: ItemType, x: number, y: number, options: { state?: number; vx?: number; vy?: number } = {}): void {
+    // Th07.exe item pool is a fixed 1100-slot array — FUN_00430970 scans for
+    // a free slot and silently drops the spawn when none is left (the 0x44c
+    // loop bound appears in every item pass, e.g. FUN_00431d10/FUN_00431da0).
+    // Without the cap, a Lunatic boss-phase sweep pushed 1000+ items in one
+    // frame on top of the existing field and the item pass froze the game.
+    if (this.items.length >= 1100) return;
     // Th07.exe (v1.00b) item spawn primitive FUN_00430970 @ 0x430970: at full
     // power, power(0)/bigPower(2) drops convert to bigCherry(7) -- so max-power
     // players get value items instead of wasted power.
@@ -2465,6 +2477,10 @@ export class StageScene implements GameHost {
         );
       }
       r.ctx.restore();
+      // Items ride the same batched path as bullets: a phase-end sweep can
+      // legitimately field 1000+ of them at once, and the per-call
+      // save/translate/restore path was the measured freeze source there.
+      r.ctx.save();
       for (const it of this.items) {
         // Items falling above the top edge peek in as their per-type arrow
         // sprite (original UX; etama2 emb14-21, +10 from the item id).
@@ -2473,11 +2489,11 @@ export class StageScene implements GameHost {
         const sprite = this.assets.anms.etama.sprites.get(this.etamaItemBase + emb);
         if (sprite) {
           const drawY = Math.max(8, it.y);
-          r.drawSprite(sprite.imageKey, sprite.x, sprite.y, sprite.w, sprite.h, ox + it.x, oy + drawY, {
-            alpha: above ? 0.85 : 1
-          });
+          r.drawSpriteInBatch(sprite.imageKey, sprite.x, sprite.y, sprite.w, sprite.h,
+            ox + it.x, oy + drawY, 0, 1, above ? 0.85 : 1, 'source-over');
         }
       }
+      r.ctx.restore();
       const p = this.playerObj;
       for (const b of this.playerBullets) {
         // Script-driven sprite state (alpha/scale/spin/blend all come from

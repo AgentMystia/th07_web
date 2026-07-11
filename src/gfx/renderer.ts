@@ -210,7 +210,8 @@ export class Renderer {
     rotation: number,
     scaleMultiplier: number,
     alpha: number,
-    blend: GlobalCompositeOperation
+    blend: GlobalCompositeOperation,
+    color?: number
   ): void {
     const img = this.assets[imageKey];
     if (!img || alpha <= 0) return;
@@ -224,6 +225,13 @@ export class Renderer {
     ctx.rotate(rotation);
     const w = Math.max(0.001, Math.abs(sw * scaleMultiplier));
     const h = Math.max(0.001, Math.abs(sh * scaleMultiplier));
+    if (color != null && (color & 0x00ffffff) !== 0x00ffffff) {
+      // Tints resolve through the same cached-canvas path as drawSprite, so
+      // a batch of colored glyphs stays one drawImage per sprite.
+      const cached = this.tintedSpriteCanvas(img, sx, sy, sw, sh, color);
+      if (cached) ctx.drawImage(cached, 0, 0, cached.width, cached.height, -w / 2, -h / 2, w, h);
+      return;
+    }
     ctx.drawImage(img, sx, sy, sw, sh, -w / 2, -h / 2, w, h);
   }
 

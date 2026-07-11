@@ -57,7 +57,10 @@ test('score popups rise 0.5px/tick, use the authored glyph banks, and retire aft
   scene.spawnScorePopup(10, 100, 200, 0xffffffff);
   const pop = scene.popupsLarge[0];
   const draws = [];
-  const renderer = { drawSprite: (...args) => draws.push(args) };
+  const renderer = {
+    ctx: { save() {}, restore() {} },
+    drawSpriteInBatch: (...args) => draws.push(args)
+  };
 
   scene.drawPopups(renderer, 0, 0);
   assert.deepEqual(draws.map((d) => d.slice(1, 5)), [[8, 0, 8, 8], [0, 0, 8, 8]]);
@@ -83,7 +86,10 @@ test('PowerUp popup uses ascii.anm sprite 10 rather than the HUD digit strip', (
   const scene = popupScene();
   scene.spawnScorePopup(-1, 100, 200, 0xffffc0a0);
   const draws = [];
-  scene.drawPopups({ drawSprite: (...args) => draws.push(args) }, 0, 0);
+  scene.drawPopups({
+    ctx: { save() {}, restore() {} },
+    drawSpriteInBatch: (...args) => draws.push(args)
+  }, 0, 0);
   assert.deepEqual(draws[0].slice(1, 5), [80, 0, 48, 8]);
 });
 
