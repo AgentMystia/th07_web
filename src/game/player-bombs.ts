@@ -339,26 +339,36 @@ export class BombRunner {
   // r24/d10 until its slot tallies 30 damage; culled 32px off-screen.
   private sakuyaAUnfocused(ctx: BombContext): void {
     const f = ctx.frame;
+    // Fixed 96-slot pool (exe 0x60 slots, stride 0x1428). Knives that fly
+    // off-screen FREE their slot, and while the spawn window is open the
+    // 5-per-frame budget refills free slots (all.c:4847-4872) — the vanilla
+    // look is a continuous knife hose replenishing for a full second, not
+    // one 96-knife burst.
+    if (this.actors.length === 0) {
+      for (let i = 0; i < 96; i++) {
+        this.actors.push({ x: 0, y: 0, vx: 0, vy: 0, angle: 0, speed: 0, accel: 0, turnRate: 0, state: 0, age: 0 });
+      }
+    }
     if (f >= 60 && f <= 120) {
-      for (let n = 0; n < 5 && this.actors.length < 96; n++) {
-        const angle = ctx.rng.range(TAU) - Math.PI;
-        const speed = ctx.rng.range(6) + 5.5;
-        this.actors.push({
-          x: this.castX + Math.cos(angle) * 24,
-          y: this.castY + Math.sin(angle) * 24,
-          vx: 0, vy: 0, angle, speed,
-          accel: ctx.rng.range(0.1) + 0.1,
-          turnRate: ctx.rng.range(0.0628) - 0.0314,
-          state: 1, age: 0
-        });
-        const i = this.actors.length - 1;
-        // The knife visual rides its actor — the exe attaches each slot's
-        // ANM to the slot and draws it at the slot position.
-        ctx.fx.spawn({
+      let budget = 5;
+      for (let i = 0; i < 96 && budget > 0; i++) {
+        const k = this.actors[i];
+        if (k.state !== 0) continue;
+        budget--;
+        k.angle = ctx.rng.range(TAU) - Math.PI;
+        k.speed = ctx.rng.range(6) + 5.5;
+        k.accel = ctx.rng.range(0.1) + 0.1;
+        k.turnRate = ctx.rng.range(0.0628) - 0.0314;
+        k.x = this.castX + Math.cos(k.angle) * 24;
+        k.y = this.castY + Math.sin(k.angle) * 24;
+        k.vx = k.vy = 0;
+        k.state = 1;
+        this.engine.slots[i].hitTally = 0;
+        this.knifeFx[i] = ctx.fx.spawnHandle({
           scriptId: 5 + (i & 1),
-          x: this.actors[i].x,
-          y: this.actors[i].y,
-          follow: this.actors[i],
+          x: k.x,
+          y: k.y,
+          follow: k,
           followRotate: true
         });
       }
@@ -366,17 +376,23 @@ export class BombRunner {
     this.actors.forEach((k, i) => {
       if (k.state === 0) return;
       const slot = this.engine.slots[i];
+      k.angle += k.turnRate * ctx.rate;
+      k.speed += k.accel * ctx.rate;
       if (slot.hitTally < 30) {
-        k.angle += k.turnRate * ctx.rate;
-        k.speed += k.accel * ctx.rate;
         k.vx = Math.cos(k.angle) * k.speed;
         k.vy = Math.sin(k.angle) * k.speed;
         k.x += k.vx * ctx.rate;
         k.y += k.vy * ctx.rate;
         this.engine.set(i, k.x, k.y, 24, 24, 10);
+      } else if (this.knifeFx[i]) {
+        // 30 damage banked: the knife freezes and its ANM swaps to the
+        // impact script 0x460 (all.c:4897-4899), same as the focused form.
+        this.knifeFx[i]!.setScript(96);
+        this.knifeFx[i] = null;
       }
       if (k.x < -32 || k.x > 416 || k.y < -32 || k.y > 480) {
-        k.state = 0;
+        k.state = 0; // frees the slot for the spawner (and culls the fx)
+        this.knifeFx[i] = null;
         this.engine.clear(i);
       }
     });

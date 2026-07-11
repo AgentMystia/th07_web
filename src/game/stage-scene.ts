@@ -1946,10 +1946,23 @@ export class StageScene implements GameHost {
   // Nearest damageable enemy to (x, y); shared by the homing steer and the
   // SakuyaA focused spawn-aim.
   private findAimTarget(x: number, y: number): Enemy | null {
+    // Sakuya's aimed knives use their own target cache with a maximum
+    // firing angle: an enemy only qualifies while the angle from the PLAYER
+    // to it lies inside [-120°, -60°) — ±30° around straight up
+    // (Th07.exe FUN_0041ed50 @ all.c:14267-14278, gated on character
+    // DAT_00625625 == 2; cone floats @ 0x48edc4/0x48edc0). Anything beside
+    // or below her is never aimed at — the knives fly their table angle.
+    const cone = this.playerObj.character.startsWith('sakuya');
+    const px = this.playerObj.x;
+    const py = this.playerObj.y;
     let best: Enemy | null = null;
     let bestDist = 1e9;
     for (const e of this.enemies) {
       if (!e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.canTakeDamage || !e.ecl.shotCollision) continue;
+      if (cone) {
+        const angle = Math.atan2(e.y - py, e.x - px);
+        if (angle < -2.0943952 || angle >= -1.0471976) continue;
+      }
       const d = (e.x - x) ** 2 + (e.y - y) ** 2;
       if (d < bestDist) {
         bestDist = d;
