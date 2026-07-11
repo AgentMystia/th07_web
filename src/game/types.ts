@@ -374,6 +374,8 @@ export interface EclState {
   interrupts: number[];
   disableCallStack: boolean;
   invisible: boolean;
+  // Test-only: last game frame this enemy emitted bullets (LIFE-001 traces).
+  lastFireFrame?: number;
   spellTimeoutFlag: boolean;
   // Th07.exe DAT_012f40a8: set while a boss spell card is active. Gates the
   // rank/count/speed bullet scaling off (spell bullets use raw ECL values).

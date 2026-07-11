@@ -25,6 +25,11 @@ interface TestHook {
   primeBorderCollision(): boolean;
   clearEnemyBullets(): void;
   spawnLog(): { t: number; time: number; sub: number }[];
+  lifecycleLog(): { f: number; ev: string; id: number; sub: number; a?: number }[];
+  frameCost(): { update: number[]; draw: number[] };
+  // Releases every previously injected held key (Input.inject is additive).
+  clearInput(): void;
+  setBombs(n: number): void;
   bgm(): { active: string | null; decoded: string[] };
 }
 
@@ -58,10 +63,17 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
     timelines: scene.runtime.timelineCursors.map((c) => ({ ...c })),
     bossActive: !!scene.bossActive,
     bossHp: scene.bossActive?.hp ?? null,
+    // PLAN.md Phase 0: explicit boss ownership — the primary boss entity and
+    // the full op99 slot table (UI-001 / LIFE-001 evidence).
+    bossOwner: scene.bossActive
+      ? { id: scene.bossActive.id, sub: scene.bossActive.ecl.subId, slot: scene.bossActive.ecl.bossSlot }
+      : null,
+    bossSlots: scene.runtime.bossSlots.map((b) => (b ? { id: b.id, sub: b.ecl.subId } : null)),
     lasers: scene.enemyLasers.filter((l) => l.inUse).length,
     laserDump: scene.enemyLasers.filter((l) => l.inUse).slice(0, 6).map((l) => ({
       x: Math.round(l.x), y: Math.round(l.y), angle: Number(l.angle.toFixed(2)),
-      near: Math.round(l.nearDist), far: Math.round(l.farDist), w: Number(l.displayWidth.toFixed(1)), state: l.state
+      near: Math.round(l.nearDist), far: Math.round(l.farDist), w: Number(l.displayWidth.toFixed(1)), state: l.state,
+      owner: l.ownerId, flags: l.flags, color: l.color, width: Number(l.width.toFixed(1))
     })),
     stageClear: scene.stageClear,
     pause: scene.pauseState
@@ -113,8 +125,14 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
       invuln: scene.playerObj.invulnFrames,
       bombInvuln: scene.playerObj.bombInvuln,
       deathTimer: scene.playerObj.deathTimer,
+      dyingFrame: scene.playerObj.dyingFrame,
+      materializeFrame: scene.playerObj.materializeFrame,
       alive: scene.playerObj.alive
     },
+    // PLAN.md Phase 0: COMBAT-001 evidence — this frame's ReimuA homing
+    // target (enemy id) and the total settled damage applied this frame.
+    homingTarget: scene.homingTargetId,
+    settledDamage: scene.settledDamageThisFrame,
     bomb: { timer: scene.playerObj.bombTimer },
     graze: scene.graze,
     pointItems: scene.pointItems,
@@ -145,6 +163,16 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
       primary: scene.runtime.std.primaryAnm ? { ...scene.runtime.std.primaryAnm } : null,
       secondary: scene.runtime.std.secondaryAnm ? { ...scene.runtime.std.secondaryAnm } : null
     },
+    // PLAN.md Phase 0: full-pool bullet type histogram keyed `sprite:offset`
+    // (RENDER-001/VM-001 evidence) — the capped bulletDump under-samples
+    // dense boss patterns.
+    bulletHistogram: scene.enemyBullets.reduce<Record<string, number>>((h, b) => {
+      if (!b.dead) {
+        const key = `${b.sprite}:${b.spriteOffset}`;
+        h[key] = (h[key] ?? 0) + 1;
+      }
+      return h;
+    }, {}),
     bulletDump: scene.enemyBullets.slice(0, 64).map((b) => ({
       id: b.id,
       x: Math.round(b.x),
@@ -161,6 +189,7 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
       grace: b.graceFrames ?? 0
     })),
     enemyDump: scene.enemies.slice(0, 8).map((e) => ({
+      id: e.id,
       sub: e.ecl.subId,
       ctxSub: e.ecl.ctx.subId,
       ctxTime: e.ecl.ctx.time,
@@ -172,6 +201,10 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
       boss: e.ecl.isBoss,
       bossSlot: e.ecl.bossSlot,
       canTakeDamage: e.ecl.canTakeDamage,
+      shotCollision: e.ecl.shotCollision,
+      shield: e.ecl.damageShield,
+      dmg: e.damageThisFrame ?? 0,
+      lastFire: e.ecl.lastFireFrame ?? -1,
       deathCallbackSub: e.ecl.deathCallbackSub,
       pendingInterrupt: e.ecl.pendingInterrupt,
       interactable: e.ecl.interactable,
@@ -392,6 +425,10 @@ async function boot(): Promise<void> {
         input.inject(held as never, pressed as never);
       },
       spawnLog: () => stage?.runtime.spawnLog ?? [],
+      lifecycleLog: () => stage?.runtime.lifecycleLog ?? [],
+      frameCost: () => loop.frameCosts(),
+      clearInput: () => input.clearInjected(),
+      setBombs: (n: number) => { if (stage) stage.playerObj.bombs = n; },
       damageBoss: (n: number) => {
         // Same gate as player damage, so probes can't hit a boss that is
         // invulnerable during phase transitions / the death animation.

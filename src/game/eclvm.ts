@@ -182,6 +182,10 @@ export class StageRuntime {
   timelineCursors: { index: number; frame: number }[] = [];
   // Trace of fired timeline spawn events (see update()); for timing audits.
   spawnLog: { t: number; time: number; sub: number }[] = [];
+  // Test-only entity-lifecycle trace (PLAN.md Phase 0 / LIFE-001): spawn,
+  // kill, release, boss-slot and visibility transitions, ring-capped.
+  // Gameplay never reads it; the ?test=1 snapshot exposes it.
+  lifecycleLog: { f: number; ev: string; id: number; sub: number; a?: number }[] = [];
   private randomItemIndex = 0;
   private randomSpawnIndex = 0;
   // FUN_00421e90 starts at a retained cursor and scans the 0x400-slot pool
@@ -210,6 +214,11 @@ export class StageRuntime {
     this.effectAnm = anms.effect;
   }
 
+  private logLifecycle(game: GameHost, ev: string, e: Enemy, a?: number): void {
+    if (this.lifecycleLog.length >= 4096) this.lifecycleLog.splice(0, 1024);
+    this.lifecycleLog.push({ f: game.frame, ev, id: e.id, sub: e.ecl.subId, ...(a !== undefined ? { a } : {}) });
+  }
+
   reset(): void {
     this.timelineCursors = this.ecl.timelines.map(() => ({ index: 0, frame: 0 }));
     this.randomItemIndex = 0;
@@ -217,6 +226,7 @@ export class StageRuntime {
     this.bulletPoolCursor = 0;
     this.bossSlots = [];
     this.bossRegistered = false;
+    this.lifecycleLog = [];
     this.globalsInt.fill(0);
     this.globalsFloat.fill(0);
     this.std.reset();
@@ -332,6 +342,7 @@ export class StageRuntime {
       ecl
     };
     game.enemies.push(e);
+    this.logLifecycle(game, 'spawn', e, parent?.id);
     // Apply the timeline life/score BEFORE the initial ECL run so a t=0
     // op110 (set HP) is not clobbered by the spawn-event life afterwards.
     // Bosses ship with life=1 as a placeholder; their real HP comes from
@@ -1824,6 +1835,7 @@ export class StageRuntime {
         s.bossSlot = slot >= 0 ? slot : null;
         s.isBoss = slot >= 0;
         if (s.isBoss) this.bossSlots[slot] = e;
+        this.logLifecycle(game, 'bossSlot', e, slot);
         // Th07.exe DAT_00495bf4: true while ANY boss slot is occupied.
         // setBossPresent prefers slot 0 (main) so helper registration does
         // not steal the UI/damageBoss pointer from the primary boss, and
@@ -1906,7 +1918,12 @@ export class StageRuntime {
         s.bulletRankAmount2Low = v.i32(a + 16);
         s.bulletRankAmount2High = v.i32(a + 20);
         return null;
-      case 132: s.invisible = !!v.i32(a); return null;
+      case 132: {
+        const vis = !!v.i32(a);
+        if (vis !== s.invisible) this.logLifecycle(game, 'invisible', e, vis ? 1 : 0);
+        s.invisible = vis;
+        return null;
+      }
       case 133:
         s.timerCallbackSub = s.deathCallbackSub;
         s.bossTimer = 0;
@@ -2188,6 +2205,9 @@ export class StageRuntime {
   ): void {
     const shootX = origin?.x ?? e.x + e.ecl.shootOffset.x;
     const shootY = origin?.y ?? e.y + e.ecl.shootOffset.y;
+    // Test-only observability (PLAN.md Phase 0 / LIFE-001): last frame this
+    // enemy emitted bullets. Gameplay never reads it.
+    e.ecl.lastFireFrame = game.frame;
     const aim = Math.atan2(game.player.y - shootY, game.player.x - shootX);
     const occupied = occupiedPoolSlots ?? this.occupiedBulletPoolSlots(game);
     let rect: { x: number; y: number; w: number; h: number; imageKey: string } | null = null;
@@ -2346,6 +2366,7 @@ export class StageRuntime {
   // so boss slots and presence flags don't go stale.
   releaseEnemy(game: GameHost, e: Enemy): void {
     const s = e.ecl;
+    this.logLifecycle(game, 'release', e);
     if (s.bossSlot != null && this.bossSlots[s.bossSlot] === e) {
       this.bossSlots[s.bossSlot] = null;
     }
@@ -2359,6 +2380,7 @@ export class StageRuntime {
     // FUN_0041ed50 @ 0x420005 gates death only on hp <= 0 and op116's
     // interactable bit. op132 invisibility has no bearing on lifecycle.
     if (!s.interactable) return true;
+    this.logLifecycle(game, 'kill', e, s.deathMode & 7);
 
     for (const threshold of s.lifeThresholds) threshold.threshold = -1;
     s.timerCallbackThreshold = -1;

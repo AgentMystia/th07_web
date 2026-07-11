@@ -333,6 +333,12 @@ export class StageScene implements GameHost {
   // Each stage owns two consecutive ename.png rows: midboss, then boss.
   // Dialogue starts only for the latter and latches the within-stage row.
   private dialogueSeen = false;
+  // Test-only observability (PLAN.md Phase 0): the ReimuA homing target
+  // chosen this frame (enemy id, null when none eligible) and the total HP
+  // actually removed from enemies this frame after all damage reductions.
+  // Read by the ?test=1 snapshot; gameplay never consults them.
+  homingTargetId: number | null = null;
+  settledDamageThisFrame = 0;
   private eff01Pattern: CanvasPattern | null = null;
 
   // Global sprite id of etama entry 1's embedded sprite 0 (the etama2.png
@@ -1123,6 +1129,7 @@ export class StageScene implements GameHost {
     }
     const p = this.playerObj;
     this.sfxPlayedThisFrame.clear();
+    this.settledDamageThisFrame = 0;
     // During a story-dialogue box the player keeps FULL movement control, as
     // in the original PCB: only damage is suspended. What freezes is the rest
     // of the simulation -- enemy/boss scripts, enemy-bullet motion, the
@@ -1727,6 +1734,7 @@ export class StageScene implements GameHost {
     if (e.ecl.damageShield > 0) dmg = e.ecl.isBoss ? Math.trunc(dmg / 9) : 0;
     e.hp -= dmg;
     e.damageThisFrame = dmg;
+    this.settledDamageThisFrame += dmg;
   }
 
   private updatePlayerBullets(collide = true): void {
@@ -1748,6 +1756,7 @@ export class StageScene implements GameHost {
         homingTarget = e;
       }
     }
+    this.homingTargetId = homingTarget?.id ?? null;
     const anm = this.playerObj.anm;
     const rate = this.slowRate;
     this.tickLaserSlots();
