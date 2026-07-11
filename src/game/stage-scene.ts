@@ -3092,9 +3092,19 @@ export class StageScene implements GameHost {
 
   // Regular background quad VMs run on Std#animationFrame, which never
   // pauses or rewinds with the script clock (FUN_00406850 @ 0x406850).
+  // NOTE both caches floor the target clock: under global slow motion the
+  // STD animation clock is FRACTIONAL (…7000.33, 7000.66…), while the cached
+  // runner steps in whole frames. Comparing the raw fractional target against
+  // the integer runner position made "clock went backward" true on almost
+  // every slowed frame, and each such frame rebuilt every background script
+  // and replayed it from frame 0 — O(stage-frame) work per script per draw.
+  // That was the 餓王剣 (stage-5 Youmu bullet-time) frame-drop report: cost
+  // engaged exactly while slowRate < 1 and grew with elapsed stage time.
+  // A genuine rewind (the STD op-4 boss loop) still rebuilds correctly.
   private bgAnmFrame(scriptId: number, targetFrame: number): AnmFrame | null {
+    const target = Math.floor(targetFrame);
     let entry = this.bgAnmCache.get(scriptId);
-    if (!entry || targetFrame < entry.frame) {
+    if (!entry || target < entry.frame) {
       const ref = this.bgScripts.get(scriptId);
       if (!ref) return null;
       entry = {
@@ -3103,7 +3113,7 @@ export class StageScene implements GameHost {
       };
       this.bgAnmCache.set(scriptId, entry);
     }
-    while (entry.frame < targetFrame) {
+    while (entry.frame < target) {
       entry.runner.update();
       entry.frame++;
     }
@@ -3115,8 +3125,9 @@ export class StageScene implements GameHost {
       this.specialBgAnmCache[slot] = null;
       return null;
     }
+    const targetAge = Math.floor(state.age);
     let entry = this.specialBgAnmCache[slot];
-    if (!entry || entry.script !== state.script || state.age < entry.age) {
+    if (!entry || entry.script !== state.script || targetAge < entry.age) {
       const ref = this.bgScripts.get(state.script);
       if (!ref) return null;
       entry = {
@@ -3126,7 +3137,7 @@ export class StageScene implements GameHost {
       };
       this.specialBgAnmCache[slot] = entry;
     }
-    while (entry.age < state.age) {
+    while (entry.age < targetAge) {
       entry.runner.update();
       entry.age++;
     }

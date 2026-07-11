@@ -34,6 +34,8 @@ export class Renderer {
   private tintNextImageId = 1;
   private readonly tintCacheLimit = 384;
   private tintScratch: { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } | null = null;
+  // Whole-image patterns for the clip-free textured-triangle fill.
+  private trianglePatterns = new WeakMap<CanvasImageSource, CanvasPattern>();
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -360,16 +362,31 @@ export class Renderer {
     const f = y0 - b * u0 - d * v0;
     if (![a, b, c, d, e, f].every(Number.isFinite)) return;
     const ctx = this.ctx;
-    ctx.save();
-    ctx.beginPath();
-    ctx.moveTo(x0, y0);
-    ctx.lineTo(x1, y1);
-    ctx.lineTo(x2, y2);
-    ctx.closePath();
-    ctx.clip();
+    // Fill the triangle with a cached whole-image pattern under the uv->
+    // screen transform instead of save/clip/transform/drawImage/restore:
+    // dense 3D sections (stage 5's bamboo grove runs hundreds of quads)
+    // made the per-triangle clip+restore pair the single largest frame
+    // cost — canvas clip stacks are expensive to unwind in software and
+    // force pipeline flushes on GPU backends. The pattern samples the same
+    // texels (the path is authored in atlas space), with the same edge
+    // antialiasing behavior as the clipped drawImage.
+    let pattern = this.trianglePatterns.get(img);
+    if (!pattern) {
+      const created = ctx.createPattern(img, 'no-repeat');
+      if (!created) return;
+      pattern = created;
+      this.trianglePatterns.set(img, pattern);
+    }
+    const prev = ctx.getTransform();
     ctx.transform(a, b, c, d, e, f);
-    ctx.drawImage(img, 0, 0);
-    ctx.restore();
+    ctx.beginPath();
+    ctx.moveTo(u0, v0);
+    ctx.lineTo(u1, v1);
+    ctx.lineTo(u2, v2);
+    ctx.closePath();
+    ctx.fillStyle = pattern;
+    ctx.fill();
+    ctx.setTransform(prev);
   }
 
   // Returns a tinted copy of an atlas sub-rect (cached), for use as the
