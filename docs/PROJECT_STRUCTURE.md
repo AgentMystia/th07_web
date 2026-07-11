@@ -89,8 +89,11 @@ on the `legacy-vanilla` branch of
   BGM routing, runtime capture, and the 12x14 tile transition.
 - `prepare-pages.mjs` — assembles the static-deploy tree in `dist/pages/`
   from runtime files only.
-- `deploy-pages.mjs` — builds that tree and publishes its orphan commit to
-  the `gh-pages` branch.
+- `deploy-pages.mjs` — manual fallback that publishes the tree as an orphan
+  `gh-pages` commit. Deployment is normally CI's job: every push to `main`
+  runs `.github/workflows/deploy.yml` (check + test + build +
+  `prepare-pages`, then `actions/deploy-pages` — the repo's Pages source is
+  "GitHub Actions", no long-lived branch).
 
 ## Tests (`tests/`)
 
