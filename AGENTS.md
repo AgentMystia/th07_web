@@ -347,9 +347,6 @@ comparisons against real play).
   cleared-stage data this port doesn't persist (approved modernization:
   the stage list exists for testing). The stage list renders as plain
   text (original uses its ascii font + per-stage practice scores).
-- Death drops scatter toward exe-exact random targets (rand*288+48,
-  rand*192−64) but fly a 40-frame straight-line velocity instead of the
-  exe's positional tween (spawn mode 2's interp fields).
 - Supernatural Border ring remains procedural (no ANM source recovered);
   it now closes fully at expiry and the playfield carries the exe's
   30/480/30 tint envelope (FUN_0043e2e0 state 4).

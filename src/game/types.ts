@@ -112,7 +112,13 @@ export interface ItemEntity {
   vy: number;
   type: ItemType;
   age: number;
+  // Th07.exe item+0x27f: 0 = falling, 1 = homing toward the player (a
+  // permanent latch), 2 = spawn-mode-2 positional tween (death drops).
   state: number;
+  // Mode-2 tween block (exe item+0x258..+0x26c while state==2): origin and
+  // target of the 60-frame lerp plus the split elapsed/frac counter
+  // (+0x278/+0x274, advanced fractionally under slowmo via FUN_00436acc).
+  tween?: { sx: number; sy: number; tx: number; ty: number; elapsed: number; frac: number };
   dead?: boolean;
 }
 
@@ -155,7 +161,7 @@ export interface GameHost {
   slowRate?: number;
   setSlowRate?(rate: number): void;
   addScore(v: number): void;
-  spawnItem(type: ItemType, x: number, y: number, options?: { state?: number; vx?: number; vy?: number }): void;
+  spawnItem(type: ItemType, x: number, y: number, options?: { state?: number; vx?: number; vy?: number; tweenTarget?: { tx: number; ty: number } }): void;
   spawnEffectParticles(effectId: number, x: number, y: number, count: number, color: number): void;
   playSfx(id: number): void;
   startDialogue?(index: number): void;

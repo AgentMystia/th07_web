@@ -751,7 +751,7 @@ export class StageScene implements GameHost {
     }
   }
 
-  spawnItem(type: ItemType, x: number, y: number, options: { state?: number; vx?: number; vy?: number } = {}): void {
+  spawnItem(type: ItemType, x: number, y: number, options: { state?: number; vx?: number; vy?: number; tweenTarget?: { tx: number; ty: number } } = {}): void {
     // Th07.exe item pool is a fixed 1100-slot array — FUN_00430970 scans for
     // a free slot and silently drops the spawn when none is left (the 0x44c
     // loop bound appears in every item pass, e.g. FUN_00431d10/FUN_00431da0).
@@ -762,6 +762,11 @@ export class StageScene implements GameHost {
     // power, power(0)/bigPower(2) drops convert to bigCherry(7) -- so max-power
     // players get value items instead of wasted power.
     if (this.playerObj.power >= 128 && (type === 'power' || type === 'bigPower')) type = 'bigCherry';
+    // Spawn mode 2 (FUN_00430970 all.c:21852-21862): the item lerps from its
+    // spawn point to the caller's target over 60 frames (see updateItems).
+    const tween = options.tweenTarget
+      ? { sx: x, sy: y, tx: options.tweenTarget.tx, ty: options.tweenTarget.ty, elapsed: 0, frac: 0 }
+      : undefined;
     this.items.push({
       id: this.id++,
       x, y,
@@ -769,7 +774,8 @@ export class StageScene implements GameHost {
       vy: options.vy ?? -2.2,
       type,
       age: 0,
-      state: options.state ?? 0
+      state: tween ? 2 : options.state ?? 0,
+      ...(tween ? { tween } : {})
     });
   }
 
@@ -1485,13 +1491,14 @@ export class StageScene implements GameHost {
   // Th07.exe FUN_00430970 spawn mode 2 (all.c:21852-21862): every death drop
   // launches from the fixed death point toward its own random target at
   // x = rand*288+48, y = rand*192-64 (playfield coords; constants @
-  // 0x48eccc/0x48eb94/0x48ecc8/0x48eb68). The exe tweens the position; the
-  // port approximates the arc with a 40-frame velocity handed to the normal
-  // gravity integrator (flagged approximation).
+  // 0x48eccc/0x48eb94/0x48ecc8/0x48eb68), riding a 60-frame positional lerp
+  // (FUN_00430c10 all.c:21936-21956) before dropping to normal fall from
+  // rest. Velocity starts zeroed — the exe reuses those fields as the tween
+  // origin while state==2.
   private spawnDeathDrop(type: ItemType, x: number, y: number): void {
     const tx = this.rng.f() * 288 + 48;
     const ty = this.rng.f() * 192 - 64;
-    this.spawnItem(type, x, y, { vx: (tx - x) / 40, vy: (ty - y) / 40 });
+    this.spawnItem(type, x, y, { vx: 0, vy: 0, tweenTarget: { tx, ty } });
   }
 
   // Fires once when the death squish finishes (tickDeath 'respawn'): teleport
@@ -2507,24 +2514,58 @@ export class StageScene implements GameHost {
   private updateItems(): void {
     const p = this.playerObj;
     const sht = p.sht;
-    const pocActive = p.alive && ((p.power >= 128 && p.y <= sht.pocLineY) || this.cherry.borderActive);
+    // Th07.exe FUN_00430c10 @ 0x430eb2-0x430f1e: the PoC trigger is
+    // (round(power) >= 128 OR shotType >= 4, i.e. SakuyaA/B bypasses the
+    // power gate, disasm @ 0x430ee7-0x430eee) AND player.y < pocLine
+    // (strict FCOMP <). On success the item's state byte (+0x27f) is written
+    // to 1 — a PERMANENT latch; leaving the trigger zone never un-latches.
+    const pocActive = p.alive
+      && (p.power >= 128 || p.character.startsWith('sakuya'))
+      && p.y < sht.pocLineY;
     for (const it of this.items) {
       it.age++;
-      if (this.cherry.borderActive) it.state = 1;
-      if (p.alive && (it.state === 1 || pocActive)) {
-        const angle = Math.atan2(p.y - it.y, p.x - it.x);
-        it.x += Math.cos(angle) * sht.autocollectSpeed * this.slowRate;
-        it.y += Math.sin(angle) * sht.autocollectSpeed * this.slowRate;
+      if (it.state === 2 && it.tween) {
+        // Spawn-mode-2 positional tween (death drops): pos = lerp(origin,
+        // target, elapsed/60) for elapsed 0..59; at exactly 60 the velocity
+        // zeroes and the item drops to normal fall from rest. Mid-tween
+        // frames skip the latch, gravity and cull entirely (the exe's mode-2
+        // branch jumps straight to the collect test). FUN_00430c10
+        // all.c:21936-21956; duration divisor DAT_0048ea98 = 60.0.
+        const tw = it.tween;
+        if (tw.elapsed > 59) {
+          if (tw.elapsed === 60) {
+            it.vx = 0;
+            it.vy = 0;
+            it.state = 0;
+          }
+        } else {
+          const t = (tw.elapsed + tw.frac) / 60;
+          it.x = t * tw.tx + (1 - t) * tw.sx;
+          it.y = t * tw.ty + (1 - t) * tw.sy;
+        }
+        // Split-counter advance (exe FUN_00436acc): fractional under slowmo.
+        tw.frac += this.slowRate;
+        while (tw.frac >= 1) {
+          tw.frac -= 1;
+          tw.elapsed++;
+        }
       } else {
-        // exe FUN_00430c10: item motion is rate-scaled (spec-slowmo.md §3.1).
-        it.vy = Math.min(3, it.vy + 0.03 * this.slowRate);
-        it.x += it.vx * this.slowRate;
-        it.y += it.vy * this.slowRate;
+        if (this.cherry.borderActive || pocActive) it.state = 1;
+        if (p.alive && it.state === 1) {
+          const angle = Math.atan2(p.y - it.y, p.x - it.x);
+          it.x += Math.cos(angle) * sht.autocollectSpeed * this.slowRate;
+          it.y += Math.sin(angle) * sht.autocollectSpeed * this.slowRate;
+        } else {
+          // exe FUN_00430c10: item motion is rate-scaled (spec-slowmo.md §3.1).
+          it.vy = Math.min(3, it.vy + 0.03 * this.slowRate);
+          it.x += it.vx * this.slowRate;
+          it.y += it.vy * this.slowRate;
+        }
+        if (it.y > 480) it.dead = true;
       }
-      if (p.alive && Math.abs(it.x - p.x) <= sht.itemRadius && Math.abs(it.y - p.y) <= sht.itemRadius) {
+      if (p.alive && !it.dead && Math.abs(it.x - p.x) <= sht.itemRadius && Math.abs(it.y - p.y) <= sht.itemRadius) {
         this.collectItem(it);
       }
-      if (it.y > 480) it.dead = true;
     }
     let w = 0;
     for (const it of this.items) if (!it.dead) this.items[w++] = it;
