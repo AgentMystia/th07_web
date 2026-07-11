@@ -66,6 +66,6 @@ test('stage-4 op145 dispatches each sister through her op108 interrupt table', (
   assert.ok(sisters.every((enemy) => !enemy.dead), 'remote interrupt must not enter deleting global Sub0');
   sisters.forEach((enemy, i) => {
     assert.equal(enemy.ecl.stack.length, 1);
-    assert.deepEqual(enemy.ecl.stack[0], resumeContexts[i]);
+    assert.deepEqual(enemy.ecl.stack[0].ctx, resumeContexts[i]);
   });
 });

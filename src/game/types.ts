@@ -226,9 +226,32 @@ export interface EclContext {
   waitTimer: number;
 }
 
+export interface EclInterpSlot {
+  target: number;
+  duration: number;
+  elapsed: number;
+  mode: number;
+  ease: number;
+  f0: number;
+  f1: number;
+  f2: number;
+  f3: number;
+}
+
+// One saved call frame. Th07.exe pushes the whole 0x218-byte context block
+// (+0x6e4..+0x8fb) on op41 CALL, interrupt entry, and op144 periodic entry —
+// that block spans the instruction cursor, the 26 variable dwords, the op45
+// wait timer, and the op27 interp slots. op42 RETURN restores all of it, so
+// callee writes to locals/params/interps roll back at return.
+export interface EclFrame {
+  ctx: EclContext;
+  vars: Float64Array;
+  interps: (EclInterpSlot | null)[];
+}
+
 export interface EclState {
   ctx: EclContext;
-  stack: EclContext[];
+  stack: EclFrame[];
   subId: number;
   mirrored: boolean;
   itemDrop: number;
@@ -258,7 +281,7 @@ export interface EclState {
   // op27 timed float interpolators (exe enemy+0x770, 8 slots stride 0x30):
   // target = special-var-id tag, mode 0-6 = 2-point LERP, 7 = cubic Hermite
   // (f2/f3 = tangents), ease 0-6 per spec-op27-effects.md §1.3.
-  interpSlots: ({ target: number; duration: number; elapsed: number; mode: number; ease: number; f0: number; f1: number; f2: number; f3: number } | null)[];
+  interpSlots: (EclInterpSlot | null)[];
   // op122 armed per-frame bullet-effect (exe enemy+0x6f4): param re-resolved
   // live from the arming instruction each frame (paramOff = absolute byte
   // offset of arg1 in the ECL image).
@@ -269,7 +292,14 @@ export interface EclState {
   movementSuppressedByEffect0: boolean;
   // op144 periodic gosub (exe +0x2f58/+0x2f64/+0x2ee4): every `period`
   // frames, nested call into subId; -1 disarms.
-  periodicSub: { period: number; subId: number; elapsed: number } | null;
+  // op144 periodic gosub. The periodic sub runs on its own PERSISTENT
+  // 26-dword variable block (exe stash at enemy+0x2ee8): loaded into the
+  // live vars at each firing (all.c:7089-7095), exported back at that
+  // firing's op42 return (+0x8f4 flag, all.c:10024-10032) — its state
+  // carries across firings without disturbing the interrupted flow.
+  periodicSub: { period: number; subId: number; elapsed: number; savedVars: Float64Array } | null;
+  // The +0x8f4 flag: the next op42 exports the live vars to the stash.
+  periodicExportArmed: boolean;
   // Pending interrupt-table index (exe +0x2b08), written by op109/timeline
   // op10/op145 and drained through the op108 table at frame/interpreter top.
   pendingInterrupt: number;

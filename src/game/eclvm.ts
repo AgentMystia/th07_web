@@ -369,6 +369,7 @@ export class StageRuntime {
       effectArm: null,
       movementSuppressedByEffect0: false,
       periodicSub: null,
+      periodicExportArmed: false,
       pendingInterrupt: -1,
       hitbox2: null,
       moveMode: 0,
@@ -582,7 +583,10 @@ export class StageRuntime {
       case 10041: case 10042: case 10043: case 10044:
         this.globalsFloat[id - 10041] = value; return;
       // Movement-state vars (see varRead): writable ones alias to the named
-      // movement fields so ECL writes reach the integrator.
+      // movement fields so ECL writes reach the integrator. 10045 is the
+      // stored heading (+0x2b54, FUN_0040e560 case 0x273d) — mode-1 motion
+      // reads it back as the travel angle.
+      case 10045: s.angle = value; return;
       case 10046: s.angularVelocity = value; return;
       case 10047: s.speed = value; return;
       case 10048: s.acceleration = value; return;
@@ -646,10 +650,12 @@ export class StageRuntime {
       s.periodicSub.elapsed += rate;
       if (s.periodicSub.elapsed >= s.periodicSub.period) {
         s.periodicSub.elapsed = 0;
-        // Nested gosub: return resumes the interrupted flow (the exe also
-        // snapshots/restores the FIRE template around it — approximated by
-        // the plain call stack).
-        s.stack.push({ ...s.ctx });
+        // Periodic entry (all.c:7081-7102): push the frame, load the sub's
+        // own persistent variable block from the stash, and arm the export
+        // flag so its op42 writes the block back.
+        this.pushFrame(s);
+        s.vars.set(s.periodicSub.savedVars);
+        s.periodicExportArmed = true;
         this.enterSub(s, s.periodicSub.subId);
       }
     }
@@ -786,6 +792,7 @@ export class StageRuntime {
     s.bulletRankAmount2Low = 0;
     s.bulletRankAmount2High = 0;
     s.stack.length = 0;
+    s.periodicExportArmed = false;
     if (s.isBoss) this.clearNonBossEnemies(game, e);
     this.enterSub(s, sub);
   }
@@ -800,6 +807,17 @@ export class StageRuntime {
     };
   }
 
+  // Th07.exe frame push (op41 all.c:10045-10052, interrupt entry 7058-7065,
+  // periodic entry 7081-7088): the saved 0x218-byte block spans the cursor,
+  // all 26 variable dwords, the wait timer, and the op27 interp slots.
+  private pushFrame(s: EclState): void {
+    s.stack.push({
+      ctx: { ...s.ctx },
+      vars: s.vars.slice(),
+      interps: s.interpSlots.map((slot) => (slot ? { ...slot } : null))
+    });
+  }
+
   // Th07.exe FUN_0040f6c0 @ all.c:7055-7072: +0x2b08 stores an interrupt
   // INDEX, not a global sub id. Save the current resume cursor, then enter
   // the sub registered by op108 in +0x2a88[index]. op109 jumps back to the
@@ -812,7 +830,7 @@ export class StageRuntime {
     const sub = s.interrupts[interruptIndex];
     if (sub == null || sub < 0) return;
     const next = this.ecl.sub(s.ctx.subId)[s.ctx.index];
-    if (!s.disableCallStack && next) s.stack.push({ ...s.ctx });
+    if (!s.disableCallStack && next) this.pushFrame(s);
     this.enterSub(s, sub);
   }
 
@@ -1415,14 +1433,34 @@ export class StageRuntime {
         return null;
       }
       case 40: s.angle = gf(0); s.moveMode = 1; return null;
-      case 41: { // call sub — callee shares this enemy's variable block
-        if (!s.disableCallStack) s.stack.push({ ...ctx, index: ctx.index + 1 });
+      case 41: { // call sub — Th07.exe case 0x28 (all.c:10042-10065)
+        if (!s.disableCallStack) {
+          this.pushFrame(s);
+          s.stack[s.stack.length - 1].ctx.index = ctx.index + 1;
+        }
+        // The ECL calling convention: the caller writes the run-globals
+        // (10037-10044) and CALL copies all eight into this enemy's param
+        // slots, where the callee reads them as 10029-10036 (and where
+        // var 10056's random range/base come from).
+        for (let i = 0; i < 4; i++) {
+          s.vars[18 + i] = this.globalsInt[i];
+          s.vars[22 + i] = this.globalsFloat[i];
+        }
         this.enterSub(s, v.i32(a));
         return 'flow';
       }
-      case 42: { // return
+      case 42: { // return — restores cursor + vars + interp slots (all.c:10019-10041)
         const ret = s.stack.pop();
-        if (ret) s.ctx = ret;
+        if (s.periodicExportArmed && s.periodicSub) {
+          // +0x8f4: the periodic sub's state persists in its own stash.
+          s.periodicSub.savedVars.set(s.vars);
+          s.periodicExportArmed = false;
+        }
+        if (ret) {
+          s.ctx = ret.ctx;
+          s.vars.set(ret.vars);
+          s.interpSlots = ret.interps;
+        }
         return 'flow';
       }
       case 45: // Wait(nFrames): Th07.exe 0x40f8e9-0x40f94f, timer at +0x76c.
@@ -1952,7 +1990,13 @@ export class StageRuntime {
         // `period` frames, nested gosub subId; -1 disarms. NOT death-tied.
         const period = gi(0);
         const subId = v.i32(a + 4);
-        s.periodicSub = subId < 0 ? null : { period: Math.max(1, period), subId, elapsed: 0 };
+        s.periodicSub = subId < 0 ? null : {
+          period: Math.max(1, period),
+          subId,
+          elapsed: 0,
+          // The persistent stash starts zeroed with the enemy struct.
+          savedVars: new Float64Array(26)
+        };
         return null;
       }
       case 145: { // SendInterruptToTrackedEnemy(idx, interruptIndex) (case 0x90)
@@ -2228,6 +2272,7 @@ export class StageRuntime {
       const sub = s.deathCallbackSub;
       s.deathCallbackSub = -1;
       s.stack.length = 0;
+      s.periodicExportArmed = false;
       this.enterSub(s, sub);
     } else {
       enemy.dead = true;
@@ -2367,6 +2412,7 @@ export class StageRuntime {
     if (mode === 0) return false;
     if (callback >= 0) {
       s.stack.length = 0;
+      s.periodicExportArmed = false;
       this.enterSub(s, callback);
     }
     // Modes 1-3 retain the actor for their scripted death/phase transition.

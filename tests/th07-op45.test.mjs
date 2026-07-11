@@ -137,12 +137,15 @@ test('op144 periodic gosub runs during a parent wait and restores its wait conte
   ]);
   const game = makeHost();
   const enemy = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
-  enemy.ecl.periodicSub = { period: 1, subId: 1, elapsed: 0 };
+  enemy.ecl.periodicSub = { period: 1, subId: 1, elapsed: 0, savedVars: new Float64Array(26) };
 
   assert.equal(enemy.ecl.ctx.waitTimer, 2);
   runtime.updateEnemy(game, enemy);
 
-  assert.equal(enemy.ecl.vars[5], 1, 'periodic callee must execute even while its parent is waiting');
+  // The periodic sub runs on its own persistent block (exe +0x2ee8 stash):
+  // its op17 increment lands in savedVars and the live vars roll back.
+  assert.equal(enemy.ecl.periodicSub.savedVars[5], 1, 'periodic callee must execute even while its parent is waiting');
+  assert.equal(enemy.ecl.vars[5], 0, 'the interrupted flow keeps its own variable block');
   assert.equal(enemy.ecl.stack.length, 0);
   assert.deepEqual(
     { sub: enemy.ecl.ctx.subId, index: enemy.ecl.ctx.index, time: enemy.ecl.ctx.time, wait: enemy.ecl.ctx.waitTimer },

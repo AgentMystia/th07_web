@@ -153,7 +153,9 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
       rect: [b.rect.x, b.rect.y, b.rect.w, b.rect.h],
       img: b.rect.imageKey,
       vx: Number(b.vx.toFixed(2)),
-      vy: Number(b.vy.toFixed(2))
+      vy: Number(b.vy.toFixed(2)),
+      ex: b.exFlags,
+      grace: b.graceFrames ?? 0
     })),
     enemyDump: scene.enemies.slice(0, 8).map((e) => ({
       sub: e.ecl.subId,
