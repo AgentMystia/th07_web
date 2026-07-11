@@ -2474,8 +2474,12 @@ export class StageScene implements GameHost {
   private drawLasers(r: Renderer, ox: number, oy: number): void {
     const ctx = r.ctx;
     for (const l of this.enemyLasers) {
+      // Exe render (FUN_004253b0, all.c:16375-16420): the beam body draws
+      // for every ALLOCATED slot, through the whole shrink — shrinkCutoff is
+      // a COLLISION-only gate (all.c:16301-16303). Cutting the draw at
+      // shrinkCutoff made long shrink tails (e.g. Prismriver shrink 200-300,
+      // cutoff 16) vanish abruptly (LASER-001).
       if (!l.inUse) continue;
-      if (l.state === 2 && l.phaseFrame >= l.shrinkCutoff) continue;
       const len = l.farDist - l.nearDist;
       if (len <= 0 || l.displayWidth <= 0) continue;
       const color = StageScene.LASER_COLORS[((l.color % 16) + 16) % 16];
@@ -2522,7 +2526,16 @@ export class StageScene implements GameHost {
       if (l.nearDist < 0) l.nearDist = 0;
       if (l.state === 0) {
         if ((l.flags & 1) === 0) {
-          l.displayWidth = Math.min(l.width, 1.2 + (l.width - 1.2) * (l.phaseFrame / Math.max(1, l.growDuration)));
+          // Exe grow ramp (all.c:16223-16241): the telegraph stays a FLAT
+          // 1.2px hairline until the last min(growDuration,30) frames, then
+          // jumps onto the growDuration-normalized ramp
+          // (phaseFrame+frac)*width/growDuration. The old smooth full-phase
+          // ramp drew (and hit-tested, via displayWidth) up to ~3x too wide
+          // mid-telegraph on long grows (LASER-001).
+          const rampWindow = Math.min(l.growDuration, 30);
+          l.displayWidth = l.growDuration - rampWindow < l.phaseFrame
+            ? Math.min(l.width, ((l.phaseFrame + (l.phaseFrac ?? 0)) * l.width) / Math.max(1, l.growDuration))
+            : 1.2;
         }
         if (l.phaseFrame >= l.growDuration) {
           l.state = 1;
