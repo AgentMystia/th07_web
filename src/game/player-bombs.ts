@@ -1,4 +1,4 @@
-import type { PlayerEffects } from './player-effects';
+import type { PlayerEffects, PlayerEffectHandle } from './player-effects';
 import type { Player } from './player';
 import type { Rng } from '../core/rng';
 import type { Enemy, EnemyBullet } from './types';
@@ -95,12 +95,15 @@ export class BombRunner {
   private castY = 0;
   private sweepSign = 1;
   private spawnedCount = 0;
+  // SakuyaA focused: per-knife visual handles for the on-hit script swap.
+  private knifeFx: (PlayerEffectHandle | null)[] = [];
 
   constructor(private engine: BombEngine, private character: string, private focused: boolean) {}
 
   start(ctx: BombContext): void {
     this.castX = ctx.player.x;
     this.castY = ctx.player.y;
+    this.knifeFx.length = 0;
     this.engine.reset();
     // MarisaB unfocused: the sweep direction sign is locked at cast from
     // which half of the playfield the player stood on (spec-bombs-marisa §3).
@@ -138,7 +141,9 @@ export class BombRunner {
         x: ctx.player.x, y: ctx.player.y, vx: 0, vy: 0,
         angle, speed: 15, accel: 0, turnRate: 0, state: 1, age: 0
       });
-      ctx.fx.spawn({ scriptId: 133 + (i & 3), x: ctx.player.x, y: ctx.player.y });
+      // The orb sprite rides its slot (same slot-attached ANM architecture
+      // as SakuyaA's knives) — it flies out and swings back with the actor.
+      ctx.fx.spawn({ scriptId: 133 + (i & 3), x: ctx.player.x, y: ctx.player.y, follow: this.actors[i] });
       ctx.playSfx(13);
     }
     this.actors.forEach((orb, i) => {
@@ -180,7 +185,12 @@ export class BombRunner {
         vx: Math.cos(launch), vy: Math.sin(launch),
         angle: launch, speed: 8 /* turnParam seed */, accel: 0, turnRate: 0, state: 1, age: 0
       });
-      ctx.fx.spawn({ scriptId: 133 + (this.actors.length & 3), x: ctx.player.x, y: ctx.player.y });
+      ctx.fx.spawn({
+        scriptId: 133 + (this.actors.length & 3),
+        x: ctx.player.x,
+        y: ctx.player.y,
+        follow: this.actors[this.actors.length - 1]
+      });
       ctx.playSfx(13);
     }
     this.actors.forEach((orb, i) => {
@@ -342,7 +352,15 @@ export class BombRunner {
           state: 1, age: 0
         });
         const i = this.actors.length - 1;
-        ctx.fx.spawn({ scriptId: 5 + (i & 1), x: this.actors[i].x, y: this.actors[i].y, rotation: angle + Math.PI / 2 });
+        // The knife visual rides its actor — the exe attaches each slot's
+        // ANM to the slot and draws it at the slot position.
+        ctx.fx.spawn({
+          scriptId: 5 + (i & 1),
+          x: this.actors[i].x,
+          y: this.actors[i].y,
+          follow: this.actors[i],
+          followRotate: true
+        });
       }
     }
     this.actors.forEach((k, i) => {
@@ -375,7 +393,11 @@ export class BombRunner {
     if (f >= 20 && f < 116 && f % 2 === 0 && this.actors.length < 96) {
       for (let n = 0; n < 2 && this.actors.length < 96; n++) {
         const i = this.actors.length;
-        const angle = (i * TAU) / 96 - Math.PI + (n === 1 ? Math.PI : 0);
+        // Exe FUN_0040bbb0 @ all.c:5007/5016: slots i and i+48 arm on the
+        // same frame ((i % 48)*2 + 20) and BOTH take the same ring angle
+        // (i % 48)*2π/48 − π — the pair separates radially through its two
+        // random speeds, not by sitting on opposite sides.
+        const angle = ((i % 48) * TAU) / 48 - Math.PI;
         this.actors.push({
           x: ctx.player.x + Math.cos(angle) * 24,
           y: ctx.player.y + Math.sin(angle) * 24,
@@ -385,7 +407,15 @@ export class BombRunner {
           turnRate: -0.15707964,
           state: 1, age: 0
         });
-        ctx.fx.spawn({ scriptId: 7 + (i & 1), x: this.actors[i].x, y: this.actors[i].y, rotation: angle + Math.PI / 2 });
+        // Visual rides the slot (exe FUN_00403f50 attaches script
+        // 0x407/0x408 to the slot; FUN_0044aa20 runs it there each frame).
+        this.knifeFx[i] = ctx.fx.spawnHandle({
+          scriptId: 7 + (i & 1),
+          x: this.actors[i].x,
+          y: this.actors[i].y,
+          follow: this.actors[i],
+          followRotate: true
+        });
       }
     }
     // Shared nearest-enemy metric: horizontally closest to the player
@@ -421,6 +451,13 @@ export class BombRunner {
         k.x += k.vx * ctx.rate;
         k.y += k.vy * ctx.rate;
         this.engine.set(i, k.x, k.y, 24, 24, 22);
+      } else if (this.knifeFx[i]) {
+        // First hit (exe all.c:5089-5092): the knife stops and its ANM
+        // swaps to the impact script 0x460 (player-anm id 96, a sparse
+        // declared id in player02.anm), with a pink burst particle.
+        this.knifeFx[i]!.setScript(96);
+        this.knifeFx[i] = null;
+        ctx.spawnParticles(0, k.x, k.y, 4, 0xffff80ff);
       }
     });
   }

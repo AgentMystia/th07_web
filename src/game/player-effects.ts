@@ -21,6 +21,19 @@ export interface PlayerEffectSpawn {
   ttl?: number;
   // Fixed draw rotation (e.g. knives oriented along their drift vector).
   rotation?: number;
+  // Track a live bomb actor: the entry follows its position (and, with
+  // followRotate, its heading) every frame, and culls when the actor's
+  // state clears — the exe attaches each attack slot's ANM to the slot
+  // itself and draws it at the slot position (FUN_00403f50/FUN_0044aa20).
+  follow?: { x: number; y: number; angle: number; state: number };
+  followRotate?: boolean;
+}
+
+export interface PlayerEffectHandle {
+  // Swap the running script (exe FUN_00403f50 re-arm — e.g. SakuyaA's
+  // knives switch to the impact animation on their first hit).
+  setScript(id: number): void;
+  release(): void;
 }
 
 interface Entry {
@@ -34,6 +47,8 @@ interface Entry {
   ttl: number;
   rotation: number | undefined;
   age: number;
+  follow?: { x: number; y: number; angle: number; state: number };
+  followRotate?: boolean;
 }
 
 export class PlayerEffects {
@@ -52,12 +67,39 @@ export class PlayerEffects {
       delay: s.delay ?? 0,
       ttl: s.ttl ?? Infinity,
       rotation: s.rotation,
-      age: 0
+      age: 0,
+      follow: s.follow,
+      followRotate: s.followRotate
     });
+  }
+
+  // Spawn returning a handle for entries whose script the bomb code needs
+  // to re-arm later (SakuyaA impact swap).
+  spawnHandle(s: PlayerEffectSpawn): PlayerEffectHandle {
+    this.spawn(s);
+    const entry = this.entries[this.entries.length - 1];
+    return {
+      setScript: (id: number) => {
+        entry.scriptId = id;
+        entry.runner = null; // re-arms on the next update
+      },
+      release: () => {
+        entry.age = entry.ttl = 0;
+      }
+    };
   }
 
   update(rate = 1): void {
     for (const e of this.entries) {
+      if (e.follow) {
+        if (e.follow.state === 0) {
+          e.age = e.ttl = 0;
+          continue;
+        }
+        e.x = e.follow.x;
+        e.y = e.follow.y;
+        if (e.followRotate) e.rotation = e.follow.angle + Math.PI / 2;
+      }
       if (e.delay > 0) {
         e.delay -= rate;
         continue;
