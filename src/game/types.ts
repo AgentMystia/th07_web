@@ -10,6 +10,14 @@ export interface EnemyBullet {
   // Stable slot in Th07.exe's fixed 0x400-entry bullet pool. Effects scan
   // this identity in slot order, independently of the browser-side array.
   poolSlot: number;
+  // op-79 opcode 0x2000 grace (exe bullet+0xbf0): while it counts down the
+  // off-screen cull is skipped entirely and collision keeps running — how
+  // patterns park bullets outside the field before they sweep in.
+  graceFrames?: number;
+  // Frames spent continuously off-screen (exe bullet+0xbfe): dir-change/
+  // bounce bullets (mask 0xdc0) survive up to 128 before dying; others die
+  // immediately, draining any leftover count first.
+  offscreenFrames?: number;
   // Shared special-effect state (bullet +0xc08). Different op121/122 effect
   // callbacks deliberately reuse it as a state, countdown, or laser id.
   effectState: number;

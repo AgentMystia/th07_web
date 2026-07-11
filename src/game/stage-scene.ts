@@ -2067,6 +2067,9 @@ export class StageScene implements GameHost {
     }
     for (const b of this.enemyBullets) {
       if (b.dead) continue;
+      // op-79 0x2000 grace ticks first (exe FUN_004241c0 all.c:16144-16146,
+      // decremented just before the position add).
+      if (b.graceFrames && b.graceFrames > 0) b.graceFrames--;
       this.updateBulletMotion(b);
       if (wave && !b.dead && (b.flags & 0x1000) === 0) {
         const dx = b.x - wave.x;
@@ -2078,9 +2081,27 @@ export class StageScene implements GameHost {
           b.dead = true;
         }
       }
-      const exActive = (b.flags & (0x40 | 0x80 | 0x100 | 0x400 | 0x800)) !== 0;
-      const margin = exActive ? 160 : 32;
-      if (b.x < -margin || b.x > 384 + margin || b.y < -margin || b.y > 448 + margin) b.dead = true;
+      // Exe cull, FUN_004241c0 @ all.c:16150-16195: a live grace count skips
+      // the bounds test entirely (the bullet stays valid and collidable
+      // off-screen); otherwise FUN_0042bdc7 keeps the bullet while its OWN
+      // sprite rect overlaps the 384x448 field (constants @ 0x48eabc/eab8 —
+      // no flat pixel margin). Off-screen, dir-change/bounce bullets (mask
+      // 0xdc0) survive up to 128 consecutive frames (+0xbfe); anything else
+      // dies once any leftover count drains.
+      if (!b.graceFrames) {
+        const halfW = b.rect.w / 2;
+        const halfH = b.rect.h / 2;
+        const onscreen = b.x + halfW >= 0 && b.x - halfW <= 384 && b.y + halfH >= 0 && b.y - halfH <= 448;
+        if (onscreen) {
+          b.offscreenFrames = 0;
+        } else if ((b.exFlags & 0xdc0) === 0) {
+          if (b.offscreenFrames && b.offscreenFrames > 0) b.offscreenFrames--;
+          else b.dead = true;
+        } else {
+          b.offscreenFrames = (b.offscreenFrames ?? 0) + 1;
+          if (b.offscreenFrames >= 128) b.dead = true;
+        }
+      }
     }
     let w = 0;
     for (const b of this.enemyBullets) if (!b.dead) this.enemyBullets[w++] = b;

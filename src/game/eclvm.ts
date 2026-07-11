@@ -32,8 +32,9 @@ function resolveExBehaviors(
   fireFlags: number,
   spawnAngle: number,
   spawnSpeed: number
-): Pick<import('./types').EnemyBullet, 'exFlags' | 'exAccel' | 'exAngle' | 'exDir' | 'exBounce'> {
+): Pick<import('./types').EnemyBullet, 'exFlags' | 'exAccel' | 'exAngle' | 'exDir' | 'exBounce' | 'graceFrames'> {
   let exFlags = 0;
+  let graceFrames = 0;
   let exAccel: { mag: number; angle: number; limit: number } | null = null;
   let exAngle: { speedDelta: number; angleDelta: number; limit: number } | null = null;
   let exDir: { angle: number; newSpeed: number; interval: number; maxTimes: number } | null = null;
@@ -43,6 +44,15 @@ function resolveExBehaviors(
     if (!slot || slot.opcode === 0) break; // end of queue (exe: pfVar1[4]==0 -> return)
     if (slot.cond === 0 && exFlags !== 0) break; // cond gate (exe: cond==0 && flags!=0 -> return)
     if ((fireFlags & slot.opcode) === 0) continue; // opcode not enabled by this FIRE
+    if (slot.opcode === 0x2000) {
+      // Not a movement behavior: a frame-counted cull/collision grace.
+      // Th07.exe FUN_004229f0 @ all.c:15449-15452 stores it into bullet
+      // +0xbf0 WITHOUT touching the behavior flags or consuming the
+      // one-slot-per-frame budget (its branch loops instead of returning).
+      // arg3 carries the frame count — e.g. Chen's 陰陽 orbs use 300.
+      graceFrames = Math.max(graceFrames, slot.arg3 | 0);
+      continue;
+    }
     exFlags |= slot.opcode;
     switch (slot.opcode) {
       case 0x10:
@@ -60,10 +70,14 @@ function resolveExBehaviors(
       case 0x800:
         exBounce = { speed: slot.f0 <= -999 ? spawnSpeed : slot.f0, maxTimes: slot.arg3 };
         break;
-      // opcode 1 (speed-ramp): flag only, no params
+      case 1:
+        break; // speed-ramp: flag only, no params
+      default:
+        warnOnce(`ex${slot.opcode}`, `op-79 opcode 0x${slot.opcode.toString(16)} has no behavior mapping`);
+        break;
     }
   }
-  return { exFlags, exAccel, exAngle, exDir, exBounce };
+  return { exFlags, exAccel, exAngle, exDir, exBounce, graceFrames };
 }
 
 // Item ids as used by ECL drop fields, confirmed against Th07.exe (v1.00b)
@@ -1174,7 +1188,11 @@ export class StageRuntime {
         // table blesses no-op).
         return;
       case 3: return; // exe stub (confirmed empty; unused by real data)
-      default: return;
+      default:
+        // Retail data uses exactly ids 0-23, all handled above — an id here
+        // means new/modded data or a decode bug worth surfacing.
+        warnOnce(`fx${id}`, `bullet-effect id ${id} out of the 24-entry table`);
+        return;
     }
   }
 
@@ -2188,7 +2206,9 @@ export class StageRuntime {
           exAccel: ex.exAccel,
           exAngle: ex.exAngle,
           exDir: ex.exDir,
-          exBounce: ex.exBounce
+          exBounce: ex.exBounce,
+          graceFrames: ex.graceFrames,
+          offscreenFrames: 0
         });
       }
     }
