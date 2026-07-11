@@ -207,9 +207,23 @@ never billboards.
 
 **ECL** (`src/game/eclvm.ts`, `src/formats/ecl.ts`): header
 `{u16 subCount, u16 timelineCount, u32 offsets[16+subs]}`; sub instruction
-`{u32 time, u16 id, u16 size, u16 rankMask, u16 paramMask}`. Variables use
-a **register window**: locals 10000–10007, each sub call shifts the window
-+8, children share the parent's array. Rank masks gate spawns by
+`{u32 time, u16 id, u16 size, u16 rankMask, u16 paramMask}`. Variables:
+there is **NO register window** (an earlier model was disproven against
+FUN_0040d750/df90/dda0/e560 + the op41/42 dispatcher cases). Each enemy
+carries one 26-dword block (+0x6fc): locals 10000–10015 (ints
+10000–10003/10012–10015, floats 10004–10011), two extra floats
+10072/10073, rand-int params 10029–10032, rand-float params 10033–10036.
+Eight RUN-GLOBALS 10037–10044 (DAT_0133da80..9c) are shared by every
+enemy and act as **argument registers**: op41 CALL pushes the whole
+0x218-byte frame (cursor + vars + wait timer + op27 interps) and copies
+the globals into the callee's param slots; op42 RETURN restores the frame
+(callee writes roll back). Interrupt entry pushes the same frame without
+the copy; the op144 periodic sub runs on its own persistent stash
+(+0x2ee8, exported back at its return via +0x8f4). Var 10056 reads a
+random derived from the params (int: base+rng%range from 10029/10030;
+float: base+rng01()*range from 10033/10034); 10055 is a raw rng draw;
+10060 is a random angle in [−π, π). op92/93 children inherit a copy of
+the parent's whole block (FUN_0041db60). Rank masks gate spawns by
 difficulty — verify changes on Lunatic (`difficulty=3`), which exercises
 paths lower ranks never touch. Spell names (op 90) are XOR-0xAA-obscured
 Shift-JIS, terminated by a 0xAA byte.
@@ -321,6 +335,24 @@ comparisons against real play).
   spec-slowmo.md.
 - Extra/Phantasm starting bombs/power PROBABLE (community convention),
   not exe-verified.
+- ESC pause menu: presentation is the authored ascii.anm entry-2
+  (pause.png) scripts verbatim, but the exe's trigger/menu logic was not
+  statically recoverable — BGM-keeps-playing and the confirm default
+  (いいえ) are PROBABLE; the cursor highlight tints unselected rows (no
+  authored variant exists). Pause-menu Retry restarts the run (story:
+  stage 1; practice: the practiced stage) — label semantics, PROBABLE.
+- Practice Start: flow/init are exe-cited (8 lives, full reset, stage
+  select after shot select, clear→title with the cursor re-parked), but
+  all six stages are selectable — the original gates by score.dat "CLRD"
+  cleared-stage data this port doesn't persist (approved modernization:
+  the stage list exists for testing). The stage list renders as plain
+  text (original uses its ascii font + per-stage practice scores).
+- Death drops scatter toward exe-exact random targets (rand*288+48,
+  rand*192−64) but fly a 40-frame straight-line velocity instead of the
+  exe's positional tween (spawn mode 2's interp fields).
+- Supernatural Border ring remains procedural (no ANM source recovered);
+  it now closes fully at expiry and the playfield carries the exe's
+  30/480/30 tint envelope (FUN_0043e2e0 state 4).
 
 ## 8. Pitfall catalog (check these FIRST when something looks wrong)
 
