@@ -401,7 +401,11 @@ export class StageScene implements GameHost {
           const p = this.playerObj;
           // FUN_0043e890 @ 0x43e890: state 1/3, an active bomb, or a
           // blocked dialogue/transition records marker 2 and retries later.
-          if (this.isDialogueBlocking() || p.bombTimer > 0 || p.bombInvuln > 0 ||
+          // The stage-clear sequence defers too: a cherryPlus bar filled by
+          // the boss-kill sweep stays pinned at 50000, carries into the
+          // next stage via RunCarry, and the first positive gain there
+          // re-requests the border (the exe's re-fire-on-next-dc6f model).
+          if (this.stageClear || this.isDialogueBlocking() || p.bombTimer > 0 || p.bombInvuln > 0 ||
               p.invulnFrames > 0 || p.materializeFrame >= 0 || p.dyingFrame >= 0) {
             return 'defer';
           }
@@ -1103,9 +1107,9 @@ export class StageScene implements GameHost {
     if (!frozen && input.pressed.has('bomb') && (p.controllable || p.deathTimer >= 0) && !this.gameOver) {
       if (this.cherry.borderEngaged) {
         // Th07.exe FUN_0043d9a0 @ 0x43d9e8-0x43da17: bombing during a
-        // border invokes the same free break as a hit. It spends no bomb,
-        // then flags every existing item for collection.
-        if (this.breakBorder(null)) {
+        // border (active OR pending) invokes the same free break as a hit.
+        // It spends no bomb, then flags every existing item for collection.
+        if (this.breakBorder(null, true)) {
           for (const it of this.items) if (!it.dead) it.state = 1;
         }
       } else if (p.tryBomb()) {
@@ -1981,8 +1985,8 @@ export class StageScene implements GameHost {
     if (result === 'deathbomb-window') this.playSfx(20);
   }
 
-  private breakBorder(sourceBullet: EnemyBullet | null): boolean {
-    if (!this.cherry.breakBorder()) return false;
+  private breakBorder(sourceBullet: EnemyBullet | null, includePending = false): boolean {
+    if (!this.cherry.breakBorder(includePending)) return false;
     this.applyBorderBreakEffects(sourceBullet, false);
     return true;
   }
@@ -2474,10 +2478,23 @@ export class StageScene implements GameHost {
   private drawBorder(r: Renderer, ox: number, oy: number): void {
     const p = this.playerObj;
     const t = this.cherry.borderTimer / BORDER_DURATION;
-    const radius = 40 + 320 * t;
+    // The ring closes fully at the mechanical end — it previously popped
+    // out at 40px, which read as the visual ending early. (The exe kills
+    // its border child object synchronously at expiry, all.c:28804-28807;
+    // the ring itself is this port's flagged procedural approximation.)
+    const radius = 360 * t;
     const ctx = r.ctx;
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
+    // Screen tint envelope (exe FUN_0043e2e0 state-4, all.c:28756-28773):
+    // color 0x303030 additive, alpha ramping over the first 30 frames,
+    // flat 0x80 through frame 510, ramping out over the final 30.
+    const elapsed = BORDER_DURATION - this.cherry.borderTimer;
+    const alphaByte = elapsed < 30 ? (0x50 * elapsed) / 30
+      : elapsed < 510 ? 0x80
+        : (0x50 * (BORDER_DURATION - elapsed)) / 30;
+    ctx.fillStyle = `rgba(48, 48, 48, ${(alphaByte / 255).toFixed(3)})`;
+    ctx.fillRect(ox, oy, 384, 448);
     ctx.translate(ox + p.x, oy + p.y);
     for (const phase of [0, Math.PI / 4]) {
       ctx.save();

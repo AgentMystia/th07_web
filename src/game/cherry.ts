@@ -162,15 +162,26 @@ export class CherrySystem {
     return 0;
   }
 
-  // Breaks the border (player hit or bomb). Returns true if a hit was
-  // absorbed by the border.
-  breakBorder(): boolean {
-    if (!this.borderEngaged) return false;
-    this.borderTimer = 0;
-    this.borderPending = false;
-    this.cherryPlus = 0;
-    this.events.onBorderEnd?.('broken', 0);
-    return true;
+  // Breaks the border. A hit is only absorbed by an ACTIVE border (exe
+  // marker +0x240d == 1); a PENDING border (marker 2) does not shield and
+  // survives the hit — it retries after the respawn. Bombs pass
+  // includePending: FUN_0043d9a0's bomb branch consumes marker 1 AND 2
+  // through the same FUN_0043eb00 free break (exe-bombs.md §1/delta 6).
+  breakBorder(includePending = false): boolean {
+    if (this.borderActive) {
+      this.borderTimer = 0;
+      this.borderPending = false;
+      this.cherryPlus = 0; // FUN_0043eb00 resets DAT_00625870 (all.c:28983)
+      this.events.onBorderEnd?.('broken', 0);
+      return true;
+    }
+    if (includePending && this.borderPending) {
+      this.borderPending = false;
+      this.cherryPlus = 0;
+      this.events.onBorderEnd?.('broken', 0);
+      return true;
+    }
+    return false;
   }
 
   // Th07.exe FUN_0041ed50 (spec §3a, all.c 14181-14220), retail-simplified
@@ -304,12 +315,13 @@ export class CherrySystem {
     const cap = isSakuya ? 60000 : 100000;
     const penalty = Math.min(cap, Math.round(this.cherry * lossRatio));
     this.cherry = Math.max(0, this.cherry - floor10(penalty));
-    // Border progress reset on death is not itself in the decompiled §3d
-    // snippet, but matches well-established PCB behavior (dying zeroes the
-    // Cherry+ meter) and was already this file's behavior; kept.
-    this.cherryPlus = 0;
-    this.borderPending = false;
-    this.borderTimer = 0;
+    // A miss does NOT touch cherryPlus or a pending border: the miss body
+    // (FUN_0043dca0) contains no DAT_00625870 write — the global's complete
+    // write-site list is the HUD countdown (all.c:28735-28739), survive
+    // reset (28796), break reset (28983), the defer pin (29274), and the
+    // replay round-trip (29736-29738). A pending border simply retries
+    // once the respawn invulnerability window clears. (An earlier port
+    // zeroed cherryPlus here — fabricated.)
   }
 
   // Th07.exe FUN_0041e6b0 (spec §3e, CONFIRMED — DAT_0048ed1c == 0.25 via
