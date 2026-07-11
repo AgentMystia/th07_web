@@ -127,6 +127,9 @@ export interface GameHost {
   rng: Rng;
   difficulty: number; // 0 E, 1 N, 2 H, 3 L
   rank: number;
+  // ECL var 10028 (Th07.exe DAT_00625627): character*2 + shotType (0=ReimuA
+  // … 5=SakuyaB).
+  shotIndex?: number;
   frame: number;
   id: number;
   player: { x: number; y: number };
@@ -210,7 +213,6 @@ export interface EclContext {
   // (exe: split (int, frac) counter at enemy+0x6f0/+0x6ec advanced by
   // FUN_00436acc at the DAT_0056baa8 rate; spec-slowmo.md §5).
   timeFrac: number;
-  windowBase: number; // register-window offset into EclState.vars
   // op45 wait countdown (exe context +0x80 == enemy +0x764/+0x76c).
   // CALL saves/restores it with the rest of the 0x218-byte ECL context.
   waitTimer: number;
@@ -222,6 +224,17 @@ export interface EclState {
   subId: number;
   mirrored: boolean;
   itemDrop: number;
+  // The enemy's 26-dword ECL variable block, Th07.exe enemy+0x6fc..+0x763.
+  // [0..15]  locals 10000-10015 (ints 10000-10003/10012-10015, floats
+  //          10004-10011 — one shared block for every sub this enemy runs;
+  //          there is NO call-window shift in the executable).
+  // [16..17] extra float slots, vars 10072/10073 (+0x73c/+0x740).
+  // [18..21] rand-int config, vars 10029-10032 (+0x744..+0x750): var 10056's
+  //          int form reads base[19] + rng % range[18].
+  // [22..25] rand-float config, vars 10033-10036 (+0x754..+0x760): var
+  //          10056's float form reads base[23] + rng01()*range[22].
+  // op92/93 child spawns copy the whole block from the parent (FUN_0041db60
+  // copies 0x1a dwords from parent+0x6fc into the child).
   vars: Float64Array;
   axisSpeed: { x: number; y: number; z: number };
   angle: number;
@@ -387,6 +400,10 @@ export interface Enemy {
   // spell-card /7, op-142 shield /9) — see StageScene#settlePendingDamage.
   pendingShotDmg: number;
   pendingBombDmg: number;
+  // HP actually removed by the most recent per-frame settle — exposed to ECL
+  // as var 10061 (Th07.exe enemy+0x2e4c, zeroed each frame at all.c:14173;
+  // the Prismrivers poll it cross-slot via op43 for damage sharing).
+  damageThisFrame?: number;
   score: number;
   frame: number;
   dead?: boolean;

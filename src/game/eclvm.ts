@@ -99,9 +99,11 @@ const RANDOM_ITEMS: ItemType[] = [
 const BULLET_HITBOX_BY_SPRITE = [4, 6, 4, 6, 4, 4, 4, 10, 5, 8, 24];
 
 // Special variable ids (reads resolved from game state). Writable general
-// variables live in EclState.vars. Th07.exe: 10000-10015 are FIXED per-enemy
-// struct fields (shared across sub calls); 10029+ are window-relative params
-// (the +8 CALL shift aliases caller args with callee params). See varRead.
+// variables live in the enemy's 26-slot block (EclState.vars). Th07.exe has
+// NO call-window shift of any kind: 10000-10015 are fixed per-enemy locals
+// shared by every sub the enemy runs, 10029-10036/10072-10073 are more fixed
+// per-enemy slots, 10037-10044 are eight RUN-GLOBALS shared across all
+// enemies, and everything else is a computed special. See varRead.
 const VAR_BASE = 10000;
 
 
@@ -179,6 +181,11 @@ export class StageRuntime {
   bossSlots: (Enemy | null)[] = [];
   // Th07.exe DAT_00495bf4: true while any boss entity is registered.
   private bossRegistered = false;
+  // ECL run-globals, vars 10037-10044 (Th07.exe DAT_0133da80..9c): four int
+  // and four float slots shared by every enemy — boss controllers write
+  // pattern parameters here and child emitters read them back.
+  globalsInt = new Int32Array(4);
+  globalsFloat = new Float64Array(4);
 
   constructor(stage: StageData, anms: { etama: Anm; enemy: Anm; effect: Anm }) {
     this.ecl = new Ecl(stage.ecl);
@@ -196,6 +203,8 @@ export class StageRuntime {
     this.bulletPoolCursor = 0;
     this.bossSlots = [];
     this.bossRegistered = false;
+    this.globalsInt.fill(0);
+    this.globalsFloat.fill(0);
     this.std.reset();
   }
 
@@ -325,12 +334,15 @@ export class StageRuntime {
 
   private makeEnemyState(subId: number, mirrored: boolean, itemDrop: number, parent: Enemy | null): EclState {
     return {
-      ctx: { subId, index: 0, time: 0, timeFrac: 0, windowBase: parent ? parent.ecl.ctx.windowBase : 0, waitTimer: 0 },
+      ctx: { subId, index: 0, time: 0, timeFrac: 0, waitTimer: 0 },
       stack: [],
       subId,
       mirrored,
       itemDrop,
-      vars: parent ? parent.ecl.vars.slice() : new Float64Array(160),
+      // Children inherit the parent's whole 26-dword variable block —
+      // Th07.exe FUN_0041db60 copies 0x1a dwords from parent+0x6fc (locals,
+      // extra floats, both rand configs) into every op92/93 spawn.
+      vars: parent ? parent.ecl.vars.slice() : new Float64Array(26),
       axisSpeed: { x: 0, y: 0, z: 0 },
       angle: 0,
       angularVelocity: 0,
@@ -422,18 +434,39 @@ export class StageRuntime {
 
   // ---- variables -----------------------------------------------------------
 
-  // Variable model derived from the stage data's dataflow: variables live in
-  // a per-enemy array indexed through a register window that shifts by +8 on
-  // every sub call (Sub48 writes 10041/10037 → called Sub49 reads them as
-  // 10033/10029). Enemies spawned by another enemy inherit a copy of the
-  // parent's array and window base, which is how bosses hand pattern
-  // parameters (angle/rotation/speed) to child emitters. Engine-state
-  // specials (10016-10027) resolve on the raw id regardless of the window.
+  // Variable model, decoded verbatim from Th07.exe's four resolvers
+  // (FUN_0040d750 int-value / FUN_0040df90 float-value / FUN_0040dda0
+  // int-address / FUN_0040e560 float-address, all.c:5583-6268). There is NO
+  // register window anywhere in the executable — an earlier port model
+  // shifted ids ≥10029 by +8 per CALL, which silently privatized what are
+  // actually fixed per-enemy fields and run-globals and broke every script
+  // that passes parameters between enemies (Alice's whole stage-3 boss fight
+  // ran on zeroed configs). The real model:
+  //   10000-10015  fixed per-enemy locals (vars[0..15]); ints at 10000-10003/
+  //                10012-10015, floats at 10004-10011.
+  //   10016/10017  difficulty / rank globals.
+  //   10018-10023  own position / player position.
+  //   10024-10028  aim-to-player, bossTimer, player distance, HP, shot index.
+  //   10029-10032  per-enemy rand-int config  (vars[18..21], +0x744..+0x750).
+  //   10033-10036  per-enemy rand-float config (vars[22..25], +0x754..+0x760).
+  //   10037-10044  RUN-GLOBALS shared by every enemy: 4 int + 4 float
+  //                (DAT_0133da80..9c) — the cross-enemy parameter bus.
+  //   10045-10054  live movement state (named fields).
+  //   10055        rng draw (int: raw u16; float: [0,1)).
+  //   10056        configured random (int: base+rng%range from 10029/10030;
+  //                float: base+rng01()*range from 10033/10034).
+  //   10060        random angle in [-π, π)  (rng01()*2π − π).
+  //   10061-10071  damage-this-frame, boss slot, frame move deltas, op148
+  //                thresholds, item drop, death score.
+  //   10072/10073  two extra per-enemy float slots (vars[16..17]).
+  // An id with no mapping resolves to its own literal value (the exe
+  // resolvers' default leaves the raw argument untouched).
 
-  private varRead(game: GameHost, e: Enemy, id: number): number {
+  private varRead(game: GameHost, e: Enemy, id: number, asFloat = false): number {
     const s = e.ecl;
     switch (id) {
       case 10016: return game.difficulty;
+      case 10017: return game.rank;
       // Th07.exe var resolver FUN_0040d750/FUN_0040dda0 (disasm confirmed):
       // 10018/19/20 = the ENEMY's OWN position (*(enemy+0x2b0c/0x2b10/0x2b14)),
       // 10021/22/23 = the PLAYER position (DAT_004b43e8/ec/f0). These were
@@ -455,6 +488,18 @@ export class StageRuntime {
       case 10025: return s.bossTimer;
       case 10026: return Math.hypot(game.player.x - e.x, game.player.y - e.y, -e.z);
       case 10027: return e.hp;
+      case 10028: return game.shotIndex ?? 0; // DAT_00625627: character*2 + shotType
+      // Per-enemy random config (see the vars block comment in types.ts) and
+      // the eight run-globals (Th07.exe DAT_0133da80..9c) — the cross-enemy
+      // parameter bus boss controllers use to configure child emitters.
+      case 10029: case 10030: case 10031: case 10032:
+        return s.vars[18 + (id - 10029)];
+      case 10033: case 10034: case 10035: case 10036:
+        return s.vars[22 + (id - 10033)];
+      case 10037: case 10038: case 10039: case 10040:
+        return this.globalsInt[id - 10037];
+      case 10041: case 10042: case 10043: case 10044:
+        return this.globalsFloat[id - 10041];
       // Th07.exe exposes the enemy's LIVE movement state through the var system
       // (FUN_0040df90 value-resolver, audit-letty-phases.md §0). The engine
       // keeps these in named fields, so alias the var ids to them — otherwise
@@ -468,30 +513,60 @@ export class StageRuntime {
       case 10049: return s.orbitSpeed;                      // +0x2b6c mode-3 orbit
       case 10053: return s.orbitAngle;                      // +0x2b5c mode-3 orbit
       case 10054: return s.orbitAngularVelocity;            // +0x2b60 mode-3 orbit
+      // Random draws (FUN_0040d750/FUN_0040df90 cases 0x2747/0x2748/0x274c):
+      // the int and float readers return DIFFERENT things for the same id.
+      case 10055: return asFloat ? game.rng.f() : game.rng.u16();
+      case 10056: return asFloat
+        ? s.vars[23] + game.rng.f() * s.vars[22]
+        : s.vars[19] + game.rng.u16InRange(Math.abs(Math.trunc(s.vars[18])));
+      case 10060: return game.rng.f() * (Math.PI * 2) - Math.PI; // rand angle [-π, π), consts @ 0x48eab0/b4
+      case 10061: return e.damageThisFrame ?? 0; // +0x2e4c, zeroed per frame at all.c:14173
+      case 10062: return s.bossSlot ?? 0;        // +0x2e17, written by op99
+      // +0x2b30/34/38 = this frame's movement delta (all.c:13120-13122).
+      case 10063: return s.frameVx;
+      case 10064: return s.frameVy;
+      case 10065: return 0; // frame z delta — engine has no z motion sources
+      // op148 HP-threshold slots (+0x2ebc..+0x2ec8); unarmed reads as 0.
+      case 10066: case 10067: case 10068: case 10069: {
+        const t = s.lifeThresholds[id - 10066].threshold;
+        return t < 0 ? 0 : t;
+      }
+      case 10070: return s.itemDrop; // +0x2e10
+      case 10071: return e.score;    // +0x2bc0 death score
+      case 10072: return s.vars[16]; // +0x73c
+      case 10073: return s.vars[17]; // +0x740
     }
-    // Th07.exe: vars 10000-10015 are FIXED per-enemy struct fields
-    // (enemy+0x6fc..0x738) shared across every sub call on this enemy — NOT
-    // shifted by the call window. Only the param/arg range (10029+) is
-    // window-relative (the +8 CALL shift aliases a caller's var10037/10041
-    // with a callee's var10029/10033). Windowing the locals too broke
-    // cross-sub locals: e.g. the 终符 controller (sub 55) sets var10007
-    // (the per-snowflake angular-velocity increment) and the spawner (sub 56)
-    // reads it — with windowing sub 56 read a fresh per-call slot (0) instead,
-    // so all snowflakes shared one angular velocity and clumped into a single
-    // point instead of fanning into the spell's flower.
     const rel = id - VAR_BASE;
-    const slot = rel <= 15 ? rel : s.ctx.windowBase + rel;
-    if (slot >= 0 && slot < s.vars.length) return s.vars[slot];
+    if (rel >= 0 && rel <= 15) return s.vars[rel];
+    // Exe resolvers' default: an unmapped id resolves to its own literal
+    // value. Warn once anyway — it usually means a special worth decoding.
+    if (rel >= 0 && rel < 100) warnOnce(`r${id}`, `read of unmapped variable ${id}`);
     return id;
   }
 
   private varWrite(game: GameHost, e: Enemy, id: number, value: number): void {
     const s = e.ecl;
     switch (id) {
-      // Th07.exe FUN_0040dda0: position (10018-10020) and distance (10026) are
-      // read-only through the var system; bossTimer write is 10025, hp is 10027.
+      // Th07.exe FUN_0040e560: own position is writable through the float
+      // var system; the player-position slots (10021-10023) are technically
+      // writable too but no retail script does — refuse defensively.
+      case 10018: e.x = value; return;
+      case 10019: e.y = value; return;
+      case 10020: e.z = value; return;
+      case 10021: case 10022: case 10023:
+        warnOnce(`w${id}`, `ignored write to player position var ${id}`);
+        return;
+      // FUN_0040dda0: bossTimer write is 10025, hp is 10027.
       case 10025: s.bossTimer = value; return;
       case 10027: e.hp = value; return;
+      case 10029: case 10030: case 10031: case 10032:
+        s.vars[18 + (id - 10029)] = value; return;
+      case 10033: case 10034: case 10035: case 10036:
+        s.vars[22 + (id - 10033)] = value; return;
+      case 10037: case 10038: case 10039: case 10040:
+        this.globalsInt[id - 10037] = Math.trunc(value); return;
+      case 10041: case 10042: case 10043: case 10044:
+        this.globalsFloat[id - 10041] = value; return;
       // Movement-state vars (see varRead): writable ones alias to the named
       // movement fields so ECL writes reach the integrator.
       case 10046: s.angularVelocity = value; return;
@@ -500,25 +575,29 @@ export class StageRuntime {
       case 10049: s.orbitSpeed = value; return;
       case 10053: s.orbitAngle = value; return;
       case 10054: s.orbitAngularVelocity = value; return;
+      case 10070: s.itemDrop = Math.trunc(value); return;
+      case 10071: e.score = Math.trunc(value); return;
+      case 10072: s.vars[16] = value; return;
+      case 10073: s.vars[17] = value; return;
     }
     const rel = id - VAR_BASE;
-    const slot = rel <= 15 ? rel : s.ctx.windowBase + rel;
-    if (slot >= 0 && slot < s.vars.length) {
-      s.vars[slot] = value;
+    if (rel >= 0 && rel <= 15) {
+      s.vars[rel] = value;
       return;
     }
-    warnOnce(`w${id}`, `write to out-of-range variable ${id} (base ${s.ctx.windowBase})`);
+    warnOnce(`w${id}`, `ignored write to unmapped variable ${id}`);
   }
 
   private getInt(game: GameHost, e: Enemy, off: number): number {
     const raw = this.ecl.view.i32(off);
-    if (raw >= VAR_BASE && raw < VAR_BASE + 100) return Math.trunc(this.varRead(game, e, raw));
+    // Int reads of float-backed vars round to nearest (exe FUN_00481260).
+    if (raw >= VAR_BASE && raw < VAR_BASE + 100) return Math.round(this.varRead(game, e, raw, false));
     return raw;
   }
 
   private getShort(game: GameHost, e: Enemy, off: number): number {
     const raw = this.ecl.view.i16(off);
-    if (raw >= VAR_BASE && raw < VAR_BASE + 100) return Math.trunc(this.varRead(game, e, raw));
+    if (raw >= VAR_BASE && raw < VAR_BASE + 100) return Math.round(this.varRead(game, e, raw, false));
     return raw;
   }
 
@@ -526,7 +605,7 @@ export class StageRuntime {
     const value = this.ecl.view.f32(off);
     const asInt = Math.trunc(value);
     if (Math.abs(value - asInt) < 0.00001 && asInt >= VAR_BASE && asInt < VAR_BASE + 100) {
-      return Number(this.varRead(game, e, asInt));
+      return Number(this.varRead(game, e, asInt, true));
     }
     return value;
   }
@@ -693,18 +772,16 @@ export class StageRuntime {
     s.bulletRankAmount2Low = 0;
     s.bulletRankAmount2High = 0;
     s.stack.length = 0;
-    s.ctx.windowBase = 0;
     if (s.isBoss) this.clearNonBossEnemies(game, e);
     this.enterSub(s, sub);
   }
 
-  private enterSub(s: EclState, subId: number, windowShift = 0): void {
+  private enterSub(s: EclState, subId: number): void {
     s.ctx = {
       subId,
       index: 0,
       time: 0,
       timeFrac: 0,
-      windowBase: Math.max(0, s.ctx.windowBase + windowShift),
       waitTimer: 0
     };
   }
@@ -1320,9 +1397,9 @@ export class StageRuntime {
         return null;
       }
       case 40: s.angle = gf(0); s.moveMode = 1; return null;
-      case 41: { // call sub (register window shifts by +8)
+      case 41: { // call sub — callee shares this enemy's variable block
         if (!s.disableCallStack) s.stack.push({ ...ctx, index: ctx.index + 1 });
-        this.enterSub(s, v.i32(a), 8);
+        this.enterSub(s, v.i32(a));
         return 'flow';
       }
       case 42: { // return
@@ -2131,7 +2208,6 @@ export class StageRuntime {
       const sub = s.deathCallbackSub;
       s.deathCallbackSub = -1;
       s.stack.length = 0;
-      s.ctx.windowBase = 0;
       this.enterSub(s, sub);
     } else {
       enemy.dead = true;
@@ -2271,7 +2347,6 @@ export class StageRuntime {
     if (mode === 0) return false;
     if (callback >= 0) {
       s.stack.length = 0;
-      s.ctx.windowBase = 0;
       this.enterSub(s, callback);
     }
     // Modes 1-3 retain the actor for their scripted death/phase transition.

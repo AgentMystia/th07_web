@@ -182,6 +182,12 @@ export class StageScene implements GameHost {
   // hardcoded 16 made every non-spell pattern 0.5 px/f faster and fire 20%
   // more often than vanilla.
   rank = 0;
+  // ECL var 10028 (Th07.exe DAT_00625627): character*2 + shotType.
+  get shotIndex(): number {
+    const c = this.playerObj.character;
+    const family = c.startsWith('reimu') ? 0 : c.startsWith('marisa') ? 1 : 2;
+    return family * 2 + (c.endsWith('B') ? 1 : 0);
+  }
   // Global slow-motion rate (exe DAT_0056baa8; spec-slowmo.md). Bullet-effect
   // 10 sets 1/param, 11 restores 1.0; reset at stage init by construction.
   slowRate = 1;
@@ -1457,6 +1463,10 @@ export class StageScene implements GameHost {
     const hadBomb = bombRaw > 0;
     e.pendingShotDmg = 0;
     e.pendingBombDmg = 0;
+    // Zeroed every frame like the exe's enemy+0x2e4c (all.c:14173) and set
+    // to the HP actually removed below — ECL var 10061 (the Prismrivers'
+    // op43 damage-sharing poll) reads it.
+    e.damageThisFrame = 0;
     if (raw <= 0) return;
     // DAT_00625627 = the shot-type bit (A=0 / B=1); the formulas below gate
     // on it being 0 (type-A shots).
@@ -1487,6 +1497,7 @@ export class StageScene implements GameHost {
     }
     if (e.ecl.damageShield > 0) dmg = e.ecl.isBoss ? Math.trunc(dmg / 9) : 0;
     e.hp -= dmg;
+    e.damageThisFrame = dmg;
   }
 
   private updatePlayerBullets(collide = true): void {
