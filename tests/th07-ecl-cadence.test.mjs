@@ -141,6 +141,26 @@ test('op91 clears the global flag for every later emitter', () => {
     'post-spell fire is rank-scaled again');
 });
 
+test('op93 resolves variable life/item/score (stage-5 wrapper->child relay, COMBAT-001)', () => {
+  // The stage-5 pattern: an invisible wrapper carries the timeline's real
+  // HP/item/score in its own hp/itemDrop/score fields and passes them to
+  // the visible child via var refs 10027/10070/10071 (exe all.c:8972-9027,
+  // paramMask 0x70 -> FUN_0040d750 resolution). Reading the raw words gave
+  // children 10027 HP.
+  const spawnChild = instruction(0, 93, [
+    i32(1), f32(0), f32(0), f32(0), i32(10027), i32(10070), i32(10071)
+  ]);
+  const runtime = makeRuntime([[spawnChild], []]);
+  const game = makeHost();
+  runtime.spawnEclEnemy(game, { subId: 0, x: 100, y: 100, life: 80, item: 1, score: 1500 });
+  assert.equal(game.enemies.length, 2, 'wrapper + child');
+  const child = game.enemies[1];
+  assert.equal(child.hp, 80, 'child inherits the wrapper HP, not the var id');
+  assert.equal(child.maxHp, 80);
+  assert.equal(child.ecl.itemDrop, 1, 'item relayed');
+  assert.equal(child.score, 1500, 'score relayed');
+});
+
 test('mode-3 orbit updates the live heading (exe +0x2b54) that op120/var10045 read', () => {
   // op56: duration 0, target (200,150), angle -π/2, angvel π/120, speed 0,
   // accel 0.5 — the Letty テーブルターニング Sub57 parameter shape.

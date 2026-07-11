@@ -1824,24 +1824,31 @@ export class StageRuntime {
         return null;
       }
       case 93: { // spawn child enemy relative to parent: (sub, x, y, z, life, item, score)
+        // life/item/score are variable-resolved like every other arg (exe
+        // case 0x5c, all.c:8972-9027: paramMask bits 0x10/0x20/0x40 route
+        // through FUN_0040d750). Stage 5's wrapper->child relay passes the
+        // timeline HP via var 10027 — reading the raw word gave every child
+        // 10027 HP, the tester's near-unkillable mobs (COMBAT-001).
         this.spawnEclEnemy(game, {
           subId: v.i32(a),
           x: e.x + gf(4), y: e.y + gf(8), z: e.z + gf(12),
-          life: v.i32(a + 16),
-          item: v.i32(a + 20),
-          score: v.i32(a + 24),
+          life: gi(16),
+          item: gi(20),
+          score: gi(24),
           mirrored: false,
           parent: e
         });
         return null;
       }
       case 92: { // Th07.exe case 0x5b: op92 spawns at ABSOLUTE position (op93 = relative)
+        // Same variable resolution as op93 (all.c:8918-8981) — dormant in
+        // shipped data (no op92 passes var refs here) but exe-correct.
         this.spawnEclEnemy(game, {
           subId: v.i32(a),
           x: gf(4), y: gf(8), z: gf(12),
-          life: v.i32(a + 16),
-          item: v.i32(a + 20),
-          score: v.i32(a + 24),
+          life: gi(16),
+          item: gi(20),
+          score: gi(24),
           mirrored: false,
           parent: e
         });
