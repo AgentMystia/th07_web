@@ -2336,15 +2336,25 @@ export class StageScene implements GameHost {
       }
     }
     if ((b.exFlags & 0x20) && b.exAngle) {
-      // angle-change (FUN_00423a80): angle += angleDelta, speed += speedDelta,
-      // velocity = polar(angle, speed). Runs while age < limit.
+      // angle-change (FUN_00423a80 @ 0x423a80): angle += rate*angleDelta,
+      // speed += rate*speedDelta, velocity = polar(angle, rate*speed). Both
+      // deltas are rate-scaled in the exe. Runs while the DEDICATED elapsed
+      // counter (exe bullet+0xcec, reset at install — not bullet age; effect
+      // id 1 installs this behavior mid-life) is below the duration; the
+      // counter advances fractionally under slowmo (FUN_00436acc).
       const an = b.exAngle;
-      if (age >= an.limit) b.exFlags &= ~0x20;
+      const elapsed = b.exAngleElapsed ?? 0;
+      if (elapsed >= an.limit) b.exFlags &= ~0x20;
       else {
-        b.angle = normalizeAngle(b.angle + an.angleDelta);
-        b.speed += an.speedDelta;
+        b.angle = normalizeAngle(b.angle + an.angleDelta * rate);
+        b.speed += an.speedDelta * rate;
         b.vx = Math.cos(b.angle) * b.speed * rate;
         b.vy = Math.sin(b.angle) * b.speed * rate;
+      }
+      b.exAngleFrac = (b.exAngleFrac ?? 0) + rate;
+      while (b.exAngleFrac >= 1) {
+        b.exAngleFrac -= 1;
+        b.exAngleElapsed = (b.exAngleElapsed ?? 0) + 1;
       }
     }
     if ((b.exFlags & 0x40) && b.exDir) this.dirChangeBullet(b, age, 'relative');

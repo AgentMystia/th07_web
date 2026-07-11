@@ -323,7 +323,11 @@ comparisons against real play).
   (spec-ui-stageclear.md §3); drawn as a small ~60% alpha "Enemy" label at
   the playfield bottom edge tracking boss.x.
 - Bullet-effect ids 1/2/4/6/9/12-15/19/21-23 ported (spec-effects-misc.md):
-  ids 1/2/4/6/12/21 delete bullets, id 1 "declaws" them to 0.3 speed, ids
+  ids 2/4/6/12/21 delete bullets; id 1 "declaws" matched bullets (filter =
+  spriteOffset, the FIRE 2nd i16 / exe bullet+0xbf8 — same field ids 2/6
+  filter on) to nominal 0.3 and installs a fresh opcode-0x20 slow-turn with
+  its own elapsed counter (E/N/H 60 ticks @ +1/60, Lunatic/Extra 240 @
+  +0.005263158, turn ±π/(rng01*60+180)/tick; FUN_00416da0 @ 0x416da0); ids
   9/15 are screen shake/flash, id 19 is the 3-second BGM fade. Ids 22/23
   (cosmetic auras) are intentional no-ops. ECL op149 (spell-presentation
   origin, 1 use) and op150 (enemy ANM Z-rotation) are handled.

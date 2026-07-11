@@ -1104,27 +1104,57 @@ export class StageRuntime {
         return;
       }
       case 20: game.playBgmTrack?.('th07_13b'); return; // Yuyuko phase-2 cue
-      case 1: { // FUN_00416da0: "declaw" — bullets of shape 2/4/6/8 (param
-        // 1 restricts to shape 8, param 2 to shape 4) drop their NOMINAL
-        // speed to a flat 0.3 and get marked processed; the bullet is not
-        // deleted and its live velocity vector is untouched. Plus a 12->0
-        // shake over 30f and a 3x pale flash (spec-effects-misc.md §1).
+      case 1: { // FUN_00416da0 @ 0x416da0: "declaw" + slow-turn. The filter
+        // field is the FIRE instruction's second i16 — spriteOffset, exe
+        // bullet+0xbf8 (param 1 restricts to offset 8, param 2 to offset 4,
+        // any other param applies no offset gate). Each first-time match:
+        // nominal speed = 0.3 (.text imm 0x3e99999a), the whole 5-slot
+        // behavior queue is wiped and a fresh opcode-0x20 slow-turn is
+        // installed with its own elapsed counter: E/N/H 60 ticks at
+        // +0.01666666753590107/tick (0x3c888889), Lunatic/Extra 240 ticks
+        // at +0.005263158120214939 (0x3bac7692); turn rate ±π/(rng01*60+180)
+        // per tick, + for offsets 6/8, − for 2/4, one RNG draw per matched
+        // bullet in pool-slot order. The same bullet-manager tick recomputes
+        // the velocity from 0.3+delta. Marked processed (+0xc08=1) so a
+        // repeat call skips it. Plus a 12->0 shake over 30f and a 3x4f pale
+        // flash (raw asm 0x416db4-0x416ddc).
         game.startScreenShake?.(30, 12, 0);
         game.startScreenFlash?.(4, 3, 0x80ffcfcf);
-        for (const b of game.enemyBullets) {
+        // Exe leaves the wobble stack slot stale for offsets outside
+        // {2,4,6,8} (retail data never fires those); carry the last value.
+        let wobble = 0;
+        const lunatic = game.difficulty >= 3;
+        for (const b of this.bulletsInPoolOrder(game)) {
           if (b.dead || b.effectState !== 0) continue;
-          if (param === 1 && b.sprite !== 8) continue;
-          if (param === 2 && b.sprite !== 4) continue;
-          if (param !== 1 && param !== 2 && ![2, 4, 6, 8].includes(b.sprite)) continue;
+          if (param === 1 && b.spriteOffset !== 8) continue;
+          if (param === 2 && b.spriteOffset !== 4) continue;
+          const k = b.spriteOffset;
+          if (k === 2 || k === 4) wobble = -Math.PI / (game.rng.f() * 60 + 180);
+          else if (k === 6 || k === 8) wobble = Math.PI / (game.rng.f() * 60 + 180);
           b.speed = 0.3;
+          // Queue wipe + fresh slot-0 install (rep stos @ 0x416f4d then
+          // FUN_004260d0). The port folds queue and live registers into the
+          // ex* fields; retail bullets here carry no live motion behavior.
+          b.exAccel = null;
+          b.exDir = null;
+          b.exBounce = null;
+          b.exAngle = {
+            speedDelta: lunatic ? 0.005263158120214939 : 0.01666666753590107,
+            angleDelta: wobble,
+            limit: lunatic ? 240 : 60
+          };
+          b.exFlags = 0x20;
+          b.exAngleElapsed = 0;
+          b.exAngleFrac = 0;
           b.effectState = 1;
         }
         return;
       }
-      case 2: { // FUN_00416fc0: silently delete every live shape-2 bullet
-        // within a param-selected radius of the calling enemy, popping a
-        // small particle at each former position (§2). param 0 also fires
-        // the shake+flash pair.
+      case 2: { // FUN_00416fc0: silently delete every live OFFSET-2 bullet
+        // (the +0xbf8 spriteOffset column, same filter field as id 1 —
+        // recon exe-effects.md Q3) within a param-selected radius of the
+        // calling enemy, popping a small particle at each former position
+        // (§2). param 0 also fires the shake+flash pair.
         const thresholds = [128, 192, 256, 999];
         const thr = thresholds[param] ?? 999;
         if (param === 0) {
@@ -1132,7 +1162,7 @@ export class StageRuntime {
           game.startScreenFlash?.(4, 1, 0x80cfcfff);
         }
         for (const b of game.enemyBullets) {
-          if (b.dead || b.sprite !== 2) continue;
+          if (b.dead || b.spriteOffset !== 2) continue;
           if (Math.hypot(e.x - b.x, e.y - b.y) >= thr) continue;
           game.spawnEffectParticles(2, b.x, b.y, 1, 0xffffffff);
           b.dead = true;
@@ -1153,13 +1183,14 @@ export class StageRuntime {
         }
         return;
       }
-      case 6: { // FUN_00417440: delete every bullet of the one shape the
-        // param selects (0->6, 1->15, 2->2), each replaced by a three-ring
-        // burst oriented opposite its travel (§5).
-        const shape = param === 0 ? 6 : param === 1 ? 15 : param === 2 ? 2 : -1;
-        if (shape < 0) return;
+      case 6: { // FUN_00417440: delete every bullet of the one OFFSET the
+        // param selects (0->6, 1->15, 2->2; +0xbf8 spriteOffset, same field
+        // as ids 1/2 — recon exe-effects.md Q4), each replaced by a
+        // three-ring burst oriented opposite its travel (§5).
+        const off = param === 0 ? 6 : param === 1 ? 15 : param === 2 ? 2 : -1;
+        if (off < 0) return;
         for (const b of game.enemyBullets) {
-          if (b.dead || b.sprite !== shape) continue;
+          if (b.dead || b.spriteOffset !== off) continue;
           game.spawnEffectParticles(6, b.x, b.y, 3, 0xffffffff);
           b.dead = true;
         }

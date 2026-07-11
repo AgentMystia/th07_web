@@ -46,6 +46,12 @@ export interface EnemyBullet {
   // maps to the exe's dedicated per-behavior parameter block.
   exAccel: { mag: number; angle: number; limit: number } | null; // 0x10
   exAngle: { speedDelta: number; angleDelta: number; limit: number } | null; // 0x20
+  // Dedicated elapsed counter for the 0x20 angle-change behavior (exe
+  // bullet+0xcec int / +0xce8 frac, reset to 0 when the behavior is
+  // promoted — FUN_004229f0 @ all.c:15499-15510). Bullet-effect id 1
+  // installs 0x20 MID-LIFE, so elapsed cannot be derived from bullet age.
+  exAngleElapsed?: number;
+  exAngleFrac?: number;
   exDir: { angle: number; newSpeed: number; interval: number; maxTimes: number } | null; // 0x40/0x80/0x100
   exBounce: { speed: number; maxTimes: number } | null; // 0x400/0x800
   dirTimes?: number;

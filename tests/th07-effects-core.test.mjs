@@ -5,8 +5,9 @@ import { mkdirSync } from 'node:fs';
 
 const outDir = 'tests/.build/effects-core';
 mkdirSync(outDir, { recursive: true });
-execSync(`npx esbuild src/game/eclvm.ts src/data/th07-data.ts src/formats/anm.ts --bundle --format=esm --outdir=${outDir} --out-extension:.js=.mjs --log-level=silent`);
+execSync(`npx esbuild src/game/eclvm.ts src/game/stage-scene.ts src/data/th07-data.ts src/formats/anm.ts --bundle --format=esm --outdir=${outDir} --out-extension:.js=.mjs --log-level=silent`);
 const { StageRuntime } = await import('../tests/.build/effects-core/game/eclvm.mjs');
+const { StageScene } = await import('../tests/.build/effects-core/game/stage-scene.mjs');
 const { TH07_DATA } = await import('../tests/.build/effects-core/data/th07-data.mjs');
 const { Anm } = await import('../tests/.build/effects-core/formats/anm.mjs');
 
@@ -79,6 +80,9 @@ function makeHost(rngValues = []) {
       u32() {
         observations.rngCalls++;
         return rngValues[rngIndex++] ?? 0;
+      },
+      f() {
+        return this.u32() / 0xffffffff;
       },
       u32InRange: () => 0
     },
@@ -170,6 +174,102 @@ function makeLaser(poolSlot, overrides = {}) {
 function close(actual, expected, message) {
   assert.ok(Math.abs(actual - expected) < 1e-6, `${message}: expected ${expected}, got ${actual}`);
 }
+
+// STG2-002 (陰陽「晴明大紋」): effect 1 filters on the FIRE second i16 —
+// spriteOffset (exe bullet+0xbf8, FUN_00416da0) — sets nominal speed 0.3,
+// wipes the behavior queue and installs a fresh opcode-0x20 slow-turn with
+// its own elapsed counter. One RNG draw per matched bullet in pool-slot
+// order; ±π/(rng01*60+180) per tick (+ for offsets 6/8, − for 2/4);
+// E/N/H: 60 ticks @ +0.01666666753590107, Lunatic: 240 @ +0.005263158120214939.
+test('effect 1 param 1 processes spriteOffset 8 (not sprite 8) and installs the slow-turn', () => {
+  const runtime = makeRuntime();
+  const game = makeHost([0, 0]);
+  game.difficulty = 3;
+  const caller = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
+  const target = makeBullet(2, { sprite: 6, spriteOffset: 8, speed: 1.8, angle: 0.5 });
+  const decoy = makeBullet(1, { sprite: 8, spriteOffset: 6, speed: 2.0 });
+  const wrongOffset = makeBullet(3, { sprite: 6, spriteOffset: 4, speed: 1.8 });
+  game.enemyBullets.push(target, decoy, wrongOffset);
+
+  runtime.runBulletEffect(game, caller, 1, 1);
+  assert.equal(target.effectState, 1, 'sprite=6 offset=8 IS processed by param 1');
+  close(target.speed, 0.3, 'nominal speed declawed');
+  assert.equal(target.exFlags, 0x20, 'slow-turn installed');
+  close(target.exAngle.angleDelta, Math.PI / 180, 'rng=0 -> +π/180 for offset 8');
+  close(target.exAngle.speedDelta, 0.005263158120214939, 'Lunatic speed delta');
+  assert.equal(target.exAngle.limit, 240, 'Lunatic duration');
+  assert.equal(target.exAngleElapsed, 0, 'fresh elapsed counter');
+  assert.equal(decoy.effectState, 0, 'sprite=8 offset=6 is NOT processed (old sprite-filter bug)');
+  close(decoy.speed, 2.0, 'decoy untouched');
+  assert.equal(wrongOffset.effectState, 0, 'offset 4 skipped by param 1');
+  assert.equal(game.observations.rngCalls, 1, 'one RNG draw per matched bullet only');
+
+  // Repeat call: the processed mark blocks re-processing.
+  runtime.runBulletEffect(game, caller, 1, 1);
+  assert.equal(game.observations.rngCalls, 1, 'processed bullets consume no further RNG');
+});
+
+test('effect 1 param 2 targets offset 4 with a negative turn; E/N/H use the 60-tick ramp', () => {
+  const runtime = makeRuntime();
+  const game = makeHost([0]);
+  game.difficulty = 2; // Hard
+  const caller = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
+  const target = makeBullet(0, { sprite: 6, spriteOffset: 4, speed: 1.2 });
+  const other = makeBullet(1, { sprite: 4, spriteOffset: 6, speed: 1.2 });
+  game.enemyBullets.push(target, other);
+  runtime.runBulletEffect(game, caller, 1, 2);
+  assert.equal(target.effectState, 1);
+  close(target.exAngle.angleDelta, -Math.PI / 180, 'rng=0 -> -π/180 for offset 4');
+  close(target.exAngle.speedDelta, 0.01666666753590107, 'Hard speed delta');
+  assert.equal(target.exAngle.limit, 60, 'Hard duration');
+  assert.equal(other.effectState, 0, 'sprite=4 offset=6 not matched by param 2');
+});
+
+test('effect 1 slow-turn: first tick ~0.3+delta, stops exactly at the tick limit (H 1.3 / L ~1.563158)', () => {
+  const scene = Object.create(StageScene.prototype);
+  scene.slowRate = 1;
+  scene.player = { x: 192, y: 384 };
+  for (const [difficulty, delta, limit, endSpeed, firstTick] of [
+    [2, 0.01666666753590107, 60, 1.3, 0.31666668],
+    [3, 0.005263158120214939, 240, 1.5631579488515854, 0.30526317]
+  ]) {
+    const b = makeBullet(0, { speed: 0.3, angle: 0, vx: 0.3, vy: 0 });
+    b.exFlags = 0x20;
+    b.exAngle = { speedDelta: delta, angleDelta: Math.PI / 180, limit };
+    b.exAngleElapsed = 0;
+    b.exAngleFrac = 0;
+    scene.updateBulletMotion(b);
+    assert.ok(Math.abs(Math.hypot(b.vx, b.vy) - firstTick) < 1e-6,
+      `difficulty ${difficulty}: first tick velocity ${Math.hypot(b.vx, b.vy)} ~ ${firstTick}`);
+    for (let i = 1; i < limit; i++) scene.updateBulletMotion(b);
+    assert.ok(Math.abs(b.speed - endSpeed) < 1e-6, `difficulty ${difficulty}: end speed ${b.speed} ~ ${endSpeed}`);
+    assert.equal(b.exFlags & 0x20, 0x20, 'still armed on the last applying tick');
+    scene.updateBulletMotion(b); // tick limit+1: behavior expires, no further delta
+    assert.equal(b.exFlags & 0x20, 0, 'behavior expired');
+    const after = b.speed;
+    scene.updateBulletMotion(b);
+    assert.equal(b.speed, after, 'no speed growth after expiry');
+  }
+});
+
+test('effects 2 and 6 filter on spriteOffset, not sprite', () => {
+  const runtime = makeRuntime();
+  const game = makeHost();
+  const caller = runtime.spawnEclEnemy(game, { subId: 0, x: 100, y: 100 });
+  const near2 = makeBullet(0, { x: 110, y: 100, sprite: 5, spriteOffset: 2 });
+  const nearSprite2 = makeBullet(1, { x: 110, y: 100, sprite: 2, spriteOffset: 5 });
+  game.enemyBullets.push(near2, nearSprite2);
+  runtime.runBulletEffect(game, caller, 2, 0);
+  assert.equal(near2.dead, true, 'offset-2 bullet deleted');
+  assert.equal(nearSprite2.dead, undefined, 'sprite-2/offset-5 bullet kept');
+
+  const off15 = makeBullet(2, { sprite: 3, spriteOffset: 15 });
+  const sprite15 = makeBullet(3, { sprite: 15, spriteOffset: 3 });
+  game.enemyBullets.push(off15, sprite15);
+  runtime.runBulletEffect(game, caller, 6, 1);
+  assert.equal(off15.dead, true, 'offset-15 bullet deleted by param 1');
+  assert.equal(sprite15.dead, undefined, 'sprite-15/offset-3 bullet kept');
+});
 
 test('effect 0 copies tracked motion and permanently suppresses movement after disarm', () => {
   const runtime = makeRuntime();
