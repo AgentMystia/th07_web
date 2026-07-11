@@ -2205,13 +2205,26 @@ export class StageRuntime {
     };
   }
 
-  // Bullet type scripts live in etama.anm entry 0 (on-disk ids 0-24, the
-  // etama.png sheet). Entries 1-3 (etama2-4) reuse overlapping on-disk script
-  // ids (0-37 / 0 / 0) for item/big-bullet animations, so the flat scriptRef
-  // map resolves every bullet id to the wrong sheet (last entry wins) — the
-  // multi-entry id-collision rule of AGENTS.md §6. TH07-TODO: later stages
-  // fire big-bullet types whose scripts live in etama2/3/4; those need a
-  // type→entry mapping here instead of the fixed entry 0.
+  // Th07.exe builds exactly 11 bullet templates at startup (FUN_004256d0,
+  // loop bound 0xb; script table int[11][5] @ 0x48b160) and the FIRE sprite
+  // arg is a raw unclamped index into them (FUN_00423480: 0x625938 +
+  // sprite*0xb8c, no remap). Primary scripts: templates 0-9 -> ANM global
+  // ids 0x200-0x209 = etama.anm ENTRY 0 on-disk scripts 0-9; template 10 ->
+  // global 0x2a8 = ENTRY 1 (etama2.png) on-disk script 0, the 64x64 大玉 —
+  // the exe's entry-1 base 0x2a8 equals 0x200 + entry0's 168-id span,
+  // matching Anm.parse()'s own spriteBase 168 (recon bullet-type-map.md).
+  // The FIRE offset shifts the resolved base sprite in GLOBAL id space
+  // (FUN_00421e90: template[+0x1d4] + offset), so entry-1 offsets must add
+  // the entry's spriteBase. Sprites >= 11 are out-of-table in the exe too
+  // (undefined behavior); stages 1-6 data only ever fires 0-10.
+  private static readonly BULLET_TEMPLATE_ENTRY: { entryIndex: number; script: number }[] = [
+    { entryIndex: 0, script: 0 }, { entryIndex: 0, script: 1 },
+    { entryIndex: 0, script: 2 }, { entryIndex: 0, script: 3 },
+    { entryIndex: 0, script: 4 }, { entryIndex: 0, script: 5 },
+    { entryIndex: 0, script: 6 }, { entryIndex: 0, script: 7 },
+    { entryIndex: 0, script: 8 }, { entryIndex: 0, script: 9 },
+    { entryIndex: 1, script: 0 }
+  ];
   private badBulletWarned = new Set<string>();
 
   bulletRect(sprite: number, offset: number): { x: number; y: number; w: number; h: number; imageKey: string } {
@@ -2219,28 +2232,35 @@ export class StageRuntime {
     const cached = this.bulletRectCache.get(key);
     if (cached) return cached;
     try {
-      const rect = this.bulletRectInEntry0(sprite, offset);
+      const tpl = StageRuntime.BULLET_TEMPLATE_ENTRY[sprite];
+      if (!tpl) throw new Error(`FIRE sprite ${sprite} is outside the exe's 11-template table`);
+      const rect = this.bulletRectInEntry(tpl.entryIndex, tpl.script, offset);
       this.bulletRectCache.set(key, rect);
       return rect;
     } catch (err) {
       // Degrade to the plain pellet instead of throwing: an uncaught throw
       // here escapes StageRuntime.update and halts the rAF loop (frozen
-      // game). Warn once per combo so bad data stays visible in dev.
+      // game). A loud structured error once per combo — retail stage data
+      // must never reach this path (sweep-verified sprites 0-10 only).
       if (!this.badBulletWarned.has(key)) {
         this.badBulletWarned.add(key);
-        console.warn(`bulletRect: fallback for script ${sprite} offset ${offset}: ${err}`);
+        console.error(`bulletRect: UNMAPPED bullet type sprite=${sprite} offset=${offset}: ${err}`);
       }
-      const rect = this.bulletRectInEntry0(0, 0);
+      const rect = this.bulletRectInEntry(0, 0, 0);
       this.bulletRectCache.set(key, rect);
       return rect;
     }
   }
 
-  private bulletRectInEntry0(sprite: number, offset: number): { x: number; y: number; w: number; h: number; imageKey: string } {
-    const ref = this.bulletAnm.scriptRefInEntry(0, sprite);
-    const runner = new AnmRunner(this.bulletAnm, sprite, { spriteIndexOffset: offset, entryIndex: 0 });
+  private bulletRectInEntry(entryIndex: number, script: number, offset: number): { x: number; y: number; w: number; h: number; imageKey: string } {
+    const ref = this.bulletAnm.scriptRefInEntry(entryIndex, script);
+    // The script's own op3 uses entry-LOCAL sprite ids; the flat sprite map
+    // is keyed by global id, so shift by the entry's spriteBase (0 for
+    // entry 0) plus the FIRE offset — the exe's global-space base+offset.
+    const spriteBase = this.bulletAnm.entries[entryIndex]?.spriteBase ?? 0;
+    const runner = new AnmRunner(this.bulletAnm, script, { spriteIndexOffset: spriteBase + offset, entryIndex });
     const frame = runner.spriteFrame();
-    if (!frame) throw new Error(`missing bullet ANM frame for script ${sprite} offset ${offset}`);
+    if (!frame) throw new Error(`missing bullet ANM frame for entry ${entryIndex} script ${script} offset ${offset}`);
     return { x: frame.x, y: frame.y, w: frame.w, h: frame.h, imageKey: frame.imageKey || ref.imageKey || 'etama' };
   }
 
