@@ -2504,8 +2504,12 @@ export class StageRuntime {
 
     const callback = s.deathCallbackSub;
     s.deathCallbackSub = -1;
-    // Mode 0 clears the enemy slot's active bit. Although the exe's common
-    // tail initializes a callback context, the inactive actor cannot run it.
+    // Mode 0 clears the enemy slot's active bit (+0x2e28 bit7, all.c:14313)
+    // BEFORE the common tail enters the callback sub (FUN_0040d6d0 @
+    // all.c:14393) — and the master loop skips inactive slots outright
+    // (`if (-1 < *(char*)(enemy+0x2e28)) goto end` @ all.c:14039), so the
+    // entered callback never executes for mode 0. Adjudicated twice
+    // (2026-07-11): the dispatch IS reached, the sub does NOT run.
     if (mode === 0) return false;
     if (callback >= 0) {
       s.stack.length = 0;
