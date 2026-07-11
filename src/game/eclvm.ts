@@ -393,6 +393,7 @@ export class StageRuntime {
       moveMode: 0,
       interpKind: 0,
       interp: null,
+      heading: 0,
       orbitAngle: 0,
       orbitAngularVelocity: 0,
       orbitSpeed: 0,
@@ -538,7 +539,7 @@ export class StageRuntime {
       // ECL that reads/writes them via vars (Letty 二非 sub41, 终符 sub57) hits a
       // dead slot and the pattern degrades (orbs collapse to the boss, rings
       // fire at a fixed angle instead of swirling with the orbit).
-      case 10045: return Math.atan2(s.frameVy, s.frameVx); // +0x2b54 heading = atan2 of this frame's move delta
+      case 10045: return s.heading; // +0x2b54 live heading (stored; a stationary enemy retains the last value)
       case 10046: return s.angularVelocity;                // +0x2b58 mode-1
       case 10047: return s.speed;                           // +0x2b64 mode-1
       case 10048: return s.acceleration;                    // +0x2b68 mode-1
@@ -603,7 +604,7 @@ export class StageRuntime {
       // movement fields so ECL writes reach the integrator. 10045 is the
       // stored heading (+0x2b54, FUN_0040e560 case 0x273d) — mode-1 motion
       // reads it back as the travel angle.
-      case 10045: s.angle = value; return;
+      case 10045: s.heading = value; s.angle = value; return;
       case 10046: s.angularVelocity = value; return;
       case 10047: s.speed = value; return;
       case 10048: s.acceleration = value; return;
@@ -682,6 +683,14 @@ export class StageRuntime {
     this.applyMovement(e, rate);
     s.frameVx = e.x - prevX;
     s.frameVy = e.y - prevY;
+    // Live heading, exe enemy+0x2b54 (recon exe-heading.md): move modes 2/3
+    // and op27 position interps recompute atan2 of the frame delta every
+    // frame (FUN_0048166a = real atan2); mode 1 carries its integrated polar
+    // angle. A stationary/mode-0 enemy retains the last heading. op120's
+    // draw rotation, var 10045 and heading-based fire bases all read THIS
+    // field — never the mode-1 angle alone (STG1-002 paper orientation).
+    if (s.moveMode === 1) s.heading = s.angle;
+    else if (s.frameVx !== 0 || s.frameVy !== 0) s.heading = Math.atan2(s.frameVy, s.frameVx);
     this.updateAutoShoot(game, e);
     // Boss spell timer is a split counter at the global rate
     // (exe-ecl-boss.md §3 + spec-slowmo.md §3.2).
@@ -888,7 +897,7 @@ export class StageRuntime {
       case 10018: e.x = value; return;
       case 10019: e.y = value; return;
       case 10020: e.z = value; return;
-      case 10045: e.ecl.angle = value; return;
+      case 10045: e.ecl.heading = value; e.ecl.angle = value; return;
       default: this.varWrite(game, e, id, value);
     }
   }

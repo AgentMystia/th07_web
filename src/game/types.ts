@@ -320,6 +320,11 @@ export interface EclState {
   moveMode: number;
   interpKind: number;
   interp: { start: { x: number; y: number; z: number }; delta: { x: number; y: number; z: number }; duration: number; left: number } | null;
+  // Live movement heading, exe enemy+0x2b54 (recon exe-heading.md): modes
+  // 2/3 + op27 position interps recompute atan2 of the frame delta every
+  // frame; mode 1 carries its integrated polar angle; a stationary enemy
+  // retains the last value. Read by var 10045 and the op120 draw rotation.
+  heading: number;
   // mode-3 orbit group (exe +0x2b5c/60/6c/70/8c-94), see
   // reference/re-specs/exe-enemy-move-fields.md §3 Group B / §5.1.
   orbitAngle: number;

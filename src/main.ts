@@ -27,6 +27,8 @@ interface TestHook {
   spawnLog(): { t: number; time: number; sub: number }[];
   lifecycleLog(): { f: number; ev: string; id: number; sub: number; a?: number }[];
   frameCost(): { update: number[]; draw: number[] };
+  // Test-only: flood the item pool for PERF-001's dense-items scenario.
+  fillItems(n: number): void;
   // Releases every previously injected held key (Input.inject is additive).
   clearInput(): void;
   setBombs(n: number): void;
@@ -404,6 +406,10 @@ async function boot(): Promise<void> {
     }
   });
 
+  // ?paused=1 (test-only): do not start the rAF loop — the page renders
+  // nothing until the probe's first advance(). Removes the boot-frame
+  // jitter between probe runs so fixed-frame checkpoints are comparable.
+  const startPaused = isTest && params.get('paused') === '1';
   if (isTest) {
     window.__TH07_TEST__ = {
       ready: true,
@@ -431,6 +437,15 @@ async function boot(): Promise<void> {
       spawnLog: () => stage?.runtime.spawnLog ?? [],
       lifecycleLog: () => stage?.runtime.lifecycleLog ?? [],
       frameCost: () => loop.frameCosts(),
+      fillItems: (n: number) => {
+        if (!stage) return;
+        // Deterministic grid fill through the real spawn path (1100 cap
+        // applies); types cycle so the draw path sees mixed art.
+        const types = ['power', 'point', 'bigPower', 'cherry', 'bigCherry'] as const;
+        for (let i = 0; i < n; i++) {
+          stage.spawnItem(types[i % types.length], 16 + (i * 7) % 352, 16 + (i * 13) % 400);
+        }
+      },
       clearInput: () => input.clearInjected(),
       setBombs: (n: number) => { if (stage) stage.playerObj.bombs = n; },
       damageBoss: (n: number) => {
@@ -457,7 +472,7 @@ async function boot(): Promise<void> {
       bgm: () => ({ active: audio.active, decoded: audio.decodedTracks })
     };
   }
-  loop.start();
+  if (!startPaused) loop.start();
 }
 
 void boot().catch((err) => {

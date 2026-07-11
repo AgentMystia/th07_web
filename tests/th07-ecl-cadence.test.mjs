@@ -141,6 +141,29 @@ test('op91 clears the global flag for every later emitter', () => {
     'post-spell fire is rank-scaled again');
 });
 
+test('mode-3 orbit updates the live heading (exe +0x2b54) that op120/var10045 read', () => {
+  // op56: duration 0, target (200,150), angle -π/2, angvel π/120, speed 0,
+  // accel 0.5 — the Letty テーブルターニング Sub57 parameter shape.
+  const orbit = instruction(0, 56, [
+    i32(0), f32(200), f32(150), f32(0), f32(-Math.PI / 2), f32(Math.PI / 120), f32(0), f32(0.5)
+  ]);
+  const runtime = makeRuntime([[orbit]]);
+  const game = makeHost();
+  const e = runtime.spawnEclEnemy(game, { subId: 0, x: 200, y: 150 });
+  for (let i = 0; i < 10; i++) runtime.updateEnemy(game, e);
+  const s = e.ecl;
+  assert.ok(s.frameVx !== 0 || s.frameVy !== 0, 'orbiter is moving');
+  assert.ok(Math.abs(s.heading - Math.atan2(s.frameVy, s.frameVx)) < 1e-9,
+    'heading tracks the frame movement delta');
+  assert.equal(s.angle, 0, 'the mode-1 polar angle stays untouched by mode 3');
+  // The heading persists when the enemy stops (mode cleared, velocity zero).
+  const lastHeading = s.heading;
+  s.moveMode = 0;
+  s.axisSpeed = { x: 0, y: 0, z: 0 };
+  runtime.updateEnemy(game, e);
+  assert.equal(s.heading, lastHeading, 'stationary enemy retains the last heading');
+});
+
 test('auto-fire is hp-gated: a dead enemy neither fires nor advances its timer', () => {
   // op75 suppresses the immediate FIRE (template only); op73 interval 10.
   const sub = [

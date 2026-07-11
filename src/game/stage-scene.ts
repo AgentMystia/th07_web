@@ -2797,7 +2797,11 @@ export class StageScene implements GameHost {
         const frame = e.ecl.anmRunner?.spriteFrame() ?? null;
         // op150 writes an absolute VM rotation; the op27 angle-follow flag
         // takes precedence when armed (both write the same exe field).
-        const rotation = e.ecl.anmRotateWithAngle ? e.ecl.angle : e.ecl.anmRotZ;
+        // op120 rotate-with-movement: the exe's per-frame ANM sync
+        // (FUN_004208a0) copies the LIVE heading (enemy+0x2b54) into the
+        // sprite rotZ — not the mode-1 polar angle, which mode-3 orbiters
+        // (Letty's テーブルターニング papers) never touch.
+        const rotation = e.ecl.anmRotateWithAngle ? e.ecl.heading : e.ecl.anmRotZ;
         r.drawAnmFrame(frame, ox + e.x, oy + e.y, rotation != null ? { rotation } : {});
       }
       this.drawLasers(r, ox, oy);
