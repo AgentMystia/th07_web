@@ -57,7 +57,7 @@ const DIFFICULTY_NAMES = ['Easy', 'Normal', 'Hard', 'Lunatic'] as const;
 const MAIN_MENU_ITEMS = [
   { name: 'Game Start', enabled: true },
   { name: 'Extra Start', enabled: true },
-  { name: 'Practice Start', enabled: false },
+  { name: 'Practice Start', enabled: true },
   { name: 'Replay', enabled: false },
   { name: 'Score', enabled: false },
   { name: 'Music Room', enabled: false },
@@ -162,7 +162,7 @@ class TitleMenu {
     this.items = MAIN_MENU_ITEMS.map((_, i) => new AnmRunner(anm, i, { entryIndex: ENTRY.mainMenu, spriteIndexOffset: base }));
   }
 
-  update(input: InputFrame, audio: AudioBus): 'confirm' | 'confirm-extra' | null {
+  update(input: InputFrame, audio: AudioBus): 'confirm' | 'confirm-extra' | 'confirm-practice' | null {
     this.logo.update();
     for (const it of this.items) it.update();
     const n = MAIN_MENU_ITEMS.length;
@@ -176,7 +176,7 @@ class TitleMenu {
     if (input.pressed.has('confirm')) {
       if (MAIN_MENU_ITEMS[this.cursor].enabled) {
         audio.sfx('se_ok00', 0.316, 10);
-        return this.cursor === 1 ? 'confirm-extra' : 'confirm';
+        return this.cursor === 1 ? 'confirm-extra' : this.cursor === 2 ? 'confirm-practice' : 'confirm';
       }
       audio.sfx('se_cancel00', 0.316, 11);
     }
@@ -427,7 +427,58 @@ class PlayerSelectMenu {
 
 // -- Top-level orchestrator ---------------------------------------------------
 
-export type MenuSceneKind = 'title' | 'difficulty' | 'select';
+// -- Practice stage select -----------------------------------------------------
+
+// Vanilla practice flow: difficulty → character → shot → STAGE (exe
+// FUN_00451d22, all.c:39732-39833). The original gates the list by cleared
+// stages persisted in score.dat ("CLRD" chunks, default = stage 1 only);
+// this port has no save data, so all six stages are selectable — a flagged
+// modernization serving stage-by-stage testing. Rows are plain text (the
+// original renders them with its ascii font + per-stage practice scores).
+class StageSelectMenu {
+  cursor = 0;
+  private repeat = new KeyRepeater();
+
+  update(input: InputFrame, audio: AudioBus): 'confirm' | 'back' | null {
+    if (this.repeat.poll(input, 'down')) {
+      this.cursor = (this.cursor + 1) % 6;
+      audio.sfx('se_select00', 0.141, 12);
+    } else if (this.repeat.poll(input, 'up')) {
+      this.cursor = (this.cursor + 5) % 6;
+      audio.sfx('se_select00', 0.141, 12);
+    }
+    if (input.pressed.has('confirm')) {
+      audio.sfx('se_ok00', 0.316, 10);
+      return 'confirm';
+    }
+    if (input.pressed.has('back')) {
+      audio.sfx('se_cancel00', 0.316, 11);
+      return 'back';
+    }
+    return null;
+  }
+
+  draw(r: Renderer): void {
+    r.drawImage('select00', 0, 0);
+    r.text('Stage Select', SCREEN_W / 2, 96, { size: 22, color: '#fce', align: 'center' });
+    for (let i = 0; i < 6; i++) {
+      const focused = i === this.cursor;
+      r.text(`Stage ${i + 1}`, SCREEN_W / 2, 160 + i * 36, {
+        size: 18,
+        color: focused ? '#fff6a0' : '#8a7f9a',
+        align: 'center'
+      });
+    }
+    hint(r, 'Up/Down Move    Z Decide    X Back');
+  }
+}
+
+export type MenuSceneKind = 'title' | 'difficulty' | 'select' | 'stage';
+
+export interface MenuStartOptions {
+  practice?: boolean;
+  stage?: number;
+}
 
 export interface MenuSnapshot {
   scene: MenuSceneKind;
@@ -442,7 +493,10 @@ export class MenuFlow {
   private title: TitleMenu;
   private difficulty: DifficultyMenu | null = null;
   private select: PlayerSelectMenu | null = null;
+  private stageSelect: StageSelectMenu | null = null;
   private chosenDifficulty = 1;
+  private practiceMode = false;
+  private chosenStage = 1;
   private transitionOut = 0;
   private pendingCharacter: CharacterId | null = null;
   private frame = 0;
@@ -450,9 +504,13 @@ export class MenuFlow {
   constructor(
     private assets: GameAssets,
     private audio: AudioBus,
-    private onStart: (difficulty: number, character: CharacterId) => void
+    private onStart: (difficulty: number, character: CharacterId, opts?: MenuStartOptions) => void,
+    initialTitleCursor = 0
   ) {
     this.title = new TitleMenu(this.anm);
+    // Th07.exe FUN_00452e91 (all.c:40457-40459): returning from a practice
+    // run parks the title cursor back on Practice Start.
+    this.title.cursor = initialTitleCursor;
   }
 
   private get anm(): Anm {
@@ -464,14 +522,22 @@ export class MenuFlow {
     if (this.transitionOut > 0) {
       this.transitionOut--;
       if (this.transitionOut === 0 && this.pendingCharacter) {
-        this.onStart(this.chosenDifficulty, this.pendingCharacter);
+        this.onStart(
+          this.chosenDifficulty,
+          this.pendingCharacter,
+          this.practiceMode ? { practice: true, stage: this.chosenStage } : undefined
+        );
       }
       return; // freeze the underlying screen while fading to the stage
     }
     switch (this.phase) {
       case 'title': {
         const result = this.title.update(input, this.audio);
-        if (result === 'confirm' || result === 'confirm-extra') {
+        if (result === 'confirm' || result === 'confirm-extra' || result === 'confirm-practice') {
+          // Practice detours through the same difficulty/character flow and
+          // adds a stage-select step after shot select (exe submenu id 8 →
+          // FUN_004515c6 → StageSelect 0xb, all.c:38487-39798).
+          this.practiceMode = result === 'confirm-practice';
           this.phase = 'difficulty';
           this.difficulty = new DifficultyMenu(this.anm, result === 'confirm-extra');
         }
@@ -487,6 +553,7 @@ export class MenuFlow {
           this.phase = 'title';
           this.difficulty = null;
           this.title = new TitleMenu(this.anm);
+          if (this.practiceMode) this.title.cursor = 2;
         }
         break;
       }
@@ -494,13 +561,30 @@ export class MenuFlow {
         const result = this.select!.update(input, this.audio);
         if (result === 'confirm') {
           this.pendingCharacter = this.select!.result();
-          this.transitionOut = STAGE_TRANSITION_FRAMES;
+          if (this.practiceMode) {
+            this.phase = 'stage';
+            this.stageSelect = new StageSelectMenu();
+          } else {
+            this.transitionOut = STAGE_TRANSITION_FRAMES;
+          }
         } else if (result === 'back-to-difficulty') {
           this.phase = 'difficulty';
           this.select = null;
           const wasExtra = this.chosenDifficulty >= 4;
           this.difficulty = new DifficultyMenu(this.anm, wasExtra);
           this.difficulty.cursor = wasExtra ? this.chosenDifficulty - 4 : this.chosenDifficulty;
+        }
+        break;
+      }
+      case 'stage': {
+        const result = this.stageSelect!.update(input, this.audio);
+        if (result === 'confirm') {
+          this.chosenStage = this.stageSelect!.cursor + 1;
+          this.transitionOut = STAGE_TRANSITION_FRAMES;
+        } else if (result === 'back') {
+          this.phase = 'select';
+          this.stageSelect = null;
+          this.select = new PlayerSelectMenu(this.anm);
         }
         break;
       }
@@ -517,6 +601,9 @@ export class MenuFlow {
         break;
       case 'select':
         this.select!.draw(r, this.frame);
+        break;
+      case 'stage':
+        this.stageSelect!.draw(r);
         break;
     }
     if (this.transitionOut > 0) {
@@ -550,9 +637,18 @@ export class MenuFlow {
           step: s.step,
           character: FAMILY_NAMES[s.charCursor],
           shotType: s.shotCursor === 0 ? 'A' : 'B',
+          practice: this.practiceMode,
           transitioning
         };
       }
+      case 'stage':
+        return {
+          scene: 'stage',
+          cursor: this.stageSelect!.cursor,
+          stage: this.stageSelect!.cursor + 1,
+          practice: true,
+          transitioning
+        };
     }
   }
 }

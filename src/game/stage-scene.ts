@@ -234,7 +234,9 @@ export class StageScene implements GameHost {
   // semantics (no freeze, no scene exit); 'arcade' is the real game: PCB's
   // continue screen (3 credits, score reset to the continue count) and a
   // return to the title after game over or the stage-clear tally.
-  mode: 'arcade' | 'test' = 'arcade';
+  // 'practice' = the vanilla Practice Start flavor: one stage, 8 lives, no
+  // continues, straight back to the title on clear or game over.
+  mode: 'arcade' | 'practice' | 'test' = 'arcade';
   onExitToTitle: (() => void) | null = null;
   // Fired (arcade mode, stages 1-5) when the player advances past the
   // stage-clear tally; the host tears this scene down and starts stage+1
@@ -245,6 +247,22 @@ export class StageScene implements GameHost {
   private gameOverTimer = 0;
   // Post-respawn continuous silent field clear (exe player+0x2400, 60f).
   private respawnClearFrames = 0;
+  // ESC pause. Menu rows: 0 再開, 1 タイトルに戻る, 2 最初からやり直す;
+  // the destructive rows detour through the 本当に？ はい/いいえ confirm.
+  // The in-exe trigger logic is not statically recoverable (recon NOT
+  // FOUND); behavior follows the shipped pause.png assets + vanilla
+  // convention — BGM keeps playing (PROBABLE).
+  pauseState: {
+    cursor: number;
+    confirm: boolean;
+    confirmCursor: number;
+    closing: number;
+    action: 'resume' | 'title' | 'retry' | null;
+    runners: AnmRunner[];
+  } | null = null;
+  // Set by main.ts: restart the run from its beginning (story: stage 1;
+  // practice: the practiced stage).
+  onRetryRun?: () => void;
   stageClearTimer = 0;
   private exitFired = false;
   private stageCompleteFired = false;
@@ -1065,8 +1083,21 @@ export class StageScene implements GameHost {
       this.updateContinueScreen(input);
       return;
     }
+    // Vanilla ESC pause: a full freeze with its own menu, drawn over the
+    // dimmed frame. Presentation comes verbatim from the authored
+    // pause.png scripts in ascii.anm entry 2 (title + three rows + the
+    // 本当に？ confirm set, each with show/hide interrupts 1/2).
+    if (this.pauseState) {
+      this.updatePause(input);
+      return;
+    }
+    if (input.pressed.has('pause') && !this.gameOver && !this.stageClear) {
+      this.openPause();
+      return;
+    }
     // Declined / exhausted continues: linger on GAME OVER, then leave.
-    if (this.gameOver && this.mode === 'arcade') {
+    // Practice has no continues and leaves the same way.
+    if (this.gameOver && this.mode !== 'test') {
       if (++this.gameOverTimer > 240) this.exitToTitle();
     }
     if (this.stageClear) {
@@ -1078,11 +1109,14 @@ export class StageScene implements GameHost {
       // Extra / Phantasm end the credit back at the title.
       const advance =
         (this.stageClearTimer > 90 && input.pressed.has('shoot')) || this.stageClearTimer > 900;
-      if (this.mode === 'arcade' && advance && !this.stageCompleteFired) {
+      if (this.mode !== 'test' && advance && !this.stageCompleteFired) {
         this.stageCompleteFired = true;
-        if (this.stageNumber < 6 && this.onStageComplete) {
+        if (this.mode === 'arcade' && this.stageNumber < 6 && this.onStageComplete) {
           this.onStageComplete(this.carryState());
         } else {
+          // Stage 6 / Extra / Phantasm end the credit; practice always
+          // returns to the title after its single stage (exe FUN_00428392
+          // case 0xb, all.c:17980-17982).
           this.exitToTitle();
         }
       }
@@ -1471,6 +1505,113 @@ export class StageScene implements GameHost {
         this.continueScreen = { cursor: 0 };
       }
     }
+  }
+
+  // -- pause menu -------------------------------------------------------------
+
+  private openPause(): void {
+    const ascii = this.assets.anms.ascii;
+    const entryIndex = 2; // data/ascii/pause.png
+    const entry = ascii.entries[entryIndex];
+    if (!entry) return;
+    const runners: AnmRunner[] = [];
+    for (let id = 0; id <= 6; id++) {
+      if (!ascii.hasScriptInEntry(entryIndex, id)) return;
+      runners.push(new AnmRunner(ascii, id, { entryIndex, spriteIndexOffset: entry.spriteBase }));
+    }
+    // Scripts 0-3 = 一時停止 + the three menu rows; 4-6 = the confirm set.
+    for (let i = 0; i <= 3; i++) runners[i].interrupt(1);
+    this.pauseState = { cursor: 0, confirm: false, confirmCursor: 1, closing: 0, action: null, runners };
+    this.playSfx(37); // se_pause
+  }
+
+  private updatePause(input: InputFrame): void {
+    const ps = this.pauseState!;
+    for (const runner of ps.runners) runner.update(1);
+    if (ps.closing > 0) {
+      if (--ps.closing === 0) {
+        const action = ps.action;
+        this.pauseState = null;
+        if (action === 'title') this.exitToTitle();
+        else if (action === 'retry') this.onRetryRun?.();
+      }
+      return;
+    }
+    const select = () => this.audio.sfx('se_select00', 0.141, 12);
+    if (ps.confirm) {
+      if (input.pressed.has('up') || input.pressed.has('down')) {
+        ps.confirmCursor ^= 1;
+        select();
+      }
+      if (input.pressed.has('shoot') || input.pressed.has('confirm')) {
+        if (ps.confirmCursor === 0) {
+          this.audio.sfx('se_ok00', 0.316, 10);
+          this.beginPauseClose(ps.cursor === 1 ? 'title' : 'retry');
+        } else {
+          this.pauseConfirmBack(ps);
+        }
+      } else if (input.pressed.has('back') || input.pressed.has('bomb')) {
+        this.pauseConfirmBack(ps);
+      }
+      return;
+    }
+    if (input.pressed.has('up')) {
+      ps.cursor = (ps.cursor + 2) % 3;
+      select();
+    } else if (input.pressed.has('down')) {
+      ps.cursor = (ps.cursor + 1) % 3;
+      select();
+    }
+    if (input.pressed.has('shoot') || input.pressed.has('confirm')) {
+      if (ps.cursor === 0) {
+        this.audio.sfx('se_ok00', 0.316, 10);
+        this.beginPauseClose('resume');
+      } else {
+        // Both destructive rows confirm through 本当に？ (default いいえ).
+        this.audio.sfx('se_ok00', 0.316, 10);
+        ps.confirm = true;
+        ps.confirmCursor = 1;
+        for (let i = 0; i <= 3; i++) ps.runners[i].interrupt(2);
+        for (let i = 4; i <= 6; i++) ps.runners[i].interrupt(1);
+      }
+    } else if (input.pressed.has('back') || input.pressed.has('bomb') || input.pressed.has('pause')) {
+      this.audio.sfx('se_cancel00', 0.316, 11);
+      this.beginPauseClose('resume');
+    }
+  }
+
+  private pauseConfirmBack(ps: NonNullable<typeof this.pauseState>): void {
+    this.audio.sfx('se_cancel00', 0.316, 11);
+    ps.confirm = false;
+    for (let i = 4; i <= 6; i++) ps.runners[i].interrupt(2);
+    for (let i = 0; i <= 3; i++) ps.runners[i].interrupt(1);
+  }
+
+  private beginPauseClose(action: 'resume' | 'title' | 'retry'): void {
+    const ps = this.pauseState!;
+    ps.action = action;
+    ps.closing = 20; // the authored hide interrupt fades over 20 frames
+    for (const runner of ps.runners) runner.interrupt(2);
+  }
+
+  private drawPause(r: Renderer): void {
+    const ps = this.pauseState!;
+    const ctx = r.ctx;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+    ctx.fillRect(0, 0, 640, 480);
+    ctx.restore();
+    ps.runners.forEach((runner, i) => {
+      const frame = runner.spriteFrame();
+      if (!frame) return;
+      // Cursor highlight: unselected rows draw tinted down (the authored
+      // scripts carry no selected/unselected variants — approximation).
+      const selected = ps.confirm
+        ? (i === 5 && ps.confirmCursor === 0) || (i === 6 && ps.confirmCursor === 1)
+        : i === ps.cursor + 1;
+      const isRow = ps.confirm ? i >= 5 : i >= 1 && i <= 3;
+      r.drawAnmFrame(frame, 0, 0, isRow && !selected ? { color: 0xff707070 } : {});
+    });
   }
 
   // -- arcade flow (continue screen / scene exit) ----------------------------
@@ -2693,6 +2834,7 @@ export class StageScene implements GameHost {
     });
     this.drawFrame(r);
     this.drawSidebar(r);
+    this.drawModeTags(r);
     if (this.stageClear) this.drawStageClearPresentation(r);
     this.drawSpellOverlay(r);
     this.drawDialogue(r);
@@ -2704,6 +2846,7 @@ export class StageScene implements GameHost {
     this.drawStageTransition(r);
     if (this.continueScreen) this.drawContinueScreen(r);
     else if (this.gameOver) r.text('GAME OVER', PLAYFIELD.x + 140, PLAYFIELD.y + 200, { size: 20, color: '#f66' });
+    if (this.pauseState) this.drawPause(r);
   }
 
   private startStageClearPresentation(): void {
@@ -3417,6 +3560,23 @@ export class StageScene implements GameHost {
         this.blit(r, 'ename', [0, row * 16, 128, 16], 32, 26);
       }
     }
+  }
+
+  // Bottom-right difficulty tag (+ the Practice tag above it), straight from
+  // pause.png: the authored ascii.anm entry-2 scripts place the 64x16 tags
+  // corner-anchored at x=344 (difficulty y=444, practice y=428).
+  private drawModeTags(r: Renderer): void {
+    const DIFF_TAG_RECTS = [
+      [128, 0, 64, 16], // Easy
+      [128, 16, 64, 16], // Normal
+      [192, 0, 64, 16], // Hard
+      [192, 16, 64, 16], // Lunatic
+      [192, 192, 64, 16], // Extra
+      [192, 208, 64, 16] // Phantasm
+    ] as const;
+    const rect = DIFF_TAG_RECTS[this.difficulty] ?? DIFF_TAG_RECTS[1];
+    this.blit(r, 'pause', rect, 344, 444, 0.9);
+    if (this.mode === 'practice') this.blit(r, 'pause', [192, 240, 64, 16], 344, 428, 0.9);
   }
 
   private timerThreshold(): number {

@@ -64,6 +64,9 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
       near: Math.round(l.nearDist), far: Math.round(l.farDist), w: Number(l.displayWidth.toFixed(1)), state: l.state
     })),
     stageClear: scene.stageClear,
+    pause: scene.pauseState
+      ? { cursor: scene.pauseState.cursor, confirm: scene.pauseState.confirm, confirmCursor: scene.pauseState.confirmCursor }
+      : null,
     stageClearTimer: scene.stageClearTimer,
     clearPresentation: {
       loadingKey: scene.clearLoadingKey,
@@ -226,19 +229,33 @@ async function boot(): Promise<void> {
     difficulty: number,
     character: CharacterId,
     stageNumber = 1,
-    carry: import('./game/stage-scene').RunCarry | null = null
+    carry: import('./game/stage-scene').RunCarry | null = null,
+    practice = false
   ): StageScene {
     const s = new StageScene(assets, audio, difficulty, character, stageNumber, carry);
     // Headless probes (?test=1 without ?menu=1) keep the scene alive forever;
     // real play gets the arcade flow: continue screen + return to title.
-    s.mode = useMenu || testArcade ? 'arcade' : 'test';
+    // Practice (exe DAT_00625628 bit0): one stage, no continues, straight
+    // back to the title on clear or game over.
+    s.mode = practice ? 'practice' : useMenu || testArcade ? 'arcade' : 'test';
+    // Practice starts with 8 lives (Th07.exe FUN_0042cf2f @ all.c:19718-19720,
+    // CONFIRMED); everything else uses the normal full-reset defaults.
+    if (practice) s.playerObj.lives = 8;
     s.hiScore = Math.max(s.hiScore, sessionHiScore);
     s.onExitToTitle = () => {
       sessionHiScore = Math.max(sessionHiScore, s.hiScore);
       stage = null;
-      menu = new MenuFlow(assets, audio, startFromMenu);
+      // Returning from practice parks the title cursor back on Practice
+      // Start (exe FUN_00452e91 @ all.c:40457-40459).
+      menu = new MenuFlow(assets, audio, startFromMenu, practice ? 2 : 0);
       audio.preloadBgm(['th07_01']);
       audio.playBgm('th07_01');
+    };
+    // Pause-menu 最初からやり直す: restart the run from its beginning —
+    // story from stage 1, practice/test from the current stage.
+    s.onRetryRun = () => {
+      sessionHiScore = Math.max(sessionHiScore, s.hiScore);
+      startStage(difficulty, character, s.mode === 'arcade' ? 1 : stageNumber, null, practice);
     };
     // Stage clear tally advanced -> tear down and enter the next stage with
     // the run state carried over (score/lives/bombs/power/graze/cherry).
@@ -258,9 +275,20 @@ async function boot(): Promise<void> {
   }
 
   // Menu-initiated runs: difficulty 4 = Extra -> stage 7, 5 = Phantasm ->
-  // stage 8; main difficulties start at stage 1.
-  const startFromMenu = (difficulty: number, character: CharacterId) =>
-    startStage(difficulty, character, difficulty >= 4 ? difficulty + 3 : 1);
+  // stage 8; main difficulties start at stage 1. Practice carries its own
+  // chosen stage.
+  const startFromMenu = (
+    difficulty: number,
+    character: CharacterId,
+    opts?: import('./game/title-scene').MenuStartOptions
+  ) =>
+    startStage(
+      difficulty,
+      character,
+      opts?.practice ? opts.stage ?? 1 : difficulty >= 4 ? difficulty + 3 : 1,
+      null,
+      opts?.practice ?? false
+    );
 
   if (useMenu) {
     menu = new MenuFlow(assets, audio, startFromMenu);
