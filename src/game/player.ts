@@ -177,12 +177,24 @@ export class Player {
   bombs = 3;
   power = 0;
   invulnFrames = 0;
-  deathTimer = -1; // counts down the deathbomb window when hit
+  // Persistent deathbomb meter, exe player+0x23f8 (site enumeration in
+  // recon exe-player-hit.md): seeded to SHT.deathbombWindow at spawn and at
+  // the materialize->invuln handoff (0x43e2c7), zeroed while materializing
+  // (0x43e237), decremented once per WALL-CLOCK frame while in the hit
+  // state (0x43dcd9, no slow-rate term), and bumped min(N, meter+6) on
+  // EVERY successful bomb (0x43dc4f-0x43dc7f). It doubles as the universal
+  // bomb gate: the trigger fails outright while it reads 0 (0x43db08).
+  deathbombMeter = 0;
+  // Exe player state 2 while the meter is still nonzero: hit taken, the
+  // deathbomb window is running. A hit never reloads the meter.
+  hitState = false;
   // -1 when idle; 0..DEATH_SQUISH_FRAMES during the post-death squish (exe
-  // state 2, fcn.0043dca0): scaleX=1-t, scaleY=1+3t, in place at the death loc.
+  // state 2 with meter==0, fcn.0043dca0): scaleX=1-t, scaleY=1+3t, in place
+  // at the death loc. Advances on the global split counter (FUN_00436acc).
   dyingFrame = -1;
   // -1 when idle; 0..MATERIALIZE_FRAMES during the respawn materialize (exe
   // state 1, fcn.0043e170): scaleX=t, scaleY=3-2t, alpha=t, t=frame/30.
+  // Advances on the global split counter like the squish.
   materializeFrame = -1;
   bombTimer = 0;
   bombInvuln = 0;
@@ -204,6 +216,8 @@ export class Player {
     this.focused = new Sht(sht[`${spec.shtBase}s`]);
     this.anm = anms[spec.anmKey];
     this.bombs = Math.trunc(this.unfocused.bombs);
+    // Exe Player::Init (0x43f320) seeds the deathbomb meter from the SHT.
+    this.deathbombMeter = Math.trunc(this.unfocused.deathbombWindow);
     this.runner = new AnmRunner(this.anm, 0);
     // Stage start skips materialize (Init preloads its timer past threshold)
     // and enters the 240-frame spawn invulnerability directly
@@ -229,14 +243,14 @@ export class Player {
     // Not hittable/firable during the deathbomb window, the death squish, or
     // the respawn materialize (exe states 2/1); the invuln window (state 3) IS
     // alive.
-    return this.deathTimer < 0 && this.dyingFrame < 0 && this.materializeFrame < 0;
+    return !this.hitState && this.dyingFrame < 0 && this.materializeFrame < 0;
   }
 
   get controllable(): boolean {
     // Input is locked during the deathbomb window, the death squish, and the
     // respawn materialize; the spawn/respawn invuln window itself is
     // controllable.
-    return this.deathTimer < 0 && this.dyingFrame < 0 && this.materializeFrame < 0;
+    return !this.hitState && this.dyingFrame < 0 && this.materializeFrame < 0;
   }
 
   // Render transform for the death squish (exe state 2). null when not dying;
@@ -274,10 +288,16 @@ export class Player {
     }
     if (this.materializeFrame >= 0) {
       // Respawn materialize (fcn.0043e170): ramp scale/alpha IN PLACE over 30
-      // frames, then enter the 240-frame invuln window. No movement/firing.
-      if (++this.materializeFrame >= MATERIALIZE_FRAMES) {
+      // simulation ticks (split counter), then enter the 240-tick invuln
+      // window. No movement/firing. The exe zeroes the deathbomb meter every
+      // state-1 frame (0x43e237) and reseeds it from the SHT at the
+      // state-1 -> state-3 handoff (0x43e2c7).
+      this.deathbombMeter = 0;
+      this.materializeFrame += rate;
+      if (this.materializeFrame >= MATERIALIZE_FRAMES) {
         this.materializeFrame = -1;
         this.invulnFrames = SPAWN_INVULN_FRAMES;
+        this.deathbombMeter = Math.trunc(this.unfocused.deathbombWindow);
       }
     }
     if (this.controllable) this.move(input, rate);
@@ -445,28 +465,34 @@ export class Player {
   }
 
   hit(): 'deathbomb-window' | 'invulnerable' {
-    if (this.invulnFrames > 0 || this.bombInvuln > 0 || this.deathTimer >= 0) return 'invulnerable';
-    this.deathTimer = Math.trunc(this.unfocused.deathbombWindow);
+    if (this.invulnFrames > 0 || this.bombInvuln > 0 || this.hitState) return 'invulnerable';
+    // Exe FUN_0043bd60: entering state 2 does NOT reload the meter — the
+    // window length is whatever the persistent meter currently holds (a
+    // recent late deathbomb leaves a shortened window).
+    this.hitState = true;
     return 'deathbomb-window';
   }
 
-  // Death sequence (exe state 2, fcn.0043dca0). The deathbomb window counts
-  // down first ('pending'); when it lapses, returns 'effects' once and starts
-  // the 30-frame death squish; the squish then counts down ('pending'); when
-  // it finishes, returns 'respawn' once. 'none' when no death is in progress.
-  // Bombing during the deathbomb window (tryBomb) clears deathTimer and
-  // cancels the whole sequence.
-  tickDeath(): 'effects' | 'respawn' | 'pending' | 'none' {
-    if (this.deathTimer >= 0) {
-      this.deathTimer--;
-      if (this.deathTimer < 0) {
+  // Death sequence (exe state 2, fcn.0043dca0). While in the hit state the
+  // deathbomb meter decrements once per WALL-CLOCK call ('pending'); the
+  // frame it reaches 0 the miss commits: returns 'effects' once and starts
+  // the death squish. The squish advances on the split counter (rate);
+  // when it finishes, returns 'respawn' once. 'none' when idle. A
+  // successful bomb (tryBomb) leaves the hit state and cancels the miss.
+  tickDeath(rate = 1): 'effects' | 'respawn' | 'pending' | 'none' {
+    if (this.hitState) {
+      this.deathbombMeter--;
+      if (this.deathbombMeter <= 0) {
+        this.deathbombMeter = 0;
+        this.hitState = false;
         this.dyingFrame = 0; // begin the death squish
         return 'effects';
       }
       return 'pending';
     }
     if (this.dyingFrame >= 0) {
-      if (++this.dyingFrame >= DEATH_SQUISH_FRAMES) {
+      this.dyingFrame += rate;
+      if (this.dyingFrame >= DEATH_SQUISH_FRAMES) {
         this.dyingFrame = -1;
         return 'respawn';
       }
@@ -476,9 +502,17 @@ export class Player {
   }
 
   tryBomb(): boolean {
-    if (this.bombs <= 0 || this.bombTimer > 0) return false;
+    // Exe trigger gates (FUN_0043d9a0 @ 0x43db08-0x43db2e): the deathbomb
+    // meter must be nonzero — this single gate is what closes bombing during
+    // the squish (meter 0), the materialize (zeroed each frame) and past the
+    // end of the deathbomb window.
+    if (this.bombs <= 0 || this.bombTimer > 0 || this.deathbombMeter <= 0) return false;
     this.bombs--;
-    this.deathTimer = -1; // deathbomb rescue
+    this.hitState = false; // deathbomb rescue
+    // Every successful bomb bumps the meter min(N, meter+6) — a no-op at
+    // full meter, the shortened-next-window rule after a late deathbomb
+    // (Th07.exe 0x43dc4f-0x43dc7f).
+    this.deathbombMeter = Math.min(Math.trunc(this.unfocused.deathbombWindow), this.deathbombMeter + 6);
     // Th07.exe per-character bomb params selected by (character, focus-state) at cast.
     const [duration, invulnTotal, speedMult] = BOMB_PARAMS[this.character][this.focusHeld ? 'focused' : 'unfocused'];
     this.bombTimer = duration;
@@ -489,7 +523,10 @@ export class Player {
   }
 
   die(): void {
-    this.deathTimer = -1;
+    this.hitState = false;
+    // Materialize holds the meter at 0 (0x43e237); it reloads at the
+    // state-1 -> state-3 handoff in update().
+    this.deathbombMeter = 0;
     // Exe FUN_0043a290: player state 2 hard-frees all three laser slots.
     for (let i = 0; i < 3; i++) {
       const slot = this.laserSlots[i];

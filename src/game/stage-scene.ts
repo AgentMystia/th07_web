@@ -435,7 +435,7 @@ export class StageScene implements GameHost {
           }
           // State 2 with a live deathbomb meter consumes the pending border
           // through FUN_0043eb00: no miss, no border timer, 40f invulnerability.
-          if (p.deathTimer >= 0) return 'cancel';
+          if (p.hitState) return 'cancel';
           return 'start';
         },
         onBorderStart: () => {
@@ -1147,16 +1147,20 @@ export class StageScene implements GameHost {
     // of the frame; the dialogue box's own advance below may clear
     // `this.dialogue` mid-frame, taking effect next frame.
     const frozen = this.isDialogueBlocking();
-    // Bombing is allowed in normal play AND during the deathbomb window
-    // (p.deathTimer >= 0) -- the few frames after a hit in which a bomb still
-    // rescues you. Blocked during the death squish / materialize (controllable
-    // false, deathTimer < 0) and while a dialogue box is up (no damage in/out).
-    if (!frozen && input.pressed.has('bomb') && (p.controllable || p.deathTimer >= 0) && !this.gameOver) {
+    // The exe reads the bomb button as a raw HELD bit (DAT_004afe30 bit 2 @
+    // 0x43d9c3/0x43db3b — gameplay buttons have no edge detection at all),
+    // so a bomb held across a dialogue unblock or across the cooldown fires
+    // on the first frame the gates open. Bombing during the deathbomb
+    // window (p.hitState) still rescues; the squish/materialize are closed
+    // by the meter gate inside tryBomb().
+    if (!frozen && input.held.has('bomb') && (p.controllable || p.hitState) && !this.gameOver) {
       if (this.cherry.borderEngaged) {
-        // Th07.exe FUN_0043d9a0 @ 0x43d9e8-0x43da17: bombing during a
-        // border (active OR pending) invokes the same free break as a hit.
-        // It spends no bomb, then flags every existing item for collection.
-        if (this.breakBorder(null, true)) {
+        // Th07.exe FUN_0043d9a0 @ 0x43d9ac-0x43d9f2: bombing during a
+        // border (active OR pending) invokes the free break instead of a
+        // bomb, gated only on no-bomb-active (+0x16a20). It spends no bomb,
+        // clears any death state to the 40-frame invuln (FUN_0043eb00:
+        // state -> 3), then flags every existing item for collection.
+        if (p.bombTimer <= 0 && this.breakBorder(null, true, true)) {
           for (const it of this.items) if (!it.dead) it.state = 1;
         }
       } else if (p.tryBomb()) {
@@ -1172,7 +1176,7 @@ export class StageScene implements GameHost {
     p.update(input, this.slowRate);
     this.focusHeld = p.focusHeld;
     if (!frozen) {
-      const death = p.tickDeath();
+      const death = p.tickDeath(this.slowRate);
       if (death === 'effects') this.onPlayerDeath();
       else if (death === 'respawn') this.onPlayerRespawn();
       if (this.respawnClearFrames > 0) {
@@ -1464,8 +1468,9 @@ export class StageScene implements GameHost {
   private onPlayerDeath(): void {
     const p = this.playerObj;
     this.voidSpellCapture();
-    this.playSfx(4);
-    this.spawnEffectParticles(3, p.x, p.y, 32, 0xffffffff);
+    // No SE/effects here: the exe front-loads the death SE and both hit
+    // bursts onto the hit frame itself (FUN_0043bd60, see onPlayerHit); the
+    // meter-zero commit only runs the drop/penalty bookkeeping + squish.
     // Th07.exe FUN_0043dca0 @ all.c:28601-28641: the power penalty applies
     // BEFORE the drops, so death drops can never hit the >=128 spawn-time
     // bigCherry conversion, and the branch picks the drop set:
@@ -2086,7 +2091,7 @@ export class StageScene implements GameHost {
         // consumes the bullet without an item. This applies to ordinary
         // spawn/respawn/bomb invulnerability as well as the 40f Border
         // aftermath, not only to Border state (all.c:27785-27791).
-        if (p.invulnFrames > 0 || p.bombInvuln > 0 || p.deathTimer >= 0) {
+        if (p.invulnFrames > 0 || p.bombInvuln > 0 || p.hitState) {
           b.dead = true;
           continue;
         }
@@ -2149,15 +2154,24 @@ export class StageScene implements GameHost {
     // particular a contact during invuln must NOT break the border.
     // (Breaking it before this check let one absorbed hit's invulnerability
     // frames chain-eat every subsequent border the instant it started.)
-    if (p.invulnFrames > 0 || p.bombInvuln > 0 || p.deathTimer >= 0) return;
+    if (p.invulnFrames > 0 || p.bombInvuln > 0 || p.hitState) return;
     if (this.breakBorder(sourceBullet)) return;
     const result = p.hit();
-    if (result === 'deathbomb-window') this.playSfx(20);
+    if (result === 'deathbomb-window') {
+      // Th07.exe FUN_0043bd60 @ 0x43bd75-0x43bdeb — the hit frame itself
+      // plays the death SE (id 4) and both hit-effect groups: a single
+      // dedicated-slot flash (type 0xc, color 0xff4040ff) and a 16-particle
+      // white scattering burst (type 6). The miss commit later spawns
+      // nothing new.
+      this.playSfx(4);
+      this.spawnEffectParticles(12, p.x, p.y, 1, 0xff4040ff);
+      this.spawnEffectParticles(6, p.x, p.y, 16, 0xffffffff);
+    }
   }
 
-  private breakBorder(sourceBullet: EnemyBullet | null, includePending = false): boolean {
+  private breakBorder(sourceBullet: EnemyBullet | null, includePending = false, rescueDeathbomb = false): boolean {
     if (!this.cherry.breakBorder(includePending)) return false;
-    this.applyBorderBreakEffects(sourceBullet, false);
+    this.applyBorderBreakEffects(sourceBullet, rescueDeathbomb);
     return true;
   }
 
@@ -2169,7 +2183,9 @@ export class StageScene implements GameHost {
     // it through player+0x2404 / DAT_004b5ebc before the spawn at
     // all.c:16160/16169.
     if (sourceBullet) sourceBullet.dead = true;
-    if (rescueDeathbomb) p.deathTimer = -1;
+    // Exe FUN_0043eb00: any prior player state (incl. 2 = deathbomb window)
+    // is overwritten to state 3 (invuln) — the miss is cancelled outright.
+    if (rescueDeathbomb) p.hitState = false;
     this.voidSpellCapture();
     p.invulnFrames = Math.max(p.invulnFrames, 40);
     this.borderClearWave = { x: p.x, y: p.y, radius: 32, ticksLeft: 50, createdFrame: this.frame };
@@ -2854,7 +2870,12 @@ export class StageScene implements GameHost {
           }
         }
       }
-      if (p.alive || p.materializeFrame >= 0 || p.dyingFrame >= 0) {
+      // Th07.exe FUN_0043eff0 @ 0x43f033-0x43f089: the main player sprite
+      // draws in EVERY lifecycle state — including state 2's deathbomb
+      // window (p.hitState) — gated only by the terminal game-over flag.
+      // Options (drawn above) stay keyed to p.alive: the exe excludes
+      // states 1/2 for them (0x43f0a3-0x43f0ca).
+      if (p.alive || p.hitState || p.materializeFrame >= 0 || p.dyingFrame >= 0) {
         const pf = p.runner.spriteFrame();
         const dt = p.dyingTransform();
         const mt = p.materializeTransform();

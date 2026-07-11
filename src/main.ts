@@ -124,7 +124,11 @@ function stageSnapshot(scene: StageScene): Record<string, unknown> {
       power: scene.playerObj.power,
       invuln: scene.playerObj.invulnFrames,
       bombInvuln: scene.playerObj.bombInvuln,
-      deathTimer: scene.playerObj.deathTimer,
+      // Compat view of the old one-shot countdown: remaining window frames
+      // while in the hit state, -1 otherwise.
+      deathTimer: scene.playerObj.hitState ? scene.playerObj.deathbombMeter : -1,
+      deathbombMeter: scene.playerObj.deathbombMeter,
+      hitState: scene.playerObj.hitState,
       dyingFrame: scene.playerObj.dyingFrame,
       materializeFrame: scene.playerObj.materializeFrame,
       alive: scene.playerObj.alive

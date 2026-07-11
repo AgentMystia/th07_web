@@ -53,8 +53,11 @@ async function advance(page, frames, setup = {}) {
     if (setup.lives != null) window.__TH07_TEST__.setLives(setup.lives);
     if (setup.invuln != null) window.__TH07_TEST__.setInvuln(setup.invuln);
     if (setup.clearBullets) window.__TH07_TEST__.clearEnemyBullets();
-    if (setup.pressed) window.__TH07_TEST__.inject([], setup.pressed);
+    // A real keypress raises the held bit on the press frame too — the exe
+    // (and the port's bomb gate) reads gameplay buttons as raw held bits.
+    if (setup.pressed) window.__TH07_TEST__.inject(setup.pressed, setup.pressed);
     window.__TH07_TEST__.advance(frames);
+    if (setup.pressed) window.__TH07_TEST__.clearInput();
   }, { frames, setup });
 }
 
