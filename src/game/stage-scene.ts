@@ -243,6 +243,8 @@ export class StageScene implements GameHost {
   continueScreen: { cursor: number } | null = null;
   continuesUsed = 0;
   private gameOverTimer = 0;
+  // Post-respawn continuous silent field clear (exe player+0x2400, 60f).
+  private respawnClearFrames = 0;
   stageClearTimer = 0;
   private exitFired = false;
   private stageCompleteFired = false;
@@ -705,6 +707,22 @@ export class StageScene implements GameHost {
     r.ctx.restore();
   }
 
+  // Th07.exe FUN_00431da0 (all.c:22298-22323): the instant a pickup completes
+  // the power bar, every OTHER live power/bigPower item converts to bigCherry
+  // with a white sparkle and, if falling, an upward nudge to velocity
+  // (0, -0.5) (threshold _DAT_0048ed74 = -0.5).
+  private convertLivePowerItems(): void {
+    for (const other of this.items) {
+      if (other.dead || (other.type !== 'power' && other.type !== 'bigPower')) continue;
+      other.type = 'bigCherry';
+      if (other.vy > -0.5) {
+        other.vx = 0;
+        other.vy = -0.5;
+      }
+      this.spawnEffectParticles(0, other.x, other.y, 1, 0xffffffff);
+    }
+  }
+
   spawnItem(type: ItemType, x: number, y: number, options: { state?: number; vx?: number; vy?: number } = {}): void {
     // Th07.exe item pool is a fixed 1100-slot array — FUN_00430970 scans for
     // a free slot and silently drops the spawn when none is left (the 0x44c
@@ -764,6 +782,21 @@ export class StageScene implements GameHost {
   }
 
   startDialogue(index: number): void {
+    // Th07.exe timeline op 8 → FUN_0042819f (all.c:17715-17717): activating
+    // a dialogue cancels every bullet+laser into auto-collecting cherry
+    // items (FUN_00422ea0(1)), kills every non-boss enemy
+    // (FUN_004217c0(0,0) — sweep-flagged ones drop their cherry item), and
+    // force-autocollects every live item with a small upward nudge
+    // (FUN_00431d10). This is what clears the pre-boss wave when a boss
+    // arrives — the boss entry subs themselves carry no authored cancel.
+    this.cancelBulletsToItems();
+    this.runtime.killNonBossEnemies(this, null, 0);
+    for (const it of this.items) {
+      if (it.dead) continue;
+      it.state = 1;
+      it.vx = 0;
+      it.vy = -0.5;
+    }
     // msg1.dat entry layout is sparse: character*10 + phase (0 pre-boss,
     // 1 post-boss) — entries 0/1 Reimu, 10/11 Marisa, 20/21 Sakuya. The ECL
     // timeline passes only the phase; the engine adds the character offset.
@@ -1091,6 +1124,14 @@ export class StageScene implements GameHost {
       const death = p.tickDeath();
       if (death === 'effects') this.onPlayerDeath();
       else if (death === 'respawn') this.onPlayerRespawn();
+      if (this.respawnClearFrames > 0) {
+        // Exe FUN_0043e2e0 top (all.c:28692-28695): while player+0x2400
+        // counts down, FUN_00422ea0(0) runs every frame — silent, itemless,
+        // skips bomb-immune lasers.
+        this.respawnClearFrames--;
+        for (const b of this.enemyBullets) b.dead = true;
+        this.cancelLasers(false);
+      }
       if (!this.gameOver) {
         const volley = this.playerObj.fire();
         if (volley.some((b) => b.sfxId >= 0)) this.playSfx(0);
@@ -1371,15 +1412,41 @@ export class StageScene implements GameHost {
   // squish, matching Th07.exe fcn.0043dca0.
   private onPlayerDeath(): void {
     const p = this.playerObj;
-    this.cherry.onDeath(p.sht.cherryLossOnDeath, p.character.startsWith('sakuya'));
     this.voidSpellCapture();
     this.playSfx(4);
     this.spawnEffectParticles(3, p.x, p.y, 32, 0xffffffff);
-    for (let i = 0; i < 5; i++) {
-      this.spawnItem('power', p.x + this.rng.range(64) - 32, p.y - this.rng.range(32));
+    // Th07.exe FUN_0043dca0 @ all.c:28601-28641: the power penalty applies
+    // BEFORE the drops, so death drops can never hit the >=128 spawn-time
+    // bigCherry conversion, and the branch picks the drop set:
+    //  - power < 1: 5x fullPower (a pity refund), cherry penalty skipped;
+    //  - else: power = 0 if < 17, otherwise -16, then 1x bigPower +
+    //    5x power, then the cherry penalty.
+    // (An earlier port spawned 5x power before the -16 landed 30 frames
+    // later in the respawn — at max power those converted to bigCherry,
+    // the tester's inconsistent miss-drop report.)
+    if (p.power < 1) {
+      for (let i = 0; i < 5; i++) this.spawnDeathDrop('fullPower', p.x, p.y);
+    } else {
+      p.power = p.power < 17 ? 0 : p.power - 16;
+      this.spawnDeathDrop('bigPower', p.x, p.y);
+      for (let i = 0; i < 5; i++) this.spawnDeathDrop('power', p.x, p.y);
+      this.cherry.onDeath(p.sht.cherryLossOnDeath, p.character.startsWith('sakuya'));
     }
-    for (const b of this.enemyBullets) b.dead = true;
+    // The exe does NOT clear the field at the miss — the respawn arms a
+    // 60-frame continuous silent cancel instead (see onPlayerRespawn).
     this.playerEffects.clear();
+  }
+
+  // Th07.exe FUN_00430970 spawn mode 2 (all.c:21852-21862): every death drop
+  // launches from the fixed death point toward its own random target at
+  // x = rand*288+48, y = rand*192-64 (playfield coords; constants @
+  // 0x48eccc/0x48eb94/0x48ecc8/0x48eb68). The exe tweens the position; the
+  // port approximates the arc with a 40-frame velocity handed to the normal
+  // gravity integrator (flagged approximation).
+  private spawnDeathDrop(type: ItemType, x: number, y: number): void {
+    const tx = this.rng.f() * 288 + 48;
+    const ty = this.rng.f() * 192 - 64;
+    this.spawnItem(type, x, y, { vx: (tx - x) / 40, vy: (ty - y) / 40 });
   }
 
   // Fires once when the death squish finishes (tickDeath 'respawn'): teleport
@@ -1388,6 +1455,11 @@ export class StageScene implements GameHost {
   private onPlayerRespawn(): void {
     const p = this.playerObj;
     p.die();
+    // Th07.exe FUN_0043e170 (respawn/materialize init, all.c:28657) arms
+    // player+0x2400 = 60; while it counts down, FUN_0043e2e0 runs
+    // FUN_00422ea0(0) every frame — a silent, itemless field clear that
+    // gives the respawned player a bullet-free bubble.
+    this.respawnClearFrames = 60;
     if (p.lives < 0) {
       this.gameOver = true;
       // PCB offers 3 continues per game; past that it's a straight game over.
@@ -2293,10 +2365,15 @@ export class StageScene implements GameHost {
           } else {
             this.spawnScorePopup(10, it.x, it.y, 0xffffffff);
           }
-          // Crossing to full power clears the field: FUN_00422ea0(1)
-          // inside the collect handler (all.c:22031/22139) — plain cancel
-          // to cherry items, no score sweep.
-          if (p.power === 128) this.cancelBulletsToItems();
+          if (p.power === 128) {
+            // Crossing to full power: FUN_00431da0 converts every other
+            // live power/bigPower item to bigCherry (all.c:22034/22142),
+            // then FUN_00422ea0(1) clears the field to cherry items — the
+            // cancel (not the conversion) is gated on no active spell card
+            // (DAT_012f40a8 == 0, all.c:22030/22138).
+            this.convertLivePowerItems();
+            if (!this.spellcard) this.cancelBulletsToItems();
+          }
         } else if (it.type === 'power') {
           this.addScore(12800);
           this.spawnScorePopup(128000, it.x, it.y, 0xffffff00);
@@ -2312,9 +2389,10 @@ export class StageScene implements GameHost {
         if (p.power < 128) {
           this.spawnScorePopup(-1, it.x, it.y, 0xffffc0a0);
           this.playSfx(0x1f);
-          for (const other of this.items) {
-            if (!other.dead && (other.type === 'power' || other.type === 'bigPower')) other.type = 'bigCherry';
-          }
+          this.convertLivePowerItems();
+          // Case 4's crossing cancel (all.c:22172) is NOT spell-gated,
+          // unlike the power/bigPower cases.
+          this.cancelBulletsToItems();
         }
         p.power = 128;
         this.addScore(100);

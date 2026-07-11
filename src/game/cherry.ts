@@ -267,11 +267,14 @@ export class CherrySystem {
   // into CherrySystem at all.
 
   onGraze(focused: boolean): void {
-    // Th07.exe FUN_0043bb30: graze raises BOTH cherryMax (FUN_0042de56) and
-    // cherry (FUN_0042de03) by 30 focused / 80 unfocused, unconditionally —
-    // NOT border-gated, and it never touches cherryPlus (graze does not
-    // progress the border; only shot-hits / cherry items via
-    // FUN_0042dc6f do).
+    // Th07.exe FUN_0043bb30 tail (all.c:27972-27981): the +30 focused /
+    // +80 unfocused cherryMax+cherry award sits INSIDE
+    // `if (player+0x240d == 1)` — it only flows while a border is ACTIVE.
+    // Grazing outside a border earns no cherry at all (the graze counter,
+    // +200 score, and spell-bonus increments before that gate are
+    // unconditional), and it never touches cherryPlus either way. The port
+    // used to award it on every graze, inflating cherry/cherryMax ~10x.
+    if (!this.borderActive) return;
     const amt = focused ? 30 : 80;
     this.cherryMax += amt;
     this.cherry = Math.min(this.cherryMax, this.cherry + amt);

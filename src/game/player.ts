@@ -498,7 +498,8 @@ export class Player {
     }
     this.lives--;
     this.bombs = Math.trunc(this.unfocused.bombs);
-    this.power = Math.max(0, this.power - 16);
+    // Power loss happens at the MISS itself, before the drops spawn
+    // (StageScene#onPlayerDeath, exe FUN_0043dca0) — not here.
     // Respawn (fcn.0043dca0 at the death-clock lapse): teleport to the spawn
     // point and enter the materialize state (fcn.0043e170) -- a 30-frame
     // in-place scale/alpha ramp, NOT a fly-in -- followed by 240f invuln
