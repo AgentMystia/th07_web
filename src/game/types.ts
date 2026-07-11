@@ -391,7 +391,6 @@ export interface EclState {
   spellTimeoutFlag: boolean;
   // Th07.exe DAT_012f40a8: set while a boss spell card is active. Gates the
   // rank/count/speed bullet scaling off (spell bullets use raw ECL values).
-  spellCardActive: boolean;
   bulletRankSpeedLow: number;
   bulletRankSpeedHigh: number;
   bulletRankAmount1Low: number;

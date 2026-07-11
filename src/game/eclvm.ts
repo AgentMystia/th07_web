@@ -199,6 +199,12 @@ export class StageRuntime {
   bossSlots: (Enemy | null)[] = [];
   // Th07.exe DAT_00495bf4: true while any boss entity is registered.
   private bossRegistered = false;
+  // Th07.exe DAT_012f40a8: GLOBAL spell-card-active state (op90 sets 1,
+  // op91 clears). Every enemy's FIRE — boss AND op92/93 helpers — skips the
+  // non-spell rank count/speed scaling while it is set. This was previously
+  // a per-enemy flag, so helpers spawned during a spell fired rank-scaled
+  // bullets (e.g. Letty final-spell 1.8 -> 1.3 at rank 0; CADENCE-001).
+  spellActive = false;
   // ECL run-globals, vars 10037-10044 (Th07.exe DAT_0133da80..9c): four int
   // and four float slots shared by every enemy — boss controllers write
   // pattern parameters here and child emitters read them back.
@@ -226,6 +232,7 @@ export class StageRuntime {
     this.bulletPoolCursor = 0;
     this.bossSlots = [];
     this.bossRegistered = false;
+    this.spellActive = false;
     this.lifecycleLog = [];
     this.globalsInt.fill(0);
     this.globalsFloat.fill(0);
@@ -438,7 +445,6 @@ export class StageRuntime {
       disableCallStack: false,
       invisible: false,
       spellTimeoutFlag: false,
-      spellCardActive: false,
       bulletRankSpeedLow: -0.5,
       bulletRankSpeedHigh: 0.5,
       bulletRankAmount1Low: 0,
@@ -1261,8 +1267,10 @@ export class StageRuntime {
     // Exe auto-shoot tick (all.c:7194-7208) fires purely on interval>0 &&
     // hp>0 — it does NOT consult the op75/76 bit (that bit only suppresses
     // the immediate fire inside FIRE ops 64-72). Checking shootDisabled here
-    // silenced every op75-then-op73 pattern.
-    if (!s.shootInterval || !s.bulletProps) return;
+    // silenced every op75-then-op73 pattern. The hp>0 gate freezes the timer
+    // AND the fire while dead/dying — no death-frame extra volley
+    // (CADENCE-001).
+    if (!s.shootInterval || !s.bulletProps || e.hp <= 0) return;
     s.shootTimer += game.slowRate ?? 1;
     if (s.shootTimer >= s.shootInterval) {
       s.shootTimer = 0;
@@ -1771,7 +1779,7 @@ export class StageRuntime {
         const decoded = new Uint8Array(end - start);
         for (let i = 0; i < decoded.length; i++) decoded[i] = bytes[start + i] ^ 0xaa;
         s.spellName = new TextDecoder('shift_jis').decode(decoded);
-        s.spellCardActive = true; // Th07.exe DAT_012f40a8 = 1 (all.c:6520)
+        this.spellActive = true; // Th07.exe DAT_012f40a8 = 1 (all.c:6520) — GLOBAL
         game.startBossSpell?.(spellId, v.i16(a), s.spellName);
         // The declare handler cancels the field's bullets into cherry items
         // with NO score sweep (all.c:6511 = FUN_00422ea0(1)); the scored
@@ -1781,7 +1789,7 @@ export class StageRuntime {
       }
       case 91: {
         s.spellName = '';
-        s.spellCardActive = false; // Th07.exe DAT_012f40a8 = 0 (all.c:6692)
+        this.spellActive = false; // Th07.exe DAT_012f40a8 = 0 (all.c:6692) — GLOBAL
         // Exe FUN_0040f340: only a spell that is still "live" (DAT_012f40a8
         // == 1 — i.e. it did not time out; a timeout bumps it to 2 and fades
         // the bullets itemlessly at all.c:13831) gets the phase-end sweep:
@@ -2150,10 +2158,10 @@ export class StageRuntime {
     const speed2 = this.getFloat(game, e, a + 16);
     // Th07.exe FUN_0040f6c0 fire body (all.c:8503): the whole rank/count/speed
     // scaling + min-1-count + 0.3-speed floors are gated behind
-    // `if (DAT_012f40a8 == 0)` — i.e. SKIPPED while a boss spell card is active.
-    // During a spell the raw ECL count/speed args are used verbatim
-    // (audit-fire-aimmode.md D1).
-    if (s.spellCardActive) {
+    // `if (DAT_012f40a8 == 0)` — the GLOBAL spell-active state, so during a
+    // spell EVERY emitter (boss and helpers alike) uses the raw ECL
+    // count/speed args verbatim (audit-fire-aimmode.md D1; CADENCE-001).
+    if (this.spellActive) {
       return {
         sprite: this.getShort(game, e, a),
         offset: this.getShort(game, e, a + 2),
@@ -2440,7 +2448,7 @@ export class StageRuntime {
       // it and only plays the death presentation before its callback.
       for (const drop of this.dropTypes(s.itemDrop)) game.spawnItem(drop, e.x, e.y);
       if (s.isBoss) {
-        if (!s.spellCardActive) {
+        if (!this.spellActive) {
           let total = game.sweepBulletsToItems();
           total = this.killNonBossEnemies(game, e, total);
           if (total > 0) game.addScore(Math.trunc(total / 10));
