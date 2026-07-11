@@ -3566,11 +3566,13 @@ export class StageScene implements GameHost {
   // pause.png: the authored ascii.anm entry-2 scripts place the 64x16 tags
   // corner-anchored at x=344 (difficulty y=444, practice y=428).
   private drawModeTags(r: Renderer): void {
+    // Column layout pixel-verified against pause.png: Hard/Lunatic stack at
+    // x=128, Easy/Normal at x=192 (the reverse of reading order).
     const DIFF_TAG_RECTS = [
-      [128, 0, 64, 16], // Easy
-      [128, 16, 64, 16], // Normal
-      [192, 0, 64, 16], // Hard
-      [192, 16, 64, 16], // Lunatic
+      [192, 0, 64, 16], // Easy
+      [192, 16, 64, 16], // Normal
+      [128, 0, 64, 16], // Hard
+      [128, 16, 64, 16], // Lunatic
       [192, 192, 64, 16], // Extra
       [192, 208, 64, 16] // Phantasm
     ] as const;

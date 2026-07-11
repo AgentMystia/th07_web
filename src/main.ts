@@ -239,8 +239,14 @@ async function boot(): Promise<void> {
     // back to the title on clear or game over.
     s.mode = practice ? 'practice' : useMenu || testArcade ? 'arcade' : 'test';
     // Practice starts with 8 lives (Th07.exe FUN_0042cf2f @ all.c:19718-19720,
-    // CONFIRMED); everything else uses the normal full-reset defaults.
-    if (practice) s.playerObj.lives = 8;
+    // CONFIRMED), and any stage other than 1 starts at FULL power — the
+    // stage-entry tail sets power to _DAT_0048eb84 = 128.0 when the run's
+    // practice flag (stats+0x93d8 bit 0) is set and the stage isn't 1
+    // (all.c:19856-19859). Stage-1 practice keeps the normal power-0 start.
+    if (practice) {
+      s.playerObj.lives = 8;
+      if (stageNumber !== 1) s.playerObj.power = 128;
+    }
     s.hiScore = Math.max(s.hiScore, sessionHiScore);
     s.onExitToTitle = () => {
       sessionHiScore = Math.max(sessionHiScore, s.hiScore);
