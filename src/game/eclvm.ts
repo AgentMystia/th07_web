@@ -515,7 +515,14 @@ export class StageRuntime {
       case 10021: return game.player.x;
       case 10022: return game.player.y;
       case 10023: return 0; // player z
-      case 10024: return Math.atan2(e.y - game.player.y, e.x - game.player.x);
+      // Angle from the enemy TOWARD the player — the exe routes var 10024
+      // through the same shared FUN_0043f2b0 the FIRE aim uses (recon
+      // vm-stage4-opener.md; exe-items.md independently decoded that
+      // function as atan2(player - pos)). Was reversed (enemy - player):
+      // every snapshot-then-absolute-fan idiom fired 180° away from the
+      // player (stage-4 opener subs 9/10/13/14 and dozens of sites across
+      // stages 1-8; VM-001).
+      case 10024: return Math.atan2(game.player.y - e.y, game.player.x - e.x);
       // Th07.exe FUN_0040d750/FUN_0040df90: 10025 = bossTimer (+0x2bcc),
       // 10026 = player-enemy 3D distance (FUN_00403d50). Previously swapped.
       case 10025: return s.bossTimer;

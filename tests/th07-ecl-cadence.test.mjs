@@ -218,6 +218,24 @@ test('Sub58 (晴明大紋): both volleys fire on the wall schedule shifted by th
   assert.ok(v2Done > 0, `volley 2 completes (${v2Done})`);
 });
 
+test('var 10024 is the aim TOWARD the player (snapshot-then-absolute-fan idiom, VM-001)', () => {
+  // The stage-4 opener idiom: op5 snapshots var 10024 into a local, then
+  // fires an absolute-mode fan with angle1 = that local. The exe resolves
+  // 10024 through the shared FUN_0043f2b0 (angle from position toward the
+  // player) — the reversed sign fired the whole fan 180° away.
+  const snapshotAim = instruction(0, 5, [f32(10004), f32(10024)]);
+  const fireAbs = instruction(0, 65, [
+    i32(6 | (6 << 16)), i32(1), i32(1), f32(1.0), f32(1.0), f32(10004), f32(0), i32(0)
+  ]);
+  const runtime = makeRuntime([[snapshotAim, fireAbs]]);
+  const game = makeHost();
+  runtime.spawnEclEnemy(game, { subId: 0, x: 100, y: 100 });
+  assert.equal(game.enemyBullets.length, 1);
+  const expected = Math.atan2(384 - 100, 192 - 100); // toward the player at (192,384)
+  assert.ok(Math.abs(game.enemyBullets[0].angle - expected) < 1e-9,
+    `fan center aims at the player (${game.enemyBullets[0].angle} vs ${expected})`);
+});
+
 test('op93 resolves variable life/item/score (stage-5 wrapper->child relay, COMBAT-001)', () => {
   // The stage-5 pattern: an invisible wrapper carries the timeline's real
   // HP/item/score in its own hp/itemDrop/score fields and passes them to
