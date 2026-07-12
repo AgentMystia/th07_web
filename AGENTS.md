@@ -448,7 +448,19 @@ comparisons against real play).
     a sparse enemy array (holes for freed slots; iterate slots ascending so a
     same-frame respawn into an already-passed low slot defers to next frame, as
     the exe does) — a real refactor touching every `this.enemies` iterator, a
-    dedicated effort. THEN the exact draw models land on a stable order.
+    dedicated effort. UPDATE: implemented it — only +1 (131→132), negligible.
+  - ★ THE PRODUCTIVE LEVER = PRINCIPLED DETERMINISTIC ORDERING FIXES (not RNG-draw
+    tweaks). Two landed this session: 0be941c (same-frame death) and 3a1d0bf
+    (freshly-fired bullets skip their spawn-frame move — exe fires AFTER
+    integrating existing bullets, both before the enemy-mgr collision, so a new
+    bullet is at spawn pos when first collided). The latter moved st1 first
+    kill-divergence 622→718 and first-death 1786→1946. To find more: the exe
+    sequences per-frame subsystems via priority-ordered manager lists
+    (FUN_0042e290 registers, FUN_0042e800 runs `&DAT_012f41f0`; enemy mgr
+    FUN_0041ed50 = priority 10) — trace that full order and match ours
+    (updatePlayerBullets→updateEnemies→updateBullets→updateLasers→
+    checkPlayerCollision→updateItems). Player MOVEMENT order is NOT an issue
+    (recorded input applies once to the same end position).
   - CAUTION: the ghost full-stage budget (163,385) is CONFOUNDED — a post-boss
     dialogue freezes our sim ~3400f, starving snow the exe also freezes. Judge
     pre-1800 by the non-ghost first-death frame, not the aggregate. Decompose
