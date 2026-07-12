@@ -2394,6 +2394,17 @@ export class StageRuntime {
     enemy.hp = 0;
     const s = enemy.ecl;
     if (sweepItems && s.sweepItemFlag) game.spawnItem('cherry', enemy.x, enemy.y, { state: 1 });
+    // The exe's FUN_004217c0 only sets HP=0 (all.c:14883); the actual removal
+    // is each enemy's OWN death switch, gated on the interactable bit
+    // (all.c:14303, 0x2e29 & 1). So a NON-interactable enemy — an invisible
+    // controller/ambient emitter like stage-1's Sub1 id-20 snow generator
+    // (op116(0)+op132+op137) — survives the sweep and keeps running its
+    // script. Removing it here (enemy.dead / death callback) killed the ambient
+    // particle stream the moment Letty's first spell swept the field (~frame
+    // 3857), starving the shared RNG stream of ~6600 frames of draws. Spare it
+    // exactly as the exe does; the normal hp<=0 path (killEnemy's interactable
+    // guard) leaves it live.
+    if (!s.interactable) return;
     if (s.deathCallbackSub >= 0) {
       const sub = s.deathCallbackSub;
       s.deathCallbackSub = -1;
