@@ -218,6 +218,34 @@ test('Sub58 (晴明大紋): both volleys fire on the wall schedule shifted by th
   assert.ok(v2Done > 0, `volley 2 completes (${v2Done})`);
 });
 
+test('op144 periodic subs disarm on phase transitions and death callbacks (the 米弹 leak, LIFE-001)', () => {
+  // Phase 1 (sub 0): arm a period-2 emitter targeting sub 1, register an
+  // HP-threshold transition to sub 2. The exe writes +0x2ee4 = -1 on every
+  // phase entry (all.c:13754) and in the death dispatch (all.c:14309);
+  // leaving it armed leaked Yuyuko's 幽曲 rice into 桜符 for ~1020 frames.
+  const phase1 = [
+    instruction(0, 144, [i32(2), i32(1)]),
+    instruction(0, 112, [i32(50)]),
+    instruction(0, 113, [i32(2)])
+  ];
+  const periodicFire = [fire(), instruction(0, 42, [])];
+  const phase2 = [];
+  const runtime = makeRuntime([phase1, periodicFire, phase2]);
+  const game = makeHost();
+  const e = runtime.spawnEclEnemy(game, { subId: 0, x: 100, y: 100, life: 100 });
+  for (let k = 0; k < 6; k++) runtime.updateEnemy(game, e);
+  const beforeTransition = game.enemyBullets.length;
+  assert.ok(beforeTransition > 0, 'periodic emitter fires during its own phase');
+  // Cross the HP threshold: the transition must disarm the periodic.
+  e.hp = 40;
+  runtime.updateEnemy(game, e);
+  assert.equal(e.ecl.ctx.subId, 2, 'entered the threshold sub');
+  assert.equal(e.ecl.periodicSub, null, 'periodic slot disarmed on phase entry');
+  const atTransition = game.enemyBullets.length;
+  for (let k = 0; k < 30; k++) runtime.updateEnemy(game, e);
+  assert.equal(game.enemyBullets.length, atTransition, 'no foreign bullets leak into the new phase');
+});
+
 test('var 10024 is the aim TOWARD the player (snapshot-then-absolute-fan idiom, VM-001)', () => {
   // The stage-4 opener idiom: op5 snapshots var 10024 into a local, then
   // fires an absolute-mode fan with angle1 = that local. The exe resolves

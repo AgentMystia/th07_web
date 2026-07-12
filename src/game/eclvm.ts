@@ -826,6 +826,12 @@ export class StageRuntime {
     s.bulletRankAmount2High = 0;
     s.stack.length = 0;
     s.periodicExportArmed = false;
+    // The exe disarms the op144 periodic sub (+0x2ee4 = -1) on EVERY phase
+    // entry — HP-threshold dispatch all.c:13754, timeout sweep all.c:13845.
+    // Leaving it armed leaked the previous phase's emitter across spell
+    // boundaries (Yuyuko 幽曲 sub38's period-8 rice into 桜符 sub58 for its
+    // first ~1020 frames — the 米弹 leak, LIFE-001/STG6-001).
+    s.periodicSub = null;
     if (s.isBoss) this.clearNonBossEnemies(game, e);
     this.enterSub(s, sub);
   }
@@ -2467,6 +2473,9 @@ export class StageRuntime {
     for (const threshold of s.lifeThresholds) threshold.threshold = -1;
     s.timerCallbackThreshold = -1;
     s.timerCallbackSub = -1;
+    // Death dispatch preamble clears the op144 periodic slot too
+    // (all.c:14309; the callback-entry tail repeats it at 14384).
+    s.periodicSub = null;
 
     const mode = s.deathMode & 7;
     // all.c:14318-14323 clears presence for boss modes 0/1; case 3 clears it
