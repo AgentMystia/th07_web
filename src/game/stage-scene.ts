@@ -2897,6 +2897,23 @@ export class StageScene implements GameHost {
       r.ctx.save();
       for (const b of this.enemyBullets) {
         if (b.dead) continue;
+        // 大玉 (template 10) spawn bloom: the exe's flags-selected intro
+        // script (etama2 entry-1 script 2, 24 frames — recon
+        // gokushinken-bullets.md) draws the same offset-shifted sprite at
+        // scale 2.0 shrinking to 1.0, additive, alpha fading 0->255 over
+        // 32f (clipped by the 24f script end). Draw-time only; movement/
+        // collision keep the byte-confirmed spawnDuration model.
+        if (b.sprite === 10 && (b.flags & 0xe) !== 0 && b.age < 24) {
+          r.drawSpriteInBatch(
+            b.rect.imageKey, b.rect.x, b.rect.y, b.rect.w, b.rect.h,
+            ox + b.x, oy + b.y,
+            b.angle + Math.PI / 2,
+            2 - b.age / 24,
+            Math.min(1, b.age / 32),
+            'lighter'
+          );
+          continue;
+        }
         const spawning = b.age < b.spawnDuration;
         r.drawSpriteInBatch(
           b.rect.imageKey,
@@ -3506,6 +3523,20 @@ export class StageScene implements GameHost {
   // 0->255 over 60 frames, then a per-frame loop shifting u +0.004167 and
   // v -0.008333. Not run through AnmRunner: the script's op-4 frame-reset
   // loop would pin the frame-keyed fade interpolation near zero.
+  // Spell-card playfield background: entry 0 of the stage's own eff0N.anm,
+  // faded in over 60 frames (op15) and then presented per that script's own
+  // authored model (decoded per stage, recon spellbg-diagnosis.md):
+  //   stages 1/2 + 6-layer0: 384x448 oversized sprite over a 256x256 texture
+  //     = GPU tile-wrap with per-frame op26/27 UV scroll (stage 1 scrolls
+  //     diagonally u+0.004167/v-0.008333; stages 2/6 scroll v+0.008333 ONLY);
+  //   stage 3: 256x256 stretched by op7 scale(1.5,1.75) with a v-wrapping
+  //     pan inside the single stretched quad;
+  //   stages 5/7/8: 256x256 stretched static — NO tiling, NO scroll (the old
+  //     one-size eff01 pattern produced the seamy 2x3 grid the testers saw);
+  //   stage 6 additionally layers entry 1 (eff06) as a static stretched
+  //     overlay alpha-capped at 224/255;
+  //   stage 4's eff04 entries are not corner-anchored backgrounds at all
+  //     (flagged open) — kept on the legacy tiled path.
   private drawSpellBackground(r: Renderer): void {
     const sc = this.spellcard;
     if (!sc) return;
@@ -3513,16 +3544,46 @@ export class StageScene implements GameHost {
     // (eff07.anm's textures are eff07b/eff07c — there is no eff07.png).
     const img = r.image(this.effectAnm.entries[0]?.imageKey ?? 'eff01');
     if (!img) return;
-    if (!this.eff01Pattern) this.eff01Pattern = r.ctx.createPattern(img, 'repeat');
-    if (!this.eff01Pattern) return;
     const ctx = r.ctx;
-    const u = 0.004167 * 256 * sc.declAge;
-    const v = -0.008333 * 256 * sc.declAge;
+    const fade = Math.min(1, sc.declAge / 60);
+    const staticStretch = this.stageNumber === 5 || this.stageNumber === 7 || this.stageNumber === 8;
     ctx.save();
-    ctx.globalAlpha = Math.min(1, sc.declAge / 60);
-    ctx.translate(PLAYFIELD.x - u, PLAYFIELD.y - v);
-    ctx.fillStyle = this.eff01Pattern;
-    ctx.fillRect(u, v, PLAYFIELD.width, PLAYFIELD.height);
+    ctx.globalAlpha = fade;
+    if (staticStretch) {
+      ctx.drawImage(img, 0, 0, img.width, img.height, PLAYFIELD.x, PLAYFIELD.y, PLAYFIELD.width, PLAYFIELD.height);
+    } else if (this.stageNumber === 3) {
+      // Stretched quad with a v-wrapping pan: draw two stacked stretched
+      // copies offset by the wrapped scroll so the seamless cycle of the
+      // original's UV window survives without tiling artifacts.
+      const dv = ((0.004167 * 256 * sc.declAge) % 256) * (PLAYFIELD.height / 256);
+      ctx.beginPath();
+      ctx.rect(PLAYFIELD.x, PLAYFIELD.y, PLAYFIELD.width, PLAYFIELD.height);
+      ctx.clip();
+      ctx.drawImage(img, 0, 0, img.width, img.height, PLAYFIELD.x, PLAYFIELD.y + dv - PLAYFIELD.height, PLAYFIELD.width, PLAYFIELD.height);
+      ctx.drawImage(img, 0, 0, img.width, img.height, PLAYFIELD.x, PLAYFIELD.y + dv, PLAYFIELD.width, PLAYFIELD.height);
+    } else {
+      if (!this.eff01Pattern) this.eff01Pattern = ctx.createPattern(img, 'repeat');
+      if (this.eff01Pattern) {
+        // Stage 1 scrolls diagonally; stages 2/6 (and legacy stage 4)
+        // scroll vertically only.
+        const u = this.stageNumber === 1 ? 0.004167 * 256 * sc.declAge : 0;
+        const v = this.stageNumber === 1 ? -0.008333 * 256 * sc.declAge : 0.008333 * 256 * sc.declAge;
+        ctx.save();
+        ctx.translate(PLAYFIELD.x - u, PLAYFIELD.y - v);
+        ctx.fillStyle = this.eff01Pattern;
+        ctx.fillRect(u, v, PLAYFIELD.width, PLAYFIELD.height);
+        ctx.restore();
+      }
+    }
+    // Stage 6's second authored layer: entry 1 (eff06.png) statically
+    // stretched over the field at 224/255 alpha.
+    if (this.stageNumber === 6) {
+      const overlay = r.image(this.effectAnm.entries[1]?.imageKey ?? '');
+      if (overlay) {
+        ctx.globalAlpha = fade * (224 / 255);
+        ctx.drawImage(overlay, 0, 0, overlay.width, overlay.height, PLAYFIELD.x, PLAYFIELD.y, PLAYFIELD.width, PLAYFIELD.height);
+      }
+    }
     ctx.restore();
   }
 
