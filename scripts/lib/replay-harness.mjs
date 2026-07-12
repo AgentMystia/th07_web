@@ -131,6 +131,12 @@ export async function runStage(rpy, stageIndex, opts = {}) {
   const source = new mod.ReplayInputSource();
   const deaths = [];
   const bombs = [];
+  // Our sim's per-frame event streams, mirroring the replay aux-word oracle
+  // (RPY_AUX_BITS): kill frames (hp<=0 removals) and item-collect frames.
+  const killFrames = [];
+  const collectFrames = [];
+  let prevEnemies = new Map();
+  let prevItems = new Map();
   let prevLives = scene.playerObj.lives;
   let prevBombs = scene.playerObj.bombs;
   const graceFrames = opts.graceFrames ?? 900;
@@ -151,6 +157,19 @@ export async function runStage(rpy, stageIndex, opts = {}) {
     if (scene.playerObj.bombs < prevBombs) bombs.push({ frame: f, stageFrame: scene.stageFrame });
     prevLives = scene.playerObj.lives;
     prevBombs = scene.playerObj.bombs;
+    {
+      const cur = new Map();
+      for (const e of scene.enemies) cur.set(e.id, e);
+      for (const [id, e] of prevEnemies) if (!cur.has(id) && e.hp <= 0) killFrames.push(f);
+      prevEnemies = cur;
+      const items = new Map();
+      for (const it of scene.items) items.set(it.id, it);
+      for (const [id, it] of prevItems) {
+        // Collected = removed before reaching the bottom cull.
+        if (!items.has(id) && it.y <= 448) collectFrames.push(f);
+      }
+      prevItems = items;
+    }
     opts.onFrame?.(f, scene);
     if (completed || exited) {
       f++;
@@ -170,6 +189,8 @@ export async function runStage(rpy, stageIndex, opts = {}) {
     deaths,
     bombs,
     hits: scene.hitLog,
+    killFrames,
+    collectFrames,
     wallMs: performance.now() - start,
     scene
   };

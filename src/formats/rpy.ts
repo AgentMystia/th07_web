@@ -32,6 +32,36 @@ export const RPY_BITS = {
   skip: 0x0100
 };
 
+// Bits of the per-frame AUX word (the second u16 of each frame record,
+// ctx+0x9e). The exe ORs event bits into it as the frame plays out — the
+// recording preserves a per-frame EVENT STREAM of the original run, which
+// makes it a frame-exact verification oracle. Writers in Th07.exe (all.c
+// lines): 0x2 @27780/27914 (player hit registered), 0x4 @28596 (bomb),
+// 0x8 @28928 (border start, FUN_0043e890 region), 0x10 @28994 (border
+// break/end), 0x20 @13887/14351/14360 (enemy kill, incl. sweeps),
+// 0x40 @22016 (item collected), 0x1 @28486 (border-adjacent, PROBABLE),
+// 0x100 @29442 (DAT_00625620 flag, dialogue-adjacent, PROBABLE).
+export const RPY_AUX_BITS = {
+  playerHit: 0x0002,
+  bomb: 0x0004,
+  borderStart: 0x0008,
+  borderEnd: 0x0010,
+  enemyKill: 0x0020,
+  itemCollect: 0x0040
+};
+
+// Frame indices in a stage's aux stream where the given event bit is set.
+export function auxEventFrames(stage: RpyStage, bit: number): number[] {
+  const out: number[] = [];
+  // Frame 0's aux word can hold uninitialized heap garbage (0xCDCD in the
+  // shipped demo replays) — the context struct is cleared on the first
+  // stage tick, not at allocation.
+  for (let f = 1; f < stage.auxFlags.length; f++) {
+    if (stage.auxFlags[f] & bit) out.push(f);
+  }
+  return out;
+}
+
 export interface RpyStage {
   stage: number; // 1-based table index: 1..6 = stages, 7 = Extra
   offset: number; // absolute offset of the 0x2C sub-header in the image

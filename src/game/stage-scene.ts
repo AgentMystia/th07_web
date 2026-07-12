@@ -1193,6 +1193,10 @@ export class StageScene implements GameHost {
 
   update(input: InputFrame): void {
     this.frame++;
+    // Refresh the shared SakuyaA aim snapshot before anything fires this
+    // frame (positions are unchanged since the previous frame's enemy pass,
+    // matching the exe's scan-in-enemy-loop timing).
+    this.updateSakuyaAimCache();
     // The continue screen freezes gameplay entirely, like the original.
     if (this.continueScreen) {
       this.updateContinueScreen(input);
@@ -2066,33 +2070,49 @@ export class StageScene implements GameHost {
     }
   }
 
-  // Nearest damageable enemy to (x, y); shared by the homing steer and the
-  // SakuyaA focused spawn-aim.
-  private findAimTarget(x: number, y: number): Enemy | null {
+  // Per-frame SakuyaA aim-target snapshot (exe player+0x2434/0x2438 copy of
+  // the DAT_004b5eec cache). Refreshed at the top of update() — equivalent
+  // to the exe's scan at the end of the previous frame's enemy pass, since
+  // nothing moves in between.
+  private sakuyaAim: { x: number; y: number } | null = null;
+
+  private updateSakuyaAimCache(): void {
+    if (!this.playerObj.character.startsWith('sakuya')) {
+      this.sakuyaAim = null;
+      return;
+    }
     // Sakuya's aimed knives use their own target cache with a maximum
     // firing angle: an enemy only qualifies while the angle from the PLAYER
     // to it lies inside [-120°, -60°) — ±30° around straight up
     // (Th07.exe FUN_0041ed50 @ all.c:14267-14278, gated on character
     // DAT_00625625 == 2; cone floats @ 0x48edc4/0x48edc0). Anything beside
     // or below her is never aimed at — the knives fly their table angle.
-    const cone = this.playerObj.character.startsWith('sakuya');
+    //
+    // Selection among qualifiers (Th07.exe FUN_0041ed50 @ all.c:14258-14300,
+    // Sakuya cache DAT_004b5eec/f0, sentinel y = -900 @ 0x48eb6c): ONE
+    // position snapshot per frame shared by every knife of the volley —
+    // the FIRST cone-qualified non-boss in pool order wins (the cache is
+    // only written while it still holds the sentinel); a cone-qualified
+    // BOSS takes the cache with min |e.x - player.x| and locks it against
+    // non-bosses (DAT_004b5ef8).
     const px = this.playerObj.x;
     const py = this.playerObj.y;
-    let best: Enemy | null = null;
-    let bestDist = 1e9;
+    let cache: { x: number; y: number } | null = null;
+    let locked = false;
     for (const e of this.enemies) {
       if (!e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.canTakeDamage || !e.ecl.shotCollision) continue;
-      if (cone) {
-        const angle = Math.atan2(e.y - py, e.x - px);
-        if (angle < -2.0943952 || angle >= -1.0471976) continue;
-      }
-      const d = (e.x - x) ** 2 + (e.y - y) ** 2;
-      if (d < bestDist) {
-        bestDist = d;
-        best = e;
+      const angle = Math.atan2(e.y - py, e.x - px);
+      if (angle < -2.0943952 || angle >= -1.0471976) continue;
+      if (e.ecl.isBoss) {
+        if (!locked || !cache || Math.abs(e.x - px) < Math.abs(cache.x - px)) {
+          cache = { x: e.x, y: e.y };
+          locked = true;
+        }
+      } else if (!locked && !cache) {
+        cache = { x: e.x, y: e.y };
       }
     }
-    return best;
+    this.sakuyaAim = cache;
   }
 
   // ReimuA homing amulet (shotType 1) / focused orb (shotType 2), Th07.exe
@@ -2141,11 +2161,15 @@ export class StageScene implements GameHost {
   // table angle. behaviorFunc 5 (SakuyaB) is intentionally not handled —
   // semantics unknown, knives fly straight per the table (AGENTS.md §7).
   private aimBulletAtSpawn(b: PlayerBullet): void {
-    const target = this.findAimTarget(b.x, b.y);
+    // Th07.exe FUN_00439070 (funcs[0]=4): aim from the SHOT's spawn position
+    // at the frame's shared target snapshot; angle = atan2 + (table angle +
+    // π/2) i.e. the record's spread relative to straight up (orbs fan ±20°);
+    // speed = table × 1.5 (DAT_0048ec24). Without a target the spawn
+    // velocity from the table stays — and no 1.5× boost.
+    const target = this.sakuyaAim;
     if (!target) return;
     const spread = b.angle - -Math.PI / 2; // table angle relative to straight up
     b.angle = Math.atan2(target.y - b.y, target.x - b.x) + spread;
-    // Th07.exe FUN_00439070: aimed shots get speed*1.5 (table 12 -> 18)
     b.speed *= 1.5;
     b.vx = Math.cos(b.angle) * b.speed;
     b.vy = Math.sin(b.angle) * b.speed;
@@ -2728,7 +2752,13 @@ export class StageScene implements GameHost {
         }
         if (it.y > 480) it.dead = true;
       }
-      if (p.alive && !it.dead && Math.abs(it.x - p.x) <= sht.itemRadius && Math.abs(it.y - p.y) <= sht.itemRadius) {
+      // Th07.exe FUN_0043b480 (item pickup): AABB overlap of the item box
+      // (± itemRadius × DAT_0048eaa4/DAT_0048eac0 = ×0.5 → ±10) against the
+      // player grab box (player ± 12, +0x9a8/+0x9ac = 12.0 @ 0x43xxxx init;
+      // box rebuilt each frame at +0x978..0x988) → effective ±22, and only
+      // in player states 0/3/4 (normal/invuln/bomb — not materialize/dying).
+      const grab = sht.itemRadius / 2 + 12;
+      if (p.alive && !it.dead && Math.abs(it.x - p.x) <= grab && Math.abs(it.y - p.y) <= grab) {
         this.collectItem(it);
       }
     }

@@ -134,6 +134,31 @@ for (let i = 0; i < rpy.stages.length; i++) {
   }
 
   const r = await runStage(rpy, i, { onFrame });
+
+  // Event-stream oracles: the aux word records per-frame kill/collect
+  // events of the ORIGINAL run — align ours against them (±3 frames).
+  const alignment = {};
+  for (const [name, bit] of [
+    ['kills', mod.RPY_AUX_BITS.enemyKill],
+    ['collects', mod.RPY_AUX_BITS.itemCollect]
+  ]) {
+    const oracle = mod.auxEventFrames(stage, bit);
+    const ourFrames = name === 'kills' ? r.killFrames : r.collectFrames;
+    let matched = 0;
+    let ptr = 0;
+    let firstGap = null;
+    for (const of_ of oracle) {
+      while (ptr < ourFrames.length && ourFrames[ptr] < of_ - 3) ptr++;
+      if (ptr < ourFrames.length && Math.abs(ourFrames[ptr] - of_) <= 3) {
+        matched++;
+        ptr++;
+      } else if (firstGap === null) {
+        firstGap = of_;
+      }
+    }
+    alignment[name] = { oracle: oracle.length, ours: ourFrames.length, matched, firstGap };
+  }
+
   if (traceLines.length || dumped) {
     mkdirSync(outDir, { recursive: true });
     if (traceLines.length) {
@@ -170,6 +195,7 @@ for (let i = 0; i < rpy.stages.length; i++) {
     deaths: r.deaths,
     bombs: r.bombs,
     hits: r.hits,
+    alignment,
     impliedDeaths: implied,
     diffs
   };
@@ -177,6 +203,12 @@ for (let i = 0; i < rpy.stages.length; i++) {
 
   console.log(`\nstage ${stage.stage}: ${pass ? 'PASS' : 'FAIL'}  ` +
     `(${r.framesRun}/${r.framesAvailable} frames, ${Math.round(r.wallMs)}ms)`);
+  for (const [name, a] of Object.entries(alignment)) {
+    console.log(
+      `  ${name}: oracle ${a.oracle}, ours ${a.ours}, matched±3f ${a.matched}` +
+        (a.firstGap !== null ? ` — first unmatched oracle event @${a.firstGap}` : '')
+    );
+  }
   if (r.deaths.length) {
     const first = r.deaths[0];
     console.log(
