@@ -337,12 +337,19 @@ export class Player {
 
   private move(input: InputFrame, rate = 1): void {
     const sht = this.sht;
+    // Th07.exe FUN_0043be00 @ all.c:28028-28055 resolves the four direction
+    // bits into a direction enum via a PRIORITY chain, not vector addition:
+    // up beats down (up+down moves UP), and right beats left (left+right
+    // moves RIGHT — the right check overwrites the left result in every
+    // branch). Real replays contain such chords (e.g. up+down+left held 53
+    // frames in the stage-1 golden fixture), so cancelling them desyncs
+    // playback and never matches live retail behavior.
     let dx = 0;
     let dy = 0;
-    if (input.held.has('left')) dx -= 1;
-    if (input.held.has('right')) dx += 1;
-    if (input.held.has('up')) dy -= 1;
-    if (input.held.has('down')) dy += 1;
+    if (input.held.has('up')) dy = -1;
+    else if (input.held.has('down')) dy = 1;
+    if (input.held.has('left')) dx = -1;
+    if (input.held.has('right')) dx = 1;
     const diagonal = dx !== 0 && dy !== 0;
     const baseSpeed = diagonal
       ? (this.focusHeld ? sht.diagFocusedSpeed : sht.diagSpeed)
@@ -360,8 +367,9 @@ export class Player {
   }
 
   private updatePose(input: InputFrame): void {
-    const movingLeft = input.held.has('left') && !input.held.has('right');
-    const movingRight = input.held.has('right') && !input.held.has('left');
+    // Same right-beats-left priority as move() (exe FUN_0043be00 enum).
+    const movingRight = input.held.has('right');
+    const movingLeft = !movingRight && input.held.has('left');
     const pose = movingLeft ? 'left' : movingRight ? 'right' : 'idle';
     if (pose === this.poseState) return;
     this.poseState = pose;

@@ -95,7 +95,11 @@ node scripts/pixel-report.mjs /tmp/s.png
 
 ### 已知差距
 
-- 尚无逐帧 replay 对比，因此不能宣称与原作达到逐帧一致。
+- 已建成基于原版 .rpy replay 的逐帧黄金验证工作流（`npm run replay:verify`，
+  解析器 `src/formats/rpy.ts`，规格 reference/re-specs/exe-replay.md）：以原作
+  引擎写下的逐面状态快照为校验点、以「原局玩家不该死」为存活不变量逐帧回放。
+  当前尚未全面通过（对齐战役进行中），因此仍不宣称逐帧一致——但差距首次可
+  机判、可定位到帧。
 - Extra / Phantasm 的覆盖与逆向证据少于 Stage 1-6；其开局 Bomb / Power
   仍采用社区惯例，状态为 PROBABLE。
 - Practice Start、Replay、Result、Music Room、Option、Quit 目前只显示在
@@ -224,8 +228,14 @@ under `reference/` is committed, deployed, or loaded by the browser.
 
 ### Known gaps
 
-- There is no frame-by-frame replay comparison, so frame-level parity is not
-  claimed.
+- A frame-by-frame replay-golden verification workflow now exists
+  (`npm run replay:verify`; parser `src/formats/rpy.ts`; spec
+  reference/re-specs/exe-replay.md): original .rpy replays are replayed
+  headlessly against per-stage snapshots the original engine recorded, with
+  "the original player must survive" as a per-frame invariant. It does not
+  fully pass yet (the alignment campaign is ongoing), so frame-level parity
+  is still not claimed — but the gap is now machine-checkable and localized
+  to exact frames.
 - Extra and Phantasm have less coverage and executable evidence than Stages
   1-6. Their initial bomb/power values remain community-convention PROBABLEs.
 - Practice Start, Replay, Result, Music Room, Option, and Quit are visible but

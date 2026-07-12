@@ -2207,8 +2207,11 @@ export class StageRuntime {
       };
     }
     const rankSpeed = game.rank * (s.bulletRankSpeedHigh - s.bulletRankSpeedLow) / 32 + s.bulletRankSpeedLow;
-    const add1 = Math.trunc(game.rank * (s.bulletRankAmount1High - s.bulletRankAmount1Low) / 32 + s.bulletRankAmount1Low);
-    const add2 = Math.trunc(game.rank * (s.bulletRankAmount2High - s.bulletRankAmount2Low) / 32 + s.bulletRankAmount2Low);
+    // Exe (0x411c76/0x4120d2): idiv truncates the (hi-lo)*rank product BEFORE
+    // adding the Lo base — trunc of the sum differs by 1 when Lo < 0 and the
+    // product lands on a half-step (e.g. hi-lo=1 at rank 16).
+    const add1 = Math.trunc(game.rank * (s.bulletRankAmount1High - s.bulletRankAmount1Low) / 32) + s.bulletRankAmount1Low;
+    const add2 = Math.trunc(game.rank * (s.bulletRankAmount2High - s.bulletRankAmount2Low) / 32) + s.bulletRankAmount2Low;
     return {
       sprite: this.getShort(game, e, a),
       offset: this.getShort(game, e, a + 2),
@@ -2337,6 +2340,9 @@ export class StageRuntime {
         game.enemyBullets.push({
           id: game.id++,
           poolSlot,
+          ownerId: e.id,
+          ownerSub: e.ecl.subId,
+          spawnFrame: game.frame,
           effectState: 0,
           x: shootX,
           y: shootY,

@@ -91,17 +91,32 @@ screenshots is a bonus check on top — never a substitute for the numbers.
 For any gameplay or visual change:
 
 1. `npm run check && npm run build && npm test`.
-2. Drive the affected states headlessly and read the **snapshot JSON**
+   `npm test` includes the **replay-golden digest lock**
+   (tests/th07-replay-golden.test.mjs): the committed real-play replay
+   (tests/replays/th7_udFe25.rpy) is re-simulated headlessly and sparse
+   per-frame state digests are compared — any simulation-behavior change
+   fails it at the exact frame the change first manifests. If YOUR change
+   intentionally alters gameplay (an alignment fix), regenerate with
+   `UPDATE_REPLAY_GOLDEN=1 npm test` and commit the digest diff with the fix.
+2. For bullet/timing/aim fidelity questions, run
+   **`npm run replay:verify`** — it replays the fixture stage-by-stage in
+   pure Node and compares our end-of-stage state against the NEXT stage's
+   recorded snapshot (ground truth written by the original engine), reporting
+   per-field diffs plus every unexpected player death with the killing
+   bullet's provenance (owner enemy, ECL sub, spawn frame, angle/speed).
+   `--trace A,B` dumps per-frame JSONL; `--dump-frame F` dumps a full
+   snapshot. Format + workflow spec: reference/re-specs/exe-replay.md.
+3. Drive the affected states headlessly and read the **snapshot JSON**
    (entity counts, positions, boss/spell state, cherry, player) printed by
    the tools. Assert the fields your change should have moved — and that
    the ones it shouldn't have moved didn't.
-3. For anything rendered, run **`node scripts/pixel-report.mjs <shot.png>`**
+4. For anything rendered, run **`node scripts/pixel-report.mjs <shot.png>`**
    and compare against the baseline table below. The report samples named
    regions (in 640×480 game coordinates) and prints average color,
    brightness, texture % (pixels far from the region mean — detail
    present), distinct-color count, and the center pixel. Custom regions:
    append `x,y,w,h:label` args.
-4. Iterate until snapshot + probes match the criteria. A change verified
+5. Iterate until snapshot + probes match the criteria. A change verified
    only by "it compiles" is assumed broken — this project's worst
    regressions all shipped in changes that compiled fine.
 
@@ -278,12 +293,37 @@ composited at (32,26), cherry banner at (32,448) showing `cherry/cherryMax`
 cherryMax after the slash) with the small purple cherryPlus above the
 blank (exe draw @ all.c:1760-1870).
 
+**RPY (T7RP replays)**: full spec in reference/re-specs/exe-replay.md;
+parser `src/formats/rpy.ts`. Load pipeline (FUN_004402d0): decrypt from
++0x10 with key byte +0x0D (`b -= key; key += 7`), additive checksum
+`0x3F000318 + sum(bytes[0x0D..])` == u32@+0x08, then TH06-era bitstream LZSS
+from +0x54 (0x2000 window, cursor starts 1, 13-bit absolute pos/4-bit
+len−3). Decompressed image: 7+7 stage offset tables @+0x1C/+0x38 (inputs /
+slowdown trailers), shot byte (char*2+type) + difficulty + date + name +
+final score at body start, then per stage a 0x2C snapshot (score-at-END,
+pointItems, cherry, cherryMax, cherryPlus≤50000, graze, extendLevel,
+threshold, **u16 RNG seed @+0x20**, power/lives/bombs/rank bytes) followed
+by fixed 4-byte frame records (u16 input word + u16 aux, no RLE). Input
+bits: 0x1 Z, 0x2 X, 0x4 Shift, 0x8 Esc, 0x10-0x80 directions (numpad
+diagonals OR pairs), 0x100 Ctrl-skip, 0x1000 Enter. **Direction chords
+resolve by priority — up beats down, right beats left (FUN_0043be00), NOT
+vector cancellation**; real replays contain such chords. Rank
+(DAT_00625884): recorded per stage; 16 at run start (= the neutral point of
+every rank formula), 32 from stage 2 on; no per-frame increment exists in
+the exe (machine-code scan) — constant within a stage.
+
 ## 7. Approximations registry (known, flagged, improvable)
 
 Each also has an inline comment at its code site. Do not silently "fix"
 gameplay to taste — improve these only with better evidence (Ghidra, frame
 comparisons against real play).
 
+- Rank progression across stages: recorded evidence pins 16 at run start and
+  32 from stage 2 onward, constant within a stage; the port models the step
+  as +16 per stage clear capped at 32 (`carryState()`), but jump-to-32 on the
+  first clear fits the same data. Replay verification is immune (per-stage
+  recorded byte is used); only multi-stage live play could differ, and only
+  if the true rule is neither.
 - Frame tiling positions (exact-fit math, engine placement not literal).
 - HUD star icon x positions; spell-timer and fps exact placement.
 - Cherry+ banner interrupt→state mapping (dim=charging, bright=border).

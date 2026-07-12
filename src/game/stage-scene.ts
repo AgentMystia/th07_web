@@ -32,6 +32,9 @@ export interface RunCarry {
   cherryPlus: number;
   spellsCaptured: number;
   extendLevel: number;
+  // Rank at the NEXT stage's start: +16 per stage clear, capped 32 (see the
+  // rank field comment for the replay-derived evidence).
+  rank: number;
 }
 
 // Item sprites live in etama.anm entry 1 (the etama2.png sheet), addressed
@@ -236,14 +239,21 @@ export function enameRowForBoss(stageNumber: number, rootSub: number): number {
 export class StageScene implements GameHost {
   rng = new Rng();
   difficulty = 1;
-  // Th07.exe DAT_00625884 lives in .data's zero-fill tail (BSS) — retail
-  // rank is 0 for the whole game: nothing writes it during play and no
-  // stage ECL touches its var (10017); replays just round-trip the 0. At
-  // rank 0 the non-spell FIRE scale contributes spdLo (default -0.5) and
-  // countLo, and op73/74 intervals stretch x1.2 (see eclvm). The previous
-  // hardcoded 16 made every non-spell pattern 0.5 px/f faster and fire 20%
-  // more often than vanilla.
-  rank = 0;
+  // Th07.exe DAT_00625884. The earlier "retail rank is 0" conclusion (BSS
+  // zero-fill + no visible writes) is DISPROVEN by real replay data: every
+  // T7RP per-stage snapshot records rank at sub-header +0x25 (writer @
+  // 0x4401fa, restore @ 0x440623), and real files carry 16 — never 0 — at
+  // run start (user run stage 1, and all three ZUN demo replays), then
+  // exactly 32 from stage 2 onward of a full run. rank 16 is the NEUTRAL
+  // point of the scale formulas (op73/74 interval = N + N/5 − 2·(N/5)·rank/32
+  // — identity at 16; FIRE adds Lo + (Hi−Lo)·rank/32), so 16 reproduces the
+  // ECL-nominal patterns the earlier hardcode got right. A machine-code scan
+  // of the exe shows no per-frame increment anywhere — rank is constant
+  // within a stage; the recorded 16→32 step across a stage boundary is
+  // modeled as +16 per stage clear, capped at 32 (PROBABLE: with only
+  // fresh=16 / after-stage-1=32 observed, +16-per-clear vs jump-to-32 are
+  // indistinguishable; both fit all current evidence).
+  rank = 16;
   // ECL var 10028 (Th07.exe DAT_00625627): character*2 + shotType.
   get shotIndex(): number {
     const c = this.playerObj.character;
@@ -429,6 +439,28 @@ export class StageScene implements GameHost {
   // Player-wide hit tally (exe player+0x240c): beams/attack slots pop a
   // spark on every 8th (lasers) / 4th (bomb slots) accumulated hit.
   private playerHitTally = 0;
+  // Committed player hits with the striking entity's provenance — the primary
+  // localization signal for replay-golden divergences (a replayed player only
+  // dies where our simulation disagrees with the original). Ring-capped at 64.
+  hitLog: Array<{
+    frame: number;
+    stageFrame: number;
+    kind: 'bullet' | 'laser' | 'body';
+    playerX: number;
+    playerY: number;
+    bullet: {
+      ownerId: number;
+      ownerSub: number;
+      spawnFrame: number;
+      sprite: number;
+      spriteOffset: number;
+      x: number;
+      y: number;
+      angle: number;
+      speed: number;
+      age: number;
+    } | null;
+  }> = [];
   // Floating number popups: two contiguous ring pools in the exe (720 large,
   // 3 small — the latter serves small cherry pickups). FUN_00401ad0 updates
   // all 723 slots: rise 0.5 px per rate-scaled frame and retire after 60.
@@ -560,6 +592,7 @@ export class StageScene implements GameHost {
       this.cherry.cherryPlus = carry.cherryPlus;
       this.cherry.spellsCaptured = carry.spellsCaptured;
       this.extendLevel = carry.extendLevel;
+      this.rank = carry.rank;
       this.startStageTransition();
     }
   }
@@ -648,7 +681,8 @@ export class StageScene implements GameHost {
       cherryMax: this.cherry.cherryMax,
       cherryPlus: this.cherry.cherryPlus,
       spellsCaptured: this.cherry.spellsCaptured,
-      extendLevel: this.extendLevel
+      extendLevel: this.extendLevel,
+      rank: Math.min(32, this.rank + 16)
     };
   }
 
@@ -2171,7 +2205,7 @@ export class StageScene implements GameHost {
       if (!l.inUse) continue;
       const result = this.checkLaserCollision(l);
       if (result === 'hit') {
-        this.onPlayerHit(null);
+        this.onPlayerHit(null, 'laser');
         return;
       }
       if (result === 'graze') this.onGrazeAward();
@@ -2180,7 +2214,7 @@ export class StageScene implements GameHost {
       if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead) continue;
       // Th07.exe FUN_0041ebc0: body kill uses hitbox*(1/1.5)/2 = /3
       if (Math.abs(e.x - px) <= e.ecl.hitbox.x / 3 + hit && Math.abs(e.y - py) <= e.ecl.hitbox.y / 3 + hit) {
-        this.onPlayerHit(null);
+        this.onPlayerHit(null, 'body');
         return;
       }
     }
@@ -2215,7 +2249,7 @@ export class StageScene implements GameHost {
     this.playSfx(30);
   }
 
-  private onPlayerHit(sourceBullet: EnemyBullet | null): void {
+  private onPlayerHit(sourceBullet: EnemyBullet | null, kind: 'bullet' | 'laser' | 'body' = 'bullet'): void {
     const p = this.playerObj;
     // An invulnerable player (spawn/bomb invuln, or already in the
     // deathbomb window) takes no hit outcome at all in the exe — in
@@ -2224,6 +2258,30 @@ export class StageScene implements GameHost {
     // frames chain-eat every subsequent border the instant it started.)
     if (p.invulnFrames > 0 || p.bombInvuln > 0 || p.hitState) return;
     if (this.breakBorder(sourceBullet)) return;
+    // Replay-divergence forensics: every committed hit records what struck
+    // the player and, for bullets, its spawn provenance. Ring-capped.
+    this.hitLog.push({
+      frame: this.frame,
+      stageFrame: this.stageFrame,
+      kind,
+      playerX: p.x,
+      playerY: p.y,
+      bullet: sourceBullet
+        ? {
+            ownerId: sourceBullet.ownerId,
+            ownerSub: sourceBullet.ownerSub,
+            spawnFrame: sourceBullet.spawnFrame,
+            sprite: sourceBullet.sprite,
+            spriteOffset: sourceBullet.spriteOffset,
+            x: sourceBullet.x,
+            y: sourceBullet.y,
+            angle: sourceBullet.angle,
+            speed: sourceBullet.speed,
+            age: sourceBullet.age
+          }
+        : null
+    });
+    if (this.hitLog.length > 64) this.hitLog.shift();
     const result = p.hit();
     if (result === 'deathbomb-window') {
       // Th07.exe FUN_0043bd60 @ 0x43bd75-0x43bdeb — the hit frame itself

@@ -10,6 +10,11 @@ export interface EnemyBullet {
   // Stable slot in Th07.exe's fixed 0x400-entry bullet pool. Effects scan
   // this identity in slot order, independently of the browser-side array.
   poolSlot: number;
+  // Spawn provenance (replay-divergence forensics: which emitter fired the
+  // bullet that hit the player). Gameplay never reads these.
+  ownerId: number; // Enemy.id of the emitter
+  ownerSub: number; // ECL sub the emitter was running at fire time
+  spawnFrame: number; // GameHost.frame at spawn
   // op-79 opcode 0x2000 grace (exe bullet+0xbf0): while it counts down the
   // off-screen cull is skipped entirely and collision keeps running — how
   // patterns park bullets outside the field before they sweep in.
