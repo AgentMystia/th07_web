@@ -1134,6 +1134,15 @@ export class StageScene implements GameHost {
   }
 
   spawnEnemyDeathEffect(e: Enemy): void {
+    // APPROXIMATION (documented). The exe death switch spawns 3+1+4 particles
+    // of effect types (0x2e15+4)/0x2e14/(0x2e15+4) (all.c:14339/14369/14370),
+    // default types 0/0 -> effectId 4 (4 draws) x7 + effectId 0 (0 draws) x1 =
+    // 28 raw draws, INTERLEAVED with the item drop (14340). A first cut that
+    // used the exact 28-draw count but our current all-effects-after-items
+    // order moved the stage-1 first death EARLIER (1938->1768): the draw ORDER
+    // within a death matters, so this needs killEnemy restructured (effect-3
+    // BEFORE the item scatter draws) — tracked as a follow-up. Until then keep
+    // the legacy burst so as not to regress.
     this.spawnEffectParticles(3, e.x, e.y, 12, 0xffffffff);
   }
 
