@@ -398,6 +398,16 @@ export class StageScene implements GameHost {
   // Read by the ?test=1 snapshot; gameplay never consults them.
   homingTargetId: number | null = null;
   settledDamageThisFrame = 0;
+  // Test-only per-pass draw costs in ms (PERF-001 breakdown); rebuilt each
+  // draw() and read via the ?test=1 hook. Gameplay never consults it.
+  drawPassCosts: Record<string, number> = {};
+  private passT0 = 0;
+
+  private markPass(label: string): void {
+    const now = performance.now();
+    this.drawPassCosts[label] = (this.drawPassCosts[label] ?? 0) + (now - this.passT0);
+    this.passT0 = now;
+  }
   private eff01Pattern: CanvasPattern | null = null;
 
   // Global sprite id of etama entry 1's embedded sprite 0 (the etama2.png
@@ -2845,14 +2855,18 @@ export class StageScene implements GameHost {
       this.clearCaptureArmed = false;
       this.stageTransitionCaptureArmed = false;
     }
+    this.drawPassCosts = {};
+    this.passT0 = performance.now();
     r.clear('#101018');
     r.ctx.fillStyle = '#04040c';
     r.ctx.fillRect(PLAYFIELD.x, PLAYFIELD.y, PLAYFIELD.width, PLAYFIELD.height);
+    this.markPass('clear');
     r.clipPlayfield(() => {
       const ox = PLAYFIELD.x + this.shakeX;
       const oy = PLAYFIELD.y + this.shakeY;
       this.drawBackground(r, ox, oy);
       this.drawSpellBackground(r);
+      this.markPass('background');
       for (const p of this.particles) {
         const alpha = 1 - p.age / p.life;
         r.ctx.globalAlpha = alpha * 0.8;
@@ -2875,6 +2889,7 @@ export class StageScene implements GameHost {
         const rotation = e.ecl.anmRotateWithAngle ? e.ecl.heading : e.ecl.anmRotZ;
         r.drawAnmFrame(frame, ox + e.x, oy + e.y, rotation != null ? { rotation } : {});
       }
+      this.markPass('enemies');
       this.drawLasers(r, ox, oy);
       // Enemy bullets dominate entity draw counts in dense spells. Their
       // sprites are untinted, so one saved Canvas state can safely cover the
@@ -2898,6 +2913,7 @@ export class StageScene implements GameHost {
         );
       }
       r.ctx.restore();
+      this.markPass('bullets');
       // Items ride the same batched path as bullets: a phase-end sweep can
       // legitimately field 1000+ of them at once, and the per-call
       // save/translate/restore path was the measured freeze source there.
@@ -2915,6 +2931,7 @@ export class StageScene implements GameHost {
         }
       }
       r.ctx.restore();
+      this.markPass('items');
       const p = this.playerObj;
       for (const b of this.playerBullets) {
         // Script-driven sprite state (alpha/scale/spin/blend all come from
@@ -3000,6 +3017,7 @@ export class StageScene implements GameHost {
         r.ctx.restore();
       }
       this.drawSpellDeclaration(r, ox, oy);
+      this.markPass('player+fx');
     });
     this.drawFrame(r);
     this.drawSidebar(r);
@@ -3016,6 +3034,7 @@ export class StageScene implements GameHost {
     if (this.continueScreen) this.drawContinueScreen(r);
     else if (this.gameOver) r.text('GAME OVER', PLAYFIELD.x + 140, PLAYFIELD.y + 200, { size: 20, color: '#f66' });
     if (this.pauseState) this.drawPause(r);
+    this.markPass('hud');
   }
 
   private startStageClearPresentation(): void {

@@ -218,20 +218,35 @@ export class Renderer {
     const img = this.assets[imageKey];
     if (!img || alpha <= 0) return;
     const ctx = this.ctx;
+    // Redundant canvas state writes are not free — a 1100-item sweep frame
+    // otherwise pays for 1100 alpha/blend sets (PERF-001). Assign only on
+    // change; values persist across batch calls and the comparison reads
+    // live state, so interleaved non-batch draws stay correct.
+    if (ctx.globalAlpha !== alpha) ctx.globalAlpha = alpha;
+    if (ctx.globalCompositeOperation !== blend) ctx.globalCompositeOperation = blend;
+    const w = Math.max(0.001, Math.abs(sw * scaleMultiplier));
+    const h = Math.max(0.001, Math.abs(sh * scaleMultiplier));
+    const tinted = color != null && (color & 0x00ffffff) !== 0x00ffffff
+      ? this.tintedSpriteCanvas(img, sx, sy, sw, sh, color)
+      : null;
+    if (rotation === 0) {
+      // Unrotated fast path (items, glyphs): translate(x,y)+draw(-w/2,-h/2)
+      // and draw(x-w/2, y-h/2) are the same affine map — two matrix ops
+      // cheaper per call, pixel-identical.
+      ctx.resetTransform();
+      if (tinted) ctx.drawImage(tinted, 0, 0, tinted.width, tinted.height, x - w / 2, y - h / 2, w, h);
+      else ctx.drawImage(img, sx, sy, sw, sh, x - w / 2, y - h / 2, w, h);
+      return;
+    }
     // Keep Canvas' own rotation path so rasterization stays pixel-identical
     // to drawSprite(); hand-built sin/cos matrices differ in their last bits.
     ctx.resetTransform();
-    ctx.globalAlpha = alpha;
-    ctx.globalCompositeOperation = blend;
     ctx.translate(x, y);
     ctx.rotate(rotation);
-    const w = Math.max(0.001, Math.abs(sw * scaleMultiplier));
-    const h = Math.max(0.001, Math.abs(sh * scaleMultiplier));
-    if (color != null && (color & 0x00ffffff) !== 0x00ffffff) {
+    if (tinted) {
       // Tints resolve through the same cached-canvas path as drawSprite, so
       // a batch of colored glyphs stays one drawImage per sprite.
-      const cached = this.tintedSpriteCanvas(img, sx, sy, sw, sh, color);
-      if (cached) ctx.drawImage(cached, 0, 0, cached.width, cached.height, -w / 2, -h / 2, w, h);
+      ctx.drawImage(tinted, 0, 0, tinted.width, tinted.height, -w / 2, -h / 2, w, h);
       return;
     }
     ctx.drawImage(img, sx, sy, sw, sh, -w / 2, -h / 2, w, h);

@@ -27,6 +27,8 @@ interface TestHook {
   spawnLog(): { t: number; time: number; sub: number }[];
   lifecycleLog(): { f: number; ev: string; id: number; sub: number; a?: number }[];
   frameCost(): { update: number[]; draw: number[] };
+  // Last frame's per-pass draw costs (ms), PERF-001 breakdown.
+  drawPasses(): Record<string, number>;
   // Test-only: flood the item pool for PERF-001's dense-items scenario.
   fillItems(n: number): void;
   // Releases every previously injected held key (Input.inject is additive).
@@ -437,6 +439,7 @@ async function boot(): Promise<void> {
       spawnLog: () => stage?.runtime.spawnLog ?? [],
       lifecycleLog: () => stage?.runtime.lifecycleLog ?? [],
       frameCost: () => loop.frameCosts(),
+      drawPasses: () => stage?.drawPassCosts ?? {},
       fillItems: (n: number) => {
         if (!stage) return;
         // Deterministic grid fill through the real spawn path (1100 cap
