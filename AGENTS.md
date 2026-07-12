@@ -423,9 +423,14 @@ comparisons against real play).
     id5/death/snow draws interleave in a different stream order. Snow (id20) IS
     exe-faithful (deterministic Sub1 loops, matches to the particle pre-1800).
     Wiring the death/cost model in ISOLATION only shifts the hypersensitive
-    first-death frame (1938→1762) — no alignment gain. NEXT STEP: restructure
-    collision into the enemy loop (per-enemy, immediate damage) so id5/death land
-    in exe order, THEN apply the death model + `EFFECT_DRAW_COST {0-6}` together.
+    first-death frame (1938→1762) — no alignment gain. **The collision
+    restructure is now DONE (commit 0be941c): per-enemy enemy-outer collision +
+    IMMEDIATE same-frame damage (updateEnemies / collidePlayerShots), enemies now
+    die the frame of the killing hit → ghost kill-match 88→131.** But wiring the
+    death model ON TOP regressed kill-match 131→101 — the exact death model +
+    id5 every-4th-hit cadence must go in TOGETHER (and for Sakuya the every-4th
+    cadence is empty, so the regression points at the global 1-in-3 death counter
+    or death-draw ordering — investigate before re-wiring).
   - CAUTION: the ghost full-stage budget (163,385) is CONFOUNDED — a post-boss
     dialogue freezes our sim ~3400f, starving snow the exe also freezes. Judge
     pre-1800 by the non-ghost first-death frame, not the aggregate. Decompose
