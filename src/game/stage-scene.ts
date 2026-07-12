@@ -1976,6 +1976,11 @@ export class StageScene implements GameHost {
     this.shotCollisionEnabled = collide;
     this.tickLaserSlots();
     for (const b of this.playerBullets) {
+      // EXPERIMENT: exe fires bullets (FUN_0043a820) AFTER movement
+      // (FUN_0043a290), so a bullet spawned THIS frame is at its spawn position
+      // when the enemy manager collides it — it does not integrate velocity yet.
+      // We fire before this pass, so skip the spawn-frame move to match.
+      const fresh = b.age === 0;
       // Player-shot age is a rate-scaled split counter (exe FUN_0043a290
       // tail); parity checks below use the integer part.
       b.age += rate;
@@ -1996,8 +2001,10 @@ export class StageScene implements GameHost {
       // velocity (× the global rate) every frame; the per-shot ANM VM ticks
       // alongside and the bullet dies when its script removes itself (impact
       // scripts end in remove(); flight scripts end in static and never do).
-      b.x += b.vx * rate;
-      b.y += b.vy * rate;
+      if (!fresh) {
+        b.x += b.vx * rate;
+        b.y += b.vy * rate;
+      }
       // Beam release fade: the VM consumes the interrupt only while parked
       // at its waitInt checkpoint (exe FUN_0044aa20 @ all.c:36279) — the
       // request re-tries every frame until then.
