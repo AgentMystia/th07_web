@@ -1295,7 +1295,7 @@ export class StageScene implements GameHost {
         this.cancelLasers(false);
       }
       if (!this.gameOver) {
-        const volley = this.playerObj.fire();
+        const volley = this.playerObj.fire(this.slowRate);
         if (volley.some((b) => b.sfxId >= 0)) this.playSfx(0);
         // Th07.exe FUN_00438b70: the shot SE fires per spawn event of the one
         // shooter with sfxId>=0 (always SE 0), not on a free-running 8f clock.

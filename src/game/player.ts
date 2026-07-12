@@ -303,24 +303,14 @@ export class Player {
     if (this.controllable) this.move(input, rate);
     else this.lastVx = 0;
     this.shooting = input.held.has('shoot') && this.controllable;
-    if (this.shooting) {
-      // Shot cadence is a split counter at the global rate (exe
-      // FUN_0043a820 via FUN_00436acc). The press frame re-arms to 0
-      // immediately (FUN_0043a930) so delay-0 shooters fire on it.
-      if (this.fireFrame < 0) {
-        this.fireFrame = 0;
-        this.fireFrameFrac = 0;
-      } else if (rate > 0.99) {
-        this.fireFrame = (this.fireFrame + 1) % SHOT_CYCLE;
-      } else {
-        this.fireFrameFrac += rate;
-        if (this.fireFrameFrac >= 1) {
-          this.fireFrameFrac -= 1;
-          this.fireFrame = (this.fireFrame + 1) % SHOT_CYCLE;
-        }
-      }
-    } else {
-      this.fireFrame = -1;
+    // Shot-cycle ARM (exe FUN_0043a930): holding shoot re-arms the counter
+    // to 0 only while it is DISARMED (< 0). A re-press mid-cycle does NOT
+    // reset the grid, and releasing does NOT stop the cycle — the armed
+    // counter free-runs to 29 firing its remaining record phases ("release
+    // inertia"), then FUN_0043a820 disarms it (>0x1d, or player states 1/2:
+    // materialize/dying). Ticking + disarm live in fire().
+    if (this.shooting && this.fireFrame < 0) {
+      this.fireFrame = 0;
       this.fireFrameFrac = 0;
     }
     this.updatePose(input);
@@ -406,8 +396,15 @@ export class Player {
     return { x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t * t };
   }
 
-  fire(): PlayerBullet[] {
-    if (!this.shooting || !this.alive) return [];
+  fire(rate = 1): PlayerBullet[] {
+    // exe FUN_0043a820: runs while the cycle is ARMED, independent of the
+    // shoot key — released cycles still fire their remaining phases.
+    if (this.fireFrame < 0) return [];
+    if (this.dyingFrame >= 0 || this.materializeFrame >= 0) {
+      this.fireFrame = -1;
+      this.fireFrameFrac = 0;
+      return [];
+    }
     const out: PlayerBullet[] = [];
     for (const shot of this.sht.shotsForPower(this.power)) {
       const isLaser = shot.funcs[0] === 2 || shot.funcs[0] === 3;
@@ -434,6 +431,23 @@ export class Player {
       if (this.fireFrame % interval !== shot.delay % interval) continue;
       const b = this.makeBullet(shot);
       if (b) out.push(b);
+    }
+    // Advance the split counter (FUN_00436acc) and expire the cycle past
+    // frame 29 (exe compares > 0x1d) — the held key re-arms it to 0 on the
+    // next update tick, giving the seamless 30-frame loop.
+    if (rate > 0.99) {
+      this.fireFrame++;
+      this.fireFrameFrac = 0;
+    } else {
+      this.fireFrameFrac += rate;
+      if (this.fireFrameFrac >= 1) {
+        this.fireFrameFrac -= 1;
+        this.fireFrame++;
+      }
+    }
+    if (this.fireFrame > 29) {
+      this.fireFrame = -1;
+      this.fireFrameFrac = 0;
     }
     return out;
   }
