@@ -14,6 +14,10 @@
 //     [--trace A,B]       per-frame JSONL for frames A..B -> trace.jsonl
 //     [--dump-frame F]    full stageSnapshot at frame F -> frame-F.json
 //     [--out DIR]         output dir for trace/dump files (default tmp/replay)
+//     [--ghost]           forced invuln — runs the FULL recorded input stream
+//                         regardless of hits, for whole-stage event/RNG-budget
+//                         diagnostics (checkpoint fields will show FAIL, since
+//                         ghost mode is diagnostic-only and never PASSes)
 //
 // Exit codes: 0 = all verified stages PASS; 2 = divergence; 1 = error.
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
@@ -133,7 +137,7 @@ for (let i = 0; i < rpy.stages.length; i++) {
     };
   }
 
-  const r = await runStage(rpy, i, { onFrame });
+  const r = await runStage(rpy, i, { onFrame, ghost: Boolean(args.ghost) });
 
   // Event-stream oracles: the aux word records per-frame kill/collect
   // events of the ORIGINAL run — align ours against them (±3 frames).
@@ -199,7 +203,7 @@ for (let i = 0; i < rpy.stages.length; i++) {
   const unexpectedDeaths = implied === null ? r.deaths : r.deaths.slice(implied);
   const incomplete = i < rpy.stages.length - 1 && !r.completed;
   const pass = diffs.length === 0 && unexpectedDeaths.length === 0 && !incomplete;
-  if (!pass) failed = true;
+  if (!pass && !args.ghost) failed = true;
 
   const stageReport = {
     stage: stage.stage,
@@ -218,7 +222,7 @@ for (let i = 0; i < rpy.stages.length; i++) {
   };
   report.stages.push(stageReport);
 
-  console.log(`\nstage ${stage.stage}: ${pass ? 'PASS' : 'FAIL'}  ` +
+  console.log(`\nstage ${stage.stage}: ${args.ghost ? 'GHOST (diagnostic-only)' : pass ? 'PASS' : 'FAIL'}  ` +
     `(${r.framesRun}/${r.framesAvailable} frames, ${Math.round(r.wallMs)}ms)`);
   for (const [name, a] of Object.entries(alignment)) {
     console.log(

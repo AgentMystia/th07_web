@@ -1946,8 +1946,16 @@ export class StageRuntime {
         return null;
       case 115: s.timerCallbackSub = v.i32(a); return null;
       case 116: s.interactable = !!v.i32(a); return null;
-      case 117: game.spawnEffectParticles(v.i32(a), e.x, e.y, v.i32(a + 4), v.u32(a + 8) >>> 0); return null;
-      case 118: game.spawnEffectParticles(v.i32(a), e.x + gf(12), e.y + gf(16), v.i32(a + 4), v.u32(a + 8) >>> 0); return null;
+      // op117/118 (exe ECL cases 0x74/0x75, all.c:9292-9346): the effectId
+      // (local_c[3]) and count (local_c[4]) are variable-resolvable operands —
+      // the exe routes each through FUN_0040d750 when its param-mask bit is set
+      // (bit1 effectId, bit2 count). Reading them raw made a dynamic-count site
+      // `ins_117(17,[10030],…)` request a literal 10030 particles (var slot
+      // 10030 = vars[19]) — 260 such calls, capped to 64 each, burned ~99.8k
+      // RNG draws (62% of the whole stage), scrambling the shared stream. The
+      // color is NOT var-resolved (exe reads it via FUN_0040dda0) — keep it raw.
+      case 117: game.spawnEffectParticles(gi(0), e.x, e.y, gi(4), v.u32(a + 8) >>> 0); return null;
+      case 118: game.spawnEffectParticles(gi(0), e.x + gf(12), e.y + gf(16), gi(4), v.u32(a + 8) >>> 0); return null;
       case 119: this.dropPowerItems(game, e, Math.trunc(this.varRead(game, e, v.i32(a)))); return null;
       case 120: s.anmRotateWithAngle = !!v.i32(a); return null;
       case 121: // immediate bullet-effect call (table @ 0x495148)

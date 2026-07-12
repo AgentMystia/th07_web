@@ -129,6 +129,26 @@ export async function runStage(rpy, stageIndex, opts = {}) {
     };
   }
 
+  // Optional per-effectId RNG profiling: wrap spawnEffectParticles and bucket
+  // the rngDraws delta by effectId, plus tally call/particle counts. Since the
+  // whole engine draws from ONE stream (confirmed: all 147 exe call sites pass
+  // state 0x495e00), an effect type that draws the wrong count per particle
+  // shifts every later gameplay draw that frame — so this bucket breakdown
+  // localizes where our stage-1 draw budget diverges from the exe's.
+  const rngProfile = opts.profileRng ? new Map() : null;
+  if (rngProfile) {
+    const origSpawn = scene.spawnEffectParticles.bind(scene);
+    scene.spawnEffectParticles = (effectId, x, y, count, color) => {
+      const before = rngDraws;
+      origSpawn(effectId, x, y, count, color);
+      const rec = rngProfile.get(effectId) ?? { calls: 0, particles: 0, draws: 0 };
+      rec.calls++;
+      rec.particles += Math.max(0, count | 0);
+      rec.draws += rngDraws - before;
+      rngProfile.set(effectId, rec);
+    };
+  }
+
   let completed = false;
   let carryOut = null;
   let exited = false;
@@ -144,7 +164,7 @@ export async function runStage(rpy, stageIndex, opts = {}) {
   const deaths = [];
   const bombs = [];
   // Our sim's per-frame event streams, mirroring the replay aux-word oracle
-  // (RPY_AUX_BITS): kill frames (hp<=0 removals) and item-collect frames.
+  // (RPY_AUX_BITS): kill frames (enemy-slot-vacate events) and item collects.
   const killFrames = [];
   const collectFrames = [];
   let prevEnemies = new Map();
@@ -156,6 +176,34 @@ export async function runStage(rpy, stageIndex, opts = {}) {
 
   let f = 0;
   let extraFrames = 0;
+
+  // Precise aux-0x20 ("enemy slot vacated") oracle. The exe sets it at three
+  // sites (all.c 13887/14351/14360). Two are distinct in TIME per enemy:
+  //   (A) 14351/14360 — the HP-kill switch, exactly once per killEnemy() call
+  //       (all death modes). Mode 0 also removes the actor the SAME frame;
+  //       modes 1-3 retain a scripted-death husk (killEnemy returns true).
+  //   (B) 13887 via 14050/14133 — natural ECL exit or off-screen+trail cull,
+  //       fired when the slot is finally freed. For a mode-1/2/3 kill this is
+  //       a SECOND, later event; for a pure despawn it is the only event.
+  // Array-membership diffing alone (below) sees only removals, so it misses
+  // (A) for modes 1-3 entirely — the enemy-audit RE confirmed this blind spot.
+  // Tap killEnemy() directly for (A); the removal diff supplies (B), skipping
+  // the same-frame mode-0 removal already counted at its call.
+  const killCallFrame = new Map(); // enemy id -> frame killEnemy() fired (A)
+  const killModeTally = { 0: 0, 1: 0, 2: 0, 3: 0 };
+  {
+    const origKill = scene.runtime.killEnemy.bind(scene.runtime);
+    scene.runtime.killEnemy = (g, e) => {
+      // interactable===false is the exe's death gate (all.c:14303); such a
+      // call is a no-op that never reaches the switch, so it fires no aux bit.
+      if (e.ecl.interactable) {
+        killFrames.push(f);
+        killCallFrame.set(e.id, f);
+        killModeTally[e.ecl.deathMode & 7] = (killModeTally[e.ecl.deathMode & 7] ?? 0) + 1;
+      }
+      return origKill(g, e);
+    };
+  }
   for (; f < stage.inputs.length + graceFrames; f++) {
     const word = f < stage.inputs.length ? stage.inputs[f] : 0;
     if (f >= stage.inputs.length) extraFrames++;
@@ -170,9 +218,13 @@ export async function runStage(rpy, stageIndex, opts = {}) {
     prevLives = scene.playerObj.lives;
     prevBombs = scene.playerObj.bombs;
     {
+      // (B) enemy-slot free: count every removal EXCEPT the same-frame mode-0
+      // removal whose (A) fire was already recorded at the killEnemy() call.
       const cur = new Map();
       for (const e of scene.enemies) cur.set(e.id, e);
-      for (const [id, e] of prevEnemies) if (!cur.has(id) && e.hp <= 0) killFrames.push(f);
+      for (const [id] of prevEnemies) {
+        if (!cur.has(id) && killCallFrame.get(id) !== f) killFrames.push(f);
+      }
       prevEnemies = cur;
       const items = new Map();
       for (const it of scene.items) items.set(it.id, it);
@@ -202,8 +254,14 @@ export async function runStage(rpy, stageIndex, opts = {}) {
     bombs,
     hits: scene.hitLog,
     killFrames,
+    killModeTally,
     collectFrames,
     rngDraws,
+    rngProfile: rngProfile
+      ? [...rngProfile.entries()]
+          .map(([effectId, rec]) => ({ effectId, ...rec }))
+          .sort((a, b) => b.draws - a.draws)
+      : null,
     wallMs: performance.now() - start,
     scene
   };
