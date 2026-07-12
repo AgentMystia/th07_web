@@ -159,6 +159,23 @@ for (let i = 0; i < rpy.stages.length; i++) {
     alignment[name] = { oracle: oracle.length, ours: ourFrames.length, matched, firstGap };
   }
 
+  // RNG draw budget: the recorder snapshots the live RNG per stage, so the
+  // LCG step count between adjacent stage seeds is the original's exact
+  // total draw count for this stage (known mod 65536, the LCG's period).
+  let rngBudget = null;
+  const next = rpy.stages[i + 1];
+  if (next) {
+    let s = stage.rngSeed;
+    for (let n = 1; n <= 65536; n++) {
+      const a = (s ^ 0x9630) - 0x6553 & 0xffff;
+      s = (((a & 0xc000) >> 14) + a * 4) & 0xffff;
+      if (s === next.rngSeed) {
+        rngBudget = { residue: n, ourDraws: r.rngDraws, ourResidue: r.rngDraws % 65536 };
+        break;
+      }
+    }
+  }
+
   if (traceLines.length || dumped) {
     mkdirSync(outDir, { recursive: true });
     if (traceLines.length) {
@@ -207,6 +224,12 @@ for (let i = 0; i < rpy.stages.length; i++) {
     console.log(
       `  ${name}: oracle ${a.oracle}, ours ${a.ours}, matched±3f ${a.matched}` +
         (a.firstGap !== null ? ` — first unmatched oracle event @${a.firstGap}` : '')
+    );
+  }
+  if (rngBudget) {
+    console.log(
+      `  rng draws: ours ${rngBudget.ourDraws} (≡${rngBudget.ourResidue} mod 65536), ` +
+        `original ≡${rngBudget.residue} — Δresidue ${rngBudget.residue - rngBudget.ourResidue}`
     );
   }
   if (r.deaths.length) {

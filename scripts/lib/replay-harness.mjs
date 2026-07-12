@@ -117,6 +117,18 @@ export async function runStage(rpy, stageIndex, opts = {}) {
   scene.mode = 'arcade';
   applySnapshot(scene, rpy, stageIndex);
 
+  // RNG draw counter: every consumer bottoms out in u16(), and the recorder
+  // snapshots the LIVE RNG state per stage — so the LCG step count between
+  // adjacent stage seeds is the original's total draw budget (mod 65536).
+  let rngDraws = 0;
+  {
+    const orig = scene.rng.u16.bind(scene.rng);
+    scene.rng.u16 = () => {
+      rngDraws++;
+      return orig();
+    };
+  }
+
   let completed = false;
   let carryOut = null;
   let exited = false;
@@ -191,6 +203,7 @@ export async function runStage(rpy, stageIndex, opts = {}) {
     hits: scene.hitLog,
     killFrames,
     collectFrames,
+    rngDraws,
     wallMs: performance.now() - start,
     scene
   };
