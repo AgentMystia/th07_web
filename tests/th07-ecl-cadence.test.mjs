@@ -141,6 +141,83 @@ test('op91 clears the global flag for every later emitter', () => {
     'post-spell fire is rank-scaled again');
 });
 
+// --- Real-data fixtures (stage 2 ECL, PLAN.md CADENCE-001) ---------------
+
+function makeRealRuntime(stageNumber) {
+  return new StageRuntime(TH07_DATA.stages[stageNumber], { etama, enemy: noAnm, effect: noAnm });
+}
+
+test('Sub36 (stage-2 road, Lunatic): op74(100) scales to 120, first auto-fire at update 120-r, HP gate freezes', () => {
+  const runtime = makeRealRuntime(2);
+  const game = makeHost();
+  const r = 37; // fixed op74 initial phase
+  game.rng.u32InRange = () => r;
+  const e = runtime.spawnEclEnemy(game, { subId: 36, x: 100, y: 60, life: 60 });
+  assert.equal(game.enemyBullets.length, 0, 'op75 suppressed the immediate FIRE');
+  // First volley lands on update 120-r; none earlier.
+  for (let k = 1; k < 120 - r; k++) {
+    runtime.updateEnemy(game, e);
+    assert.equal(game.enemyBullets.length, 0, `no fire at update ${k}`);
+  }
+  runtime.updateEnemy(game, e);
+  assert.equal(game.enemyBullets.length, 10, 'first volley: count1*count2 = 2*5 bullets');
+  assert.ok(game.enemyBullets.every((b) => b.sprite === 3 && b.spriteOffset === 10), 'Lunatic template 3:10');
+  // Steady cadence: next volley exactly 120 updates later.
+  for (let k = 1; k < 120; k++) {
+    runtime.updateEnemy(game, e);
+    assert.equal(game.enemyBullets.length, 10, `steady interval (update +${k})`);
+  }
+  runtime.updateEnemy(game, e);
+  assert.equal(game.enemyBullets.length, 20, 'second volley exactly 120 ECL ticks later');
+  // HP=0 freezes the timer and never back-fills the round.
+  e.hp = 0;
+  for (let k = 0; k < 200; k++) runtime.updateEnemy(game, e);
+  assert.equal(game.enemyBullets.length, 20, 'no fire while dead');
+  e.hp = 60;
+  for (let k = 1; k < 120; k++) {
+    runtime.updateEnemy(game, e);
+    assert.equal(game.enemyBullets.length, 20, 'timer resumes from its frozen phase');
+  }
+  runtime.updateEnemy(game, e);
+  assert.equal(game.enemyBullets.length, 30, 'full interval after revival');
+});
+
+test('Sub58 (晴明大紋): both volleys fire on the wall schedule shifted by the CALL[2] flash loop', () => {
+  // The spell declares at local t=120; each CALL[2] (the 30-iteration
+  // SE+flash helper, 4 ticks/iteration) costs ~120 WALL frames inside the
+  // callee before the volley CALLs at t=250-290 / t=390-430 run. The exe
+  // pays the same cost — its op2/op3 jumps re-enter the eval loop at
+  // LAB_0040f83a exactly like the port's 'flow' continue — so the second
+  // volley legitimately lands ~120 frames after its local time. This
+  // fixture pins the schedule; PLAN.md's original offsets (effect at
+  // declAge 219-221) were mis-derived without the flash-loop cost.
+  const runtime = makeRealRuntime(2);
+  const game = makeHost();
+  const e = runtime.spawnEclEnemy(game, { subId: 58, x: 192, y: 128, life: 2200 });
+  const count = (off) => game.enemyBullets.filter((b) => b.sprite === 6 && b.spriteOffset === off && !b.dead).length;
+  let firstV1 = -1;
+  let v1Done = -1;
+  let firstV2 = -1;
+  let v2Done = -1;
+  // One lap only: Sub58's op2 at t=550 loops the whole attack back to
+  // t=240, so a longer window would double-count the next lap's volleys.
+  for (let k = 1; k <= 620; k++) {
+    runtime.updateEnemy(game, e);
+    if (firstV1 < 0 && count(8) > 0) firstV1 = k;
+    if (v1Done < 0 && count(8) === 345) v1Done = k;
+    if (firstV2 < 0 && count(4) > 0) firstV2 = k;
+    if (v2Done < 0 && count(4) === 345) v2Done = k;
+  }
+  assert.equal(count(8), 345, 'volley 1: 5 CALLs x 69 bullets, offset 8');
+  assert.equal(count(4), 345, 'volley 2: 5 CALLs x 69 bullets, offset 4');
+  // The sub enters at local t=122 (the Lunatic declare path jumps there),
+  // so with the ~120-frame first flash loop, t=250's volley lands at wall
+  // ~250: the stall exactly cancels the 122-tick head start.
+  assert.ok(firstV1 > 240 && firstV1 < 265, `volley 1 wall start (${firstV1})`);
+  assert.ok(firstV2 - v1Done > 90, `volley 2 waits out the second flash loop (${v1Done} -> ${firstV2})`);
+  assert.ok(v2Done > 0, `volley 2 completes (${v2Done})`);
+});
+
 test('op93 resolves variable life/item/score (stage-5 wrapper->child relay, COMBAT-001)', () => {
   // The stage-5 pattern: an invisible wrapper carries the timeline's real
   // HP/item/score in its own hp/itemDrop/score fields and passes them to
