@@ -56,6 +56,15 @@ const ITEM_SPRITES: Record<ItemType, number> = {
 // Per-type offscreen indicator arrows sit 10 embedded ids after their item
 // (emb14-21, same order) — drawn while an item is still above the top edge.
 const ITEM_ARROW_OFFSET = 10;
+// exe-exact RNG draw cost (raw u16) per particle for the ambient effect types
+// ECL op117/118 spawn, = the DAT_00494fb0 spawnVetoFn's draw count (binary-read
+// confirmed; the paired perFrameGateFns draw ZERO). Only the effectIds stage 1
+// actually uses are listed; id22's real cost branches on launch vx sign
+// (handled at the call site). Effect draws share the gameplay RNG stream, so
+// these counts are load-bearing for bullet/fire alignment, not cosmetic.
+//   17 → FUN_00419bc0 (1 frand, discarded); 20 → FUN_0041a210 (10 frand+1 u32);
+//   22 → FUN_0041b020 (2 or 4).
+const EFFECT_DRAW_COST: Record<number, number> = { 17: 2, 20: 22, 22: 2 };
 const CLEAR_LOADING_ANM = ['loading', 'loading2', 'loading3'] as const;
 
 // SE slot table, Th07.exe @ 0x494a78 (38 entries × 8 bytes: {i32 wavIndex,
@@ -882,15 +891,77 @@ export class StageScene implements GameHost {
     });
   }
 
-  spawnEffectParticles(effectId: number, x: number, y: number, count: number, color: number): void {
-    // Approximation of the original etama-based effect scripts (documented
-    // deviation, to be refined): simple drifting/fading particles.
+  spawnEffectParticles(
+    effectId: number,
+    x: number,
+    y: number,
+    count: number,
+    color: number,
+    seed?: { x: number; y: number; z: number }
+  ): void {
+    // The whole engine draws from ONE RNG stream (all 147 exe call sites share
+    // state 0x495e00), so a decorative effect that consumes the wrong number of
+    // draws desyncs every later GAMEPLAY draw that frame. These are the etama
+    // ambient particles allocated by exe FUN_0041b320/FUN_0041b560 (ECL op
+    // 117/118) out of a 400-slot pool; each allocated particle draws exactly
+    // its DAT_00494fb0 spawnVetoFn count, and the per-frame gate functions for
+    // the types stage 1 uses draw ZERO (binary-read confirmed). We reproduce
+    // the exe DRAW COUNT exactly; the visual is an approximation. Because every
+    // draw is one seed step, drawing N raw u16 == the exe's frand/u32 mix
+    // summing to N — stream-identical regardless of the visual mapping.
+    const spec = EFFECT_DRAW_COST[effectId];
+    if (spec !== undefined) {
+      // exe caps at free pool slots (<=400); stage-1 per-call counts are <=64,
+      // within our visual cap, so this bound never trims a real draw here.
+      const n = Math.min(Math.max(0, count | 0), 64);
+      // effectId 22 (FUN_0041b020): 4 raw draws when the launch velocity.x <= 0
+      // (its `+600` field, seeded from op118's operand — DAT_0048ec28 == 0.0),
+      // else 2. Other spec'd types are a fixed raw count (id17=2, id20=22).
+      const perParticle = effectId === 22 ? (!seed || seed.x <= 0 ? 4 : 2) : spec;
+      const snow = perParticle >= 12;
+      for (let i = 0; i < n; i++) {
+        // Draw EXACTLY `perParticle` raw u16 — one seed step each, so this
+        // matches the exe spawnVetoFn's frand/u32 mix seed-for-seed. Map the
+        // first two draws to a drift velocity (visual only).
+        let vx = 0;
+        let vy = 0;
+        for (let d = 0; d < perParticle; d++) {
+          const r = this.rng.u16();
+          if (d === 0) {
+            const ang = (r / 65536) * Math.PI * 2;
+            vx = Math.cos(ang);
+            vy = Math.sin(ang);
+          } else if (d === 1) {
+            const sp = (0.3 + (r / 65536) * 0.9) * this.slowRate;
+            vx *= sp;
+            vy *= sp;
+          }
+        }
+        if (seed) {
+          vx += seed.x * 0.02;
+          vy += seed.y * 0.02;
+        }
+        this.particles.push({
+          id: this.id++,
+          x,
+          y,
+          vx,
+          vy,
+          age: 0,
+          life: snow ? 180 : 24,
+          color,
+          size: snow ? 3 : 2,
+          kind: snow ? 'snow' : 'spark'
+        });
+      }
+      return;
+    }
+    // Not-yet-RE'd effectIds (bomb/deathbomb/enemy-death bursts 0/2/3/5/6/12/16):
+    // legacy approximation. Draw counts here are NOT exe-verified — tracked as
+    // the remaining stage-1 budget gap (id3 enemy-death is the largest).
     const isSnow = effectId >= 18;
     for (let i = 0; i < Math.min(count, 64); i++) {
       const angle = this.rng.range(Math.PI * 2);
-      // Decorative particles bake the current slow rate into their spawn
-      // velocity and then tick at wall clock (exe FUN_004194d0 family /
-      // FUN_00419650; spec-slowmo.md §3.4.5).
       const speed = (isSnow ? 0.2 + this.rng.range(0.5) : 0.5 + this.rng.range(2)) * this.slowRate;
       this.particles.push({
         id: this.id++,

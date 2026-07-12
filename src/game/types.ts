@@ -173,7 +173,17 @@ export interface GameHost {
   setSlowRate?(rate: number): void;
   addScore(v: number): void;
   spawnItem(type: ItemType, x: number, y: number, options?: { state?: number; vx?: number; vy?: number; tweenTarget?: { tx: number; ty: number } }): void;
-  spawnEffectParticles(effectId: number, x: number, y: number, count: number, color: number): void;
+  // seed = op118's 3-float operand (exe writes it to the particle's velocity-
+  // seed field +0x96/97/98, NOT a position offset); op117 passes none. Some
+  // effect types' per-particle RNG draw count branches on its x sign.
+  spawnEffectParticles(
+    effectId: number,
+    x: number,
+    y: number,
+    count: number,
+    color: number,
+    seed?: { x: number; y: number; z: number }
+  ): void;
   playSfx(id: number): void;
   startDialogue?(index: number): void;
   isDialogueBlocking?(): boolean;

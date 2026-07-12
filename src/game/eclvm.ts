@@ -1955,7 +1955,11 @@ export class StageRuntime {
       // RNG draws (62% of the whole stage), scrambling the shared stream. The
       // color is NOT var-resolved (exe reads it via FUN_0040dda0) — keep it raw.
       case 117: game.spawnEffectParticles(gi(0), e.x, e.y, gi(4), v.u32(a + 8) >>> 0); return null;
-      case 118: game.spawnEffectParticles(gi(0), e.x + gf(12), e.y + gf(16), gi(4), v.u32(a + 8) >>> 0); return null;
+      // op118's 3 floats (local_c[6..8]) are a velocity/direction SEED written
+      // to the particle's +0x96/97/98 field (exe FUN_0041b560, all.c:12184),
+      // NOT a spawn-position offset — position is the raw enemy xyz. Some effect
+      // types (id22) branch their RNG draw count on the seed's x sign.
+      case 118: game.spawnEffectParticles(gi(0), e.x, e.y, gi(4), v.u32(a + 8) >>> 0, { x: gf(12), y: gf(16), z: gf(20) }); return null;
       case 119: this.dropPowerItems(game, e, Math.trunc(this.varRead(game, e, v.i32(a)))); return null;
       case 120: s.anmRotateWithAngle = !!v.i32(a); return null;
       case 121: // immediate bullet-effect call (table @ 0x495148)
