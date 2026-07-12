@@ -400,12 +400,37 @@ comparisons against real play).
   stream (state 0x495e00) so a wrong draw count desyncs bullet/fire timing.
   Costs are the `DAT_00494fb0` spawnVetoFn (binary-read; paired perFrameGateFn
   draws 0): effectId 17→2, 20→22, 22→2-or-4 (4 if launch vx≤0). `EFFECT_DRAW_COST`
-  in stage-scene.ts. STILL APPROXIMATE (draw count NOT yet exe-verified, the
-  open stage-1 RNG-budget gap): the enemy-death burst (`spawnEnemyDeathEffect`,
-  legacy id3×12 — exe is effectId 4×7+0×1=28 draws interleaved with the item
-  drop, needs killEnemy reordered) and id5 (impact spark, provenance unknown).
-  Measure with `node scripts/replay-verify.mjs --stage 1 --ghost` (prints
-  `rng draws: ours N … original ≡R`); stage-1 budget is 163,385.
+  in stage-scene.ts. The full effect-family veto costs (binary, effect table @
+  file 0x933b0): ids 0/1/2 NULL=0; id3=FUN_00419700=4; id4/5/6=FUN_004194d0=4.
+  **Draw-model DERIVED + VERIFIED, wiring BLOCKED on draw order** (2026-07-12):
+  - **Enemy death** (`spawnEnemyDeathEffect`, legacy id3×12=72). Exe FUN_0041ed50
+    per-enemy death switch (all.c 14310-14370), default fairy: id0×1 (0) + id4×4
+    (16) ALWAYS, + id4×6 (24) + a 0-draw item every 3rd death (GLOBAL manager
+    counter %3, deaths #0,3,6…). = 16 draws ⅔ / 40 draws ⅓. The prior "28-draw"
+    note was the WRONG branch (0x2e10≥0 custom-death-script; plain fairies use
+    0x2e10=−1). Items are NOT rand-scattered (`FUN_00430970` mode-2 unreachable
+    from death). Fire is exact already: op67 aimMode-3 deterministic (0 draws);
+    op74 draws u32InRange ONCE at arm (2), autofire re-arm to 0 (not re-random).
+  - **id5 impact spark**: exe spawns it in the player-shot-vs-enemy collision
+    `FUN_0043a980` (all.c:14176) — one id5/id3 (both 4 draws) per bullet's first
+    enemy hit + every 4th hit (global `&3` counter, id3 if slot<96 else id5). Our
+    first-hit spark (stage-scene 2067) matches per-bullet; laser/missile cadences
+    (%8, %6) are Sakuya-irrelevant.
+  - **THE BLOCKER — draw ORDER.** `FUN_0043a980` runs INSIDE the enemy manager,
+    PER ENEMY in slot order: fire → player-shot collision+damage (id5) → death
+    (id0/id4), with IMMEDIATE damage. Our engine runs a SEPARATE
+    `updatePlayerBullets` collision pass with DEFERRED (next-frame) damage, so
+    id5/death/snow draws interleave in a different stream order. Snow (id20) IS
+    exe-faithful (deterministic Sub1 loops, matches to the particle pre-1800).
+    Wiring the death/cost model in ISOLATION only shifts the hypersensitive
+    first-death frame (1938→1762) — no alignment gain. NEXT STEP: restructure
+    collision into the enemy loop (per-enemy, immediate damage) so id5/death land
+    in exe order, THEN apply the death model + `EFFECT_DRAW_COST {0-6}` together.
+  - CAUTION: the ghost full-stage budget (163,385) is CONFOUNDED — a post-boss
+    dialogue freezes our sim ~3400f, starving snow the exe also freezes. Judge
+    pre-1800 by the non-ghost first-death frame, not the aggregate. Decompose
+    pre-1800 draws with a spawnEffectParticles hook (see tmp/nonsnow-1800.mjs
+    pattern): @1800 = snow 33704 (faithful) + death 1640 + id5 + gameplay 140.
 
 ## 8. Pitfall catalog (check these FIRST when something looks wrong)
 
@@ -437,10 +462,21 @@ comparisons against real play).
   (op94/op91/boss non-spell death) must only set HP=0, not delete;
   non-interactable enemies (op116(0)) are spared by the exe (removal is the
   interactable-gated death switch). Deleting them kills ambient emitters.
-- **A death "fix" moves the first divergence EARLIER** → whack-a-mole of RNG
-  desync: changing draw counts shifts WHICH enemy's `rand%interval` fire (op74)
-  clips the player. Judge by the ghost-run budget/alignment, not one death
-  frame; the real win is total per-event draw fidelity.
+- **A death "fix" moves the first divergence EARLIER** → the stage-1 first-death
+  frame (1938) is a HYPERSENSITIVE, NON-MONOTONIC proxy: it's a *lucky* desync
+  (the old wrong death draws happened to make the killing op74 fairy fire
+  survivably). ANY draw-count change — even an exe-VERIFIED one — reshuffles
+  which fairy's `rand%interval` clips the player, so correct fixes regress it.
+  Do NOT chase this frame with isolated fixes. Alignment is all-or-nothing:
+  every pre-1800 draw must match in COUNT *and* STREAM ORDER simultaneously.
+  Snow is faithful; the remaining stage-1 desync is draw ORDER — the exe does
+  player-shot collision (id5) + death PER-ENEMY inside the enemy loop with
+  immediate damage (§7), which our separate deferred-damage pass reorders.
+- **The ghost full-stage RNG budget disagrees with reality** → it's CONFOUNDED
+  past the boss: a post-boss dialogue freezes our sim ~3400 frames (6856→10259
+  in ghost), starving the snow generator that the exe *also* freezes, so
+  ~26k "missing" draws are a ghost-timing artifact, not fidelity. Measure
+  pre-1800 (non-ghost first-death) instead.
 - **Probe reads flat where content belongs** → check the snapshot first:
   if the simulation state is right (entities exist), the defect is in
   rendering (anchor, entry-scoped ids, clip, alpha); if the state is wrong

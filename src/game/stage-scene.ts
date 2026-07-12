@@ -64,6 +64,14 @@ const ITEM_ARROW_OFFSET = 10;
 // these counts are load-bearing for bullet/fire alignment, not cosmetic.
 //   17 → FUN_00419bc0 (1 frand, discarded); 20 → FUN_0041a210 (10 frand+1 u32);
 //   22 → FUN_0041b020 (2 or 4).
+// NOTE (2026-07-12, verified this session but NOT yet wired in — see
+// spawnEnemyDeathEffect): the death/impact family ids 0-6 read the same table
+// (binary @ file 0x933b0): ids 0/1/2 vetoFn NULL = 0 draws; id3 → FUN_00419700
+// (2 frand = 4); ids 4/5/6 → FUN_004194d0 (2 frand = 4); shared gate zero. The
+// legacy spawnEffectParticles path draws 6 for id3/id5 — off by 2/particle. Not
+// corrected yet because it can't help alignment without the per-enemy
+// collision-order restructure (see spawnEnemyDeathEffect), and in isolation it
+// only shifts the hypersensitive first-death frame.
 const EFFECT_DRAW_COST: Record<number, number> = { 17: 2, 20: 22, 22: 2 };
 const CLEAR_LOADING_ANM = ['loading', 'loading2', 'loading3'] as const;
 
@@ -1134,15 +1142,31 @@ export class StageScene implements GameHost {
   }
 
   spawnEnemyDeathEffect(e: Enemy): void {
-    // APPROXIMATION (documented). The exe death switch spawns 3+1+4 particles
-    // of effect types (0x2e15+4)/0x2e14/(0x2e15+4) (all.c:14339/14369/14370),
-    // default types 0/0 -> effectId 4 (4 draws) x7 + effectId 0 (0 draws) x1 =
-    // 28 raw draws, INTERLEAVED with the item drop (14340). A first cut that
-    // used the exact 28-draw count but our current all-effects-after-items
-    // order moved the stage-1 first death EARLIER (1938->1768): the draw ORDER
-    // within a death matters, so this needs killEnemy restructured (effect-3
-    // BEFORE the item scatter draws) — tracked as a follow-up. Until then keep
-    // the legacy burst so as not to regress.
+    // APPROXIMATION (id3×12 = 72 raw draws). The EXE-EXACT model is now fully
+    // derived + agent/binary-verified (2026-07-12) but deliberately NOT wired
+    // in — implementing it in isolation regresses the (hypersensitive,
+    // non-monotonic) stage-1 first-death frame without fixing alignment,
+    // because the draws land in the WRONG STREAM ORDER (see below).
+    //
+    // Verified exe model — FUN_0041ed50 per-enemy death switch (all.c
+    // 14310-14370), default fairy (death bytes 0x2e14=0 -> effectId 0,
+    // 0x2e15=0 -> id 0x2e15+4 = 4, death-script 0x2e10 = -1):
+    //   - every 3rd death (GLOBAL manager counter deaths #0,3,6…, all.c 14326,
+    //     deterministic — not random): id4×6 (24 draws) + FUN_00430970 item
+    //     (param_4 = local_18 = 0 -> 0 draws), BEFORE the always pair.
+    //   - ALWAYS (all.c 14369-14370): id0×1 (0) + id4×4 (16).
+    //   => 16 draws ⅔ of the time, 40 draws ⅓. Per-particle veto costs (binary
+    //   effect table @ file 0x933b0): id0/1/2 NULL=0; id3=FUN_00419700=4;
+    //   id4/5/6=FUN_004194d0=4. FUN_0041b320 has no per-call draw.
+    //
+    // WHY IT'S BLOCKED: the exe draws enemy fire, THEN player-shot collision +
+    // damage (FUN_0043a980 @ all.c:14176, spawning id5), THEN death effects —
+    // ALL per-enemy, in slot order, with IMMEDIATE damage. Our engine runs a
+    // separate updatePlayerBullets collision pass with DEFERRED (next-frame)
+    // damage, so id5/death draws interleave against snow/fire in a different
+    // order. Aligning stage 1 needs that collision-loop restructure first;
+    // then this exact death model + EFFECT_DRAW_COST {0-6} become correct
+    // together. Tracked in AGENTS.md §7.
     this.spawnEffectParticles(3, e.x, e.y, 12, 0xffffffff);
   }
 
