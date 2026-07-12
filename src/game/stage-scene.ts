@@ -456,6 +456,9 @@ export class StageScene implements GameHost {
   // Player-wide hit tally (exe player+0x240c): beams/attack slots pop a
   // spark on every 8th (lasers) / 4th (bomb slots) accumulated hit.
   private playerHitTally = 0;
+  // VALIDATION-EXPERIMENT: gates collidePlayerShots (set per frame from
+  // updatePlayerBullets' `collide` arg — false while a dialogue box is up).
+  private shotCollisionEnabled = true;
   // Committed player hits with the striking entity's provenance — the primary
   // localization signal for replay-golden divergences (a replayed player only
   // dies where our simulation disagrees with the original). Ring-capped at 64.
@@ -1142,31 +1145,18 @@ export class StageScene implements GameHost {
   }
 
   spawnEnemyDeathEffect(e: Enemy): void {
-    // APPROXIMATION (id3×12 = 72 raw draws). The EXE-EXACT model is now fully
-    // derived + agent/binary-verified (2026-07-12) but deliberately NOT wired
-    // in — implementing it in isolation regresses the (hypersensitive,
-    // non-monotonic) stage-1 first-death frame without fixing alignment,
-    // because the draws land in the WRONG STREAM ORDER (see below).
-    //
-    // Verified exe model — FUN_0041ed50 per-enemy death switch (all.c
-    // 14310-14370), default fairy (death bytes 0x2e14=0 -> effectId 0,
-    // 0x2e15=0 -> id 0x2e15+4 = 4, death-script 0x2e10 = -1):
-    //   - every 3rd death (GLOBAL manager counter deaths #0,3,6…, all.c 14326,
-    //     deterministic — not random): id4×6 (24 draws) + FUN_00430970 item
-    //     (param_4 = local_18 = 0 -> 0 draws), BEFORE the always pair.
-    //   - ALWAYS (all.c 14369-14370): id0×1 (0) + id4×4 (16).
-    //   => 16 draws ⅔ of the time, 40 draws ⅓. Per-particle veto costs (binary
-    //   effect table @ file 0x933b0): id0/1/2 NULL=0; id3=FUN_00419700=4;
-    //   id4/5/6=FUN_004194d0=4. FUN_0041b320 has no per-call draw.
-    //
-    // WHY IT'S BLOCKED: the exe draws enemy fire, THEN player-shot collision +
-    // damage (FUN_0043a980 @ all.c:14176, spawning id5), THEN death effects —
-    // ALL per-enemy, in slot order, with IMMEDIATE damage. Our engine runs a
-    // separate updatePlayerBullets collision pass with DEFERRED (next-frame)
-    // damage, so id5/death draws interleave against snow/fire in a different
-    // order. Aligning stage 1 needs that collision-loop restructure first;
-    // then this exact death model + EFFECT_DRAW_COST {0-6} become correct
-    // together. Tracked in AGENTS.md §7.
+    // APPROXIMATION (id3×12 = 72 raw draws) — STILL the legacy burst. The
+    // per-enemy collision restructure (see updateEnemies / collidePlayerShots)
+    // is now in place, so id5/death draws DO interleave in exe order; but wiring
+    // the exact death model below on top of it REDUCED the ghost kill-match
+    // (131→101) because the id5 impact-spark CADENCE isn't exe-exact yet (exe
+    // FUN_0043a980: per-bullet first-hit id5 [ours matches] PLUS every-4th-hit
+    // id3/id5 via a global counter). Add the death model + id5 every-4th cadence
+    // TOGETHER, then re-measure. Verified exe death model — FUN_0041ed50 death
+    // switch (all.c 14310-14370), default fairy (0x2e14=0→id0, 0x2e15=0→id4,
+    // 0x2e10=-1): id0×1 (0) + id4×4 (16) ALWAYS, + id4×6 (24) + 0-draw item on a
+    // GLOBAL 1-in-3 counter (deaths #0,3,6…). Veto costs (effect table @ file
+    // 0x933b0): id0/1/2 NULL=0; id3=FUN_00419700=4; id4/5/6=FUN_004194d0=4.
     this.spawnEffectParticles(3, e.x, e.y, 12, 0xffffffff);
   }
 
@@ -1467,8 +1457,11 @@ export class StageScene implements GameHost {
       const borderBonus = this.cherry.tick(this.slowRate);
       if (borderBonus > 0) this.addScore(borderBonus);
       this.runtime.update(this);
-      this.updateEnemies();
+      // VALIDATION-EXPERIMENT: player-shot MOVEMENT first (exe FUN_0043a290 in
+      // the player subsystem), THEN the enemy manager whose per-enemy pass now
+      // does the shot COLLISION (collidePlayerShots) at current bullet positions.
       this.updatePlayerBullets();
+      this.updateEnemies();
       this.updateBullets();
       this.updateLasers();
       this.checkPlayerCollision();
@@ -1979,8 +1972,8 @@ export class StageScene implements GameHost {
       }
     }
     this.homingTargetId = homingTarget?.id ?? null;
-    const anm = this.playerObj.anm;
     const rate = this.slowRate;
+    this.shotCollisionEnabled = collide;
     this.tickLaserSlots();
     for (const b of this.playerBullets) {
       // Player-shot age is a rate-scaled split counter (exe FUN_0043a290
@@ -2017,83 +2010,11 @@ export class StageScene implements GameHost {
         b.dead = true;
         continue;
       }
-      // Hit-test gate, exe FUN_0043a980 @ 0x43a9d1: state 1 (fired) bullets,
-      // plus shotType 3 (MarisaA missile) in EITHER state — the collided
-      // missile keeps dealing contact damage while its explosion plays.
-      if (b.state !== 'fired' && b.shotType !== 3) continue;
-      for (const e of collide ? this.enemies : []) {
-        // Exe shot gate is bit0 (interactable) && bit4 (shotCollision) —
-        // NOT bit1 (collisionEnabled), which only covers body-vs-player.
-        if (!e.ecl.shotCollision || !e.ecl.interactable || e.ecl.invisible || e.dead) continue;
-        const hw = (e.ecl.hitbox.x + b.hitboxW) / 2;
-        const hh = (e.ecl.hitbox.y + b.hitboxH) / 2;
-        if (Math.abs(b.x - e.x) <= hw && Math.abs(b.y - e.y) <= hh) {
-          if (b.shotType === 4 || b.shotType === 5) {
-            // Th07.exe FUN_0043a980: lasers deal FULL table damage on even values
-            // of their own age counter only, never enter 'collided', never spawn
-            // the impact ANM, and pierce (the test continues to further
-            // enemies). FUN_0043a080 (funcs[3]=2) pops a spark at the
-            // beam/enemy crossing every 8th tallied hit.
-            if ((Math.floor(b.age) & 1) === 0) {
-              this.damageEnemy(e, b.damage);
-              if ((++this.playerHitTally & 7) === 0) this.spawnEffectParticles(5, b.x, e.y, 1, 0xffffffff);
-            }
-          } else if (b.state === 'collided') {
-            // Missile re-hit (FUN_00439d80 state-2 branch): even values of
-            // the bullet's own age counter only; the slot damage is
-            // PERMANENTLY /3 (min 1), the explosion slows ×0.88 per
-            // qualifying hit, and a spark pops on ages divisible by 6.
-            if ((Math.floor(b.age) & 1) === 0) {
-              b.damage = Math.max(1, Math.trunc(b.damage / 3));
-              b.vx *= 0.88;
-              b.vy *= 0.88;
-              this.damageEnemy(e, b.damage);
-              if (Math.floor(b.age) % 6 === 0) this.spawnEffectParticles(5, e.x, e.y, 1, 0xffffffff);
-            }
-          } else {
-            // First hit. MarisaA's missile (FUN_00439d80 state-1 branch)
-            // expands its box per sprite id and bursts at a random upward
-            // angle in [-3π/4, -π/4] before the shared hit path runs.
-            if (b.shotType === 3) {
-              const exp = MISSILE_EXPLOSION[b.impactScript - 0x20];
-              if (exp) {
-                b.hitboxW = exp[0];
-                b.hitboxH = exp[0];
-                const ang = this.rng.range(Math.PI / 2) - (3 * Math.PI) / 4;
-                b.vx = Math.cos(ang) * exp[1];
-                b.vy = Math.sin(ang) * exp[1];
-              }
-            }
-            this.damageEnemy(e, b.damage);
-            b.state = 'collided';
-            // Exe impact switch (FUN_0043a980 @ 0x43aa8c): re-arm the VM with
-            // script sprite+0x20 and pop one type-5 particle at the bullet.
-            if (anm.hasScript(b.impactScript)) b.runner = new AnmRunner(anm, b.impactScript);
-            this.spawnEffectParticles(5, b.x, b.y, 1, 0xffffffff);
-            if (b.shotType !== 3) {
-              // Th07.exe: velocity/8 on hit — except shotType 3 (MarisaA missile)
-              // which keeps full velocity into its collided explosion.
-              b.vx /= 8;
-              b.vy /= 8;
-            }
-            this.playSfx(20);
-          }
-          // Beams pierce and the collided missile keeps overlapping — only a
-          // fresh single-hit bullet stops testing further enemies.
-          if (b.shotType !== 3 && b.shotType !== 4 && b.shotType !== 5) break;
-        }
-        // Type-5 helper boxes (FUN_004398e0 → attack slots 0x60+): every
-        // beam-history sample is a 10-wide, full-beam-height, damage-1 box
-        // tested every frame with no parity gate.
-        if (b.shotType === 5 && b.history) {
-          for (const hpt of b.history) {
-            if (Math.abs(hpt.x - e.x) <= (e.ecl.hitbox.x + 10) / 2 &&
-                Math.abs(hpt.y - e.y) <= (e.ecl.hitbox.y + b.hitboxH) / 2) {
-              this.damageEnemy(e, 1, this.playerObj.bombTimer > 0 ? 'bomb' : 'shot');
-            }
-          }
-        }
-      }
+      // VALIDATION-EXPERIMENT: player-shot-vs-enemy collision moved OUT of this
+      // (bullet-outer) pass into collidePlayerShots(e), called PER ENEMY inside
+      // updateEnemies (exe FUN_0043a980 @ all.c:14176 runs inside the enemy
+      // manager, per enemy in slot order, with immediate damage). `collide`
+      // controls it via collisionEnabled below.
       // Bounds cull, exe FUN_0043a290 (FUN_0042bdc7): skipped entirely for
       // the persistent beam types — their lifetime is the laser-slot timer.
       if (b.shotType !== 4 && b.shotType !== 5 &&
@@ -2102,6 +2023,69 @@ export class StageScene implements GameHost {
     let w = 0;
     for (const b of this.playerBullets) if (!b.dead) this.playerBullets[w++] = b;
     this.playerBullets.length = w;
+  }
+
+  // VALIDATION-EXPERIMENT: exe FUN_0043a980 (all.c:14176), called PER ENEMY
+  // inside the enemy manager. Tests every player bullet against ONE enemy,
+  // deals IMMEDIATE damage (accumulated into pending, settled this same frame
+  // before the death check) and spawns the id5 impact spark — so id5/death
+  // draws land in the exe's per-enemy stream order (vs our old bullet-outer
+  // pass). A single-hit bullet becomes 'collided' on its first enemy and is
+  // then skipped by later enemies (replacing the old inner-loop `break`).
+  private collidePlayerShots(e: Enemy): void {
+    if (!this.shotCollisionEnabled) return;
+    if (!e.ecl.shotCollision || !e.ecl.interactable || e.ecl.invisible || e.dead) return;
+    const anm = this.playerObj.anm;
+    for (const b of this.playerBullets) {
+      if (b.dead) continue;
+      if (b.state !== 'fired' && b.shotType !== 3) continue;
+      const hw = (e.ecl.hitbox.x + b.hitboxW) / 2;
+      const hh = (e.ecl.hitbox.y + b.hitboxH) / 2;
+      if (Math.abs(b.x - e.x) <= hw && Math.abs(b.y - e.y) <= hh) {
+        if (b.shotType === 4 || b.shotType === 5) {
+          if ((Math.floor(b.age) & 1) === 0) {
+            this.damageEnemy(e, b.damage);
+            if ((++this.playerHitTally & 7) === 0) this.spawnEffectParticles(5, b.x, e.y, 1, 0xffffffff);
+          }
+        } else if (b.state === 'collided') {
+          if ((Math.floor(b.age) & 1) === 0) {
+            b.damage = Math.max(1, Math.trunc(b.damage / 3));
+            b.vx *= 0.88;
+            b.vy *= 0.88;
+            this.damageEnemy(e, b.damage);
+            if (Math.floor(b.age) % 6 === 0) this.spawnEffectParticles(5, e.x, e.y, 1, 0xffffffff);
+          }
+        } else {
+          if (b.shotType === 3) {
+            const exp = MISSILE_EXPLOSION[b.impactScript - 0x20];
+            if (exp) {
+              b.hitboxW = exp[0];
+              b.hitboxH = exp[0];
+              const ang = this.rng.range(Math.PI / 2) - (3 * Math.PI) / 4;
+              b.vx = Math.cos(ang) * exp[1];
+              b.vy = Math.sin(ang) * exp[1];
+            }
+          }
+          this.damageEnemy(e, b.damage);
+          b.state = 'collided';
+          if (anm.hasScript(b.impactScript)) b.runner = new AnmRunner(anm, b.impactScript);
+          this.spawnEffectParticles(5, b.x, b.y, 1, 0xffffffff);
+          if (b.shotType !== 3) {
+            b.vx /= 8;
+            b.vy /= 8;
+          }
+          this.playSfx(20);
+        }
+      }
+      if (b.shotType === 5 && b.history) {
+        for (const hpt of b.history) {
+          if (Math.abs(hpt.x - e.x) <= (e.ecl.hitbox.x + 10) / 2 &&
+              Math.abs(hpt.y - e.y) <= (e.ecl.hitbox.y + b.hitboxH) / 2) {
+            this.damageEnemy(e, 1, this.playerObj.bombTimer > 0 ? 'bomb' : 'shot');
+          }
+        }
+      }
+    }
   }
 
   // MarisaB laser-slot upkeep, Th07.exe FUN_0043a290 head + the shared
@@ -2467,17 +2451,21 @@ export class StageScene implements GameHost {
   }
 
   private updateEnemies(): void {
-    for (const e of this.enemies) {
-      // Settle last frame's shot/bomb damage through the exe pipeline
-      // before the ECL runs, so life-threshold callbacks see the new HP —
-      // same relative order as Th07.exe FUN_0041ed50 (hit test, damage,
-      // then FUN_0041e4a0/FUN_0041e6b0 callbacks in the same pass).
-      this.settlePendingDamage(e);
-      e.frame++;
-      this.runtime.updateEnemy(this, e);
-    }
+    // VALIDATION-EXPERIMENT: single per-enemy pass matching exe FUN_0041ed50's
+    // enemy loop — fire(ECL) → player-shot collision+id5 → settle(IMMEDIATE
+    // damage this same frame) → death. Player bullets have already MOVED this
+    // frame (updatePlayerBullets now runs before updateEnemies). The old model
+    // settled last frame's damage before the ECL; here the ECL still sees the
+    // prior frame's collision (settled at the end of that enemy's prior
+    // iteration), so the fire-sees-prev-HP ordering is unchanged — what changes
+    // is that death now happens the SAME frame as the killing hit (exe-faithful)
+    // and id5/death draws interleave per enemy.
     for (const e of this.enemies) {
       if (e.dead) continue;
+      e.frame++;
+      this.runtime.updateEnemy(this, e);
+      this.collidePlayerShots(e);
+      this.settlePendingDamage(e);
       const offscreen = e.x < -64 || e.x > 448 || e.y < -64 || e.y > 512;
       // op137 (exe `+0x2e2a` bit7, exe-misc-ecl-ops.md §4): exempts an
       // enemy from this cull even after it's been seen and gone offscreen
