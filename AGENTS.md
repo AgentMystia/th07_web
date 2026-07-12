@@ -394,6 +394,18 @@ comparisons against real play).
 - Supernatural Border ring remains procedural (no ANM source recovered);
   it now closes fully at expiry and the playfield carries the exe's
   30/480/30 tint envelope (FUN_0043e2e0 state 4).
+- Decorative ambient particles (ECL op117/118 → `spawnEffectParticles`): the
+  VISUAL is approximate but the per-particle **RNG draw count is exe-exact**
+  for the types stage 1 uses, because all effects share the one gameplay RNG
+  stream (state 0x495e00) so a wrong draw count desyncs bullet/fire timing.
+  Costs are the `DAT_00494fb0` spawnVetoFn (binary-read; paired perFrameGateFn
+  draws 0): effectId 17→2, 20→22, 22→2-or-4 (4 if launch vx≤0). `EFFECT_DRAW_COST`
+  in stage-scene.ts. STILL APPROXIMATE (draw count NOT yet exe-verified, the
+  open stage-1 RNG-budget gap): the enemy-death burst (`spawnEnemyDeathEffect`,
+  legacy id3×12 — exe is effectId 4×7+0×1=28 draws interleaved with the item
+  drop, needs killEnemy reordered) and id5 (impact spark, provenance unknown).
+  Measure with `node scripts/replay-verify.mjs --stage 1 --ghost` (prints
+  `rng draws: ours N … original ≡R`); stage-1 budget is 163,385.
 
 ## 8. Pitfall catalog (check these FIRST when something looks wrong)
 
@@ -416,6 +428,19 @@ comparisons against real play).
   the constant, re-read the disassembly. Every compensating hack we ever
   added (scroll speed, camera lift, ground mirroring, procedural moon) was
   masking a misread and got replaced by the real semantics.
+- **RNG-budget "matches" but bullets still desync** → the total can be right
+  by cancellation. Profile per-effectId draws (`opts.profileRng` in
+  replay-harness) and match each event's count, not just the sum. A single
+  mis-resolved ECL operand (op117/118 count read raw instead of gi()) once
+  hid a 100k-draw error that summed near budget.
+- **Ambient effect / invisible controller vanishes mid-stage** → field sweeps
+  (op94/op91/boss non-spell death) must only set HP=0, not delete;
+  non-interactable enemies (op116(0)) are spared by the exe (removal is the
+  interactable-gated death switch). Deleting them kills ambient emitters.
+- **A death "fix" moves the first divergence EARLIER** → whack-a-mole of RNG
+  desync: changing draw counts shifts WHICH enemy's `rand%interval` fire (op74)
+  clips the player. Judge by the ghost-run budget/alignment, not one death
+  frame; the real win is total per-event draw fidelity.
 - **Probe reads flat where content belongs** → check the snapshot first:
   if the simulation state is right (entities exist), the defect is in
   rendering (anchor, entry-scoped ids, clip, alpha); if the state is wrong
