@@ -431,6 +431,22 @@ comparisons against real play).
     pre-1800 by the non-ghost first-death frame, not the aggregate. Decompose
     pre-1800 draws with a spawnEffectParticles hook (see tmp/nonsnow-1800.mjs
     pattern): @1800 = snow 33704 (faithful) + death 1640 + id5 + gameplay 140.
+  - SCOPE OF THE FIX (all 6 stages share this — `replay-verify` no-arg triage:
+    first false-death st1@1938 st2@1040 st3@1181 st4@1036 st5@1093 st6@938, ALL
+    the same RNG-stream desync). The "restructure" is really a SLOT-FAITHFUL
+    rewrite of the collision + enemy-manager, and it is all-or-nothing (a
+    hypersensitive metric — no partial credit). Exe frame shape to reproduce:
+    player subsystem `FUN_0043eef0` (bullet MOVE `FUN_0043a290`@29061 → fire
+    `FUN_0043a820` → homing `FUN_0043edc0`), THEN enemy manager `FUN_0041ed50`
+    which, PER ENEMY in slot order, does fire(`FUN_0040f6c0`) → player-shot
+    collision+immediate-damage(`FUN_0043a980`@14176, iterating 96 bullet + 112
+    attack SLOTS, spawning id5) → death(id0/id4). Byte-exactness needs our
+    dynamic bullet/enemy arrays to iterate in the exe's FIXED-SLOT order (slot
+    allocation = first-free ring), plus immediate (not deferred) damage. Our
+    `settlePendingDamage`-before-ECL already preserves the fire-sees-prev-frame-
+    HP ordering, so moving it after the per-enemy collision is safe; the change
+    that matters is same-frame death + per-enemy id5 draw order. This is a
+    dedicated multi-session effort — do NOT wire the death/cost model without it.
 
 ## 8. Pitfall catalog (check these FIRST when something looks wrong)
 
