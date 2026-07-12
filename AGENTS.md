@@ -404,13 +404,19 @@ comparisons against real play).
   file 0x933b0): ids 0/1/2 NULL=0; id3=FUN_00419700=4; id4/5/6=FUN_004194d0=4.
   **Draw-model DERIVED + VERIFIED, wiring BLOCKED on draw order** (2026-07-12):
   - **Enemy death** (`spawnEnemyDeathEffect`, legacy id3×12=72). Exe FUN_0041ed50
-    per-enemy death switch (all.c 14310-14370), default fairy: id0×1 (0) + id4×4
-    (16) ALWAYS, + id4×6 (24) + a 0-draw item every 3rd death (GLOBAL manager
-    counter %3, deaths #0,3,6…). = 16 draws ⅔ / 40 draws ⅓. The prior "28-draw"
-    note was the WRONG branch (0x2e10≥0 custom-death-script; plain fairies use
-    0x2e10=−1). Items are NOT rand-scattered (`FUN_00430970` mode-2 unreachable
-    from death). Fire is exact already: op67 aimMode-3 deterministic (0 draws);
-    op74 draws u32InRange ONCE at arm (2), autofire re-arm to 0 (not re-random).
+    per-enemy death switch (all.c 14324-14370) BRANCHES ON `0x2e10` = **itemDrop**
+    (ECL var 10070, NOT a death-script — this corrects the earlier note):
+    itemDrop==−1 (random; 160 of 208 st1 deaths) → 1-in-3 GLOBAL-counter id4×6 +
+    id0×1 + id4×4 = 16 ⅔ / 40 ⅓; itemDrop≥0 (specific; 47) → id4×3 + id0×1 + id4×4
+    = **28** (= iter-4's "28", which was right for these); itemDrop==−2 (none; 1) →
+    16. id0=0, id4=4 draws; items NOT rand-scattered (`FUN_00430970` mode-2
+    unreachable from death). Fire is exact already: op67 aimMode-3 deterministic
+    (0 draws); op74 draws u32InRange ONCE at arm (2), autofire re-arm to 0.
+    ⚠ EXHAUSTIVELY TESTED (this session, all WITH the restructure): every death
+    model — 16, 28, the correct itemDrop-branched one — gives kill-match ~102, ALL
+    worse than the legacy id3×12's 131. Death draws can't be fixed in isolation:
+    the item→power→DPS→kill-timing ripple means the UPSTREAM stream must be exact
+    first. Do not re-attempt the death model without the full-exact stream.
   - **id5 impact spark**: exe spawns it in the player-shot-vs-enemy collision
     `FUN_0043a980` (all.c:14176) — one id5/id3 (both 4 draws) per bullet's first
     enemy hit + every 4th hit (global `&3` counter, id3 if slot<96 else id5). Our
