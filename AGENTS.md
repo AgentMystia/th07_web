@@ -430,7 +430,19 @@ comparisons against real play).
     death model ON TOP regressed kill-match 131→101 — the exact death model +
     id5 every-4th-hit cadence must go in TOGETHER (and for Sakuya the every-4th
     cadence is empty, so the regression points at the global 1-in-3 death counter
-    or death-draw ordering — investigate before re-wiring).
+    or death-draw ordering — investigate before re-wiring). MEASURED: the id0+id4
+    16-draw model gives kill-match 107 < the legacy id3×12's 131 — tweaking
+    death-draw COUNT is noise-chasing (ghost kill-match ripples RNG→item-scatter
+    →power→DPS→kill-timing; nothing aligns until the WHOLE stream is exact). The
+    restructure's win is instead a DETERMINISTIC timing fix (same-frame death) —
+    that is why it is robust. NEXT PRINCIPLED STEP (validated — enemy PROCESSING
+    order matters: reversing updateEnemies drops kill-match 131→106): make enemy
+    (and bullet) iteration SLOT-FAITHFUL. The exe reuses freed slots (first-free
+    ring); our compacted array appends, diverging after out-of-order deaths. Needs
+    a sparse enemy array (holes for freed slots; iterate slots ascending so a
+    same-frame respawn into an already-passed low slot defers to next frame, as
+    the exe does) — a real refactor touching every `this.enemies` iterator, a
+    dedicated effort. THEN the exact draw models land on a stable order.
   - CAUTION: the ghost full-stage budget (163,385) is CONFOUNDED — a post-boss
     dialogue freezes our sim ~3400f, starving snow the exe also freezes. Judge
     pre-1800 by the non-ghost first-death frame, not the aggregate. Decompose
