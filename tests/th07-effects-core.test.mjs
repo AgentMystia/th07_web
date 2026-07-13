@@ -6,7 +6,7 @@ import { mkdirSync } from 'node:fs';
 const outDir = 'tests/.build/effects-core';
 mkdirSync(outDir, { recursive: true });
 execSync(`npx esbuild src/game/eclvm.ts src/game/stage-scene.ts src/data/th07-data.ts src/formats/anm.ts --bundle --format=esm --outdir=${outDir} --out-extension:.js=.mjs --log-level=silent`);
-const { StageRuntime } = await import('../tests/.build/effects-core/game/eclvm.mjs');
+const { StageRuntime, advanceBulletExBehavior } = await import('../tests/.build/effects-core/game/eclvm.mjs');
 const { StageScene } = await import('../tests/.build/effects-core/game/stage-scene.mjs');
 const { TH07_DATA } = await import('../tests/.build/effects-core/data/th07-data.mjs');
 const { Anm } = await import('../tests/.build/effects-core/formats/anm.mjs');
@@ -194,7 +194,11 @@ test('effect 1 param 1 processes spriteOffset 8 (not sprite 8) and installs the 
   runtime.runBulletEffect(game, caller, 1, 1);
   assert.equal(target.effectState, 1, 'sprite=6 offset=8 IS processed by param 1');
   close(target.speed, 0.3, 'nominal speed declawed');
-  assert.equal(target.exFlags, 0x20, 'slow-turn installed');
+  assert.equal(target.exFlags, 0, 'queue wipe leaves the replacement pending until bullet-manager promotion');
+  assert.equal(target.exBehaviorIndex, 0);
+  assert.equal(target.exSlots[0].opcode, 0x20);
+  advanceBulletExBehavior(target);
+  assert.equal(target.exFlags, 0x20, 'slow-turn promoted on the bullet-manager tick');
   close(target.exAngle.angleDelta, Math.PI / 180, 'rng=0 -> +π/180 for offset 8');
   close(target.exAngle.speedDelta, 0.005263158120214939, 'Lunatic speed delta');
   assert.equal(target.exAngle.limit, 240, 'Lunatic duration');
@@ -219,6 +223,7 @@ test('effect 1 param 2 targets offset 4 with a negative turn; E/N/H use the 60-t
   game.enemyBullets.push(target, other);
   runtime.runBulletEffect(game, caller, 1, 2);
   assert.equal(target.effectState, 1);
+  advanceBulletExBehavior(target);
   close(target.exAngle.angleDelta, -Math.PI / 180, 'rng=0 -> -π/180 for offset 4');
   close(target.exAngle.speedDelta, 0.01666666753590107, 'Hard speed delta');
   assert.equal(target.exAngle.limit, 60, 'Hard duration');
@@ -409,7 +414,11 @@ test('effect 16 emits forty real bullets across eight calls while retaining its 
   assert.equal(emitted.length, 40);
   assert.equal(seed.dead, undefined, 'effect 16 retains the seed');
   assert.ok(emitted.every((bullet) => bullet.sprite === 0 && bullet.spriteOffset === 6));
-  assert.ok(emitted.every((bullet) => bullet.x === 50 && bullet.y === 60 && bullet.flags === 2));
+  assert.ok(emitted.every((bullet) => bullet.flags === 2));
+  assert.ok(emitted.every((bullet) =>
+    Math.abs(bullet.x - (50 - bullet.vx * 4)) < 1e-6 &&
+    Math.abs(bullet.y - (60 - bullet.vy * 4)) < 1e-6
+  ), 'flags-selected spawn states begin four velocity vectors behind the emitter');
   assert.equal(new Set(game.enemyBullets.map((bullet) => bullet.poolSlot)).size, 41, 'bullet slots stay unique');
   assert.deepEqual(emitted.slice(0, 5).map((bullet) => bullet.poolSlot), [1, 2, 3, 4, 5]);
 });

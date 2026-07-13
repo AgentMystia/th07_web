@@ -6,6 +6,12 @@ export { StageScene } from '../game/stage-scene';
 export type { RunCarry } from '../game/stage-scene';
 export { Rpy, RPY_BITS, RPY_CHARACTERS, RPY_AUX_BITS, auxEventFrames } from '../formats/rpy';
 export { ReplayInputSource } from '../core/replay-input';
+export {
+  applyReplayStageSnapshot,
+  replayFastForwardContinues,
+  replaySlowdownAdvances,
+  replayStageEntry
+} from '../game/replay-playback';
 export { Anm } from '../formats/anm';
 export { TH07_DATA } from '../data/th07-data';
 export { stageSnapshot } from '../game/snapshot';

@@ -5,18 +5,20 @@ import { mkdirSync } from 'node:fs';
 
 // ITEM-001: the Point-of-Collection trigger must LATCH (Th07.exe
 // FUN_00430c10 @ 0x430eb2-0x430f1e writes item+0x27f=1 permanently the first
-// frame the trigger holds). Trigger: (round(power)>=128 OR shot is Sakuya)
-// AND player.y < pocLine (strict). Leaving the trigger zone afterwards must
-// not stop the item from homing.
+// frame the trigger holds). Trigger: (round(power)>=128 OR difficulty>3)
+// AND player.y < pocLine (strict). DAT_0061c260 is the difficulty byte, not
+// the character selector. Leaving the trigger zone afterwards must not stop
+// the item from homing.
 
 const outDir = 'tests/.build/poc-latch';
 mkdirSync(outDir, { recursive: true });
 execSync(`npx esbuild src/game/stage-scene.ts --bundle --format=esm --outfile=${outDir}/stage-scene.mjs --log-level=silent`);
 const { StageScene } = await import('../tests/.build/poc-latch/stage-scene.mjs');
 
-function itemScene({ power = 128, character = 'reimuA', x = 192, y = 100 } = {}) {
+function itemScene({ power = 128, character = 'reimuA', difficulty = 3, x = 192, y = 100 } = {}) {
   const scene = Object.create(StageScene.prototype);
   scene.slowRate = 1;
+  scene.difficulty = difficulty;
   scene.items = [];
   scene.cherry = { borderActive: false };
   scene.playerObj = {
@@ -73,17 +75,23 @@ test('POC boundary is strict: y == pocLine does not trigger, y just above does',
   assert.equal(it2.state, 1);
 });
 
-test('below full power the POC needs a Sakuya shot; Reimu/Marisa do not trigger', () => {
+test('below full power no character triggers POC on Lunatic; Extra bypasses the power gate', () => {
   const reimu = itemScene({ power: 127, y: 100, character: 'reimuA' });
   const it1 = addItem(reimu);
   reimu.updateItems();
   assert.equal(it1.state, 0, 'ReimuA below 128 power never latches');
 
-  // Th07.exe 0x430ee7: shotType>=4 (SakuyaA/B) skips the power>=128 gate.
+  // Th07.exe 0x430ee7 reads difficulty, so Sakuya has no character-specific
+  // bypass on Lunatic.
   const sakuya = itemScene({ power: 0, y: 100, character: 'sakuyaA' });
   const it2 = addItem(sakuya);
   sakuya.updateItems();
-  assert.equal(it2.state, 1, 'Sakuya latches at any power');
+  assert.equal(it2.state, 0, 'low-power Sakuya does not latch on Lunatic');
+
+  const extra = itemScene({ power: 0, y: 100, character: 'reimuA', difficulty: 4 });
+  const it3 = addItem(extra);
+  extra.updateItems();
+  assert.equal(it3.state, 1, 'Extra/Phantasm difficulty bypasses the power gate');
 });
 
 test('border force-collect still latches every item', () => {

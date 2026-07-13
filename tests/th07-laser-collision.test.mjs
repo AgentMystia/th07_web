@@ -32,6 +32,8 @@ function scene(player = {}) {
   s.slowRate = 1;
   s.enemyLasers = [];
   s.playerObj = { x: 60, y: 0, hitboxHalf: 1, grazeboxHalf: 2, alive: true, ...player };
+  s.onPlayerHit = () => {};
+  s.onGrazeAward = () => {};
   return s;
 }
 
@@ -95,4 +97,27 @@ test('shrink: collision gates at shrinkCutoff while the slot stays drawable unti
   }
   assert.equal(l.inUse, false, 'freed when the shrink finishes');
   assert.equal(calls, 185, 'allocated for the whole 200-frame shrink, not just to the cutoff');
+});
+
+test('laser manager tests the native phase before advancing its split counter', () => {
+  const s = scene({ x: 60, y: 6.5 });
+  let grazes = 0;
+  s.onGrazeAward = () => { grazes++; };
+  const l = makeLaser({ state: 1, phaseFrame: 12, displayWidth: 20 });
+  s.enemyLasers.push(l);
+
+  s.updateLasers();
+  assert.equal(grazes, 1, 'phase-12 graze occurs before the counter becomes 13');
+  assert.equal(l.phaseFrame, 13);
+});
+
+test('angled laser projection uses the native FUN_00430070 orientation', () => {
+  const s = scene({ x: 200.763397217, y: 418.516937256, hitboxHalf: 1.1 });
+  const l = makeLaser({
+    x: 206.124359131, y: 213.701629639, angle: 1.753861785,
+    state: 2, phaseFrame: 12, nearDist: 0, farDist: 500,
+    width: 1.2, displayWidth: 0.3, shrinkCutoff: 16
+  });
+  assert.equal(s.checkLaserCollision(l), 'graze',
+    'Stage-3 native slot 1 reaches the player only with the positive-angle rotation');
 });

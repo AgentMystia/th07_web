@@ -4,10 +4,18 @@ import { Renderer } from './gfx/renderer';
 import { AudioBus } from './audio/audio';
 import { loadAssets } from './game/assets';
 import { StageScene } from './game/stage-scene';
-import { MenuFlow } from './game/title-scene';
+import { MenuFlow, type ReplayPlaybackMode } from './game/title-scene';
 import type { CharacterId } from './game/player';
 import { stageBgmTracks } from './game/bgm';
 import { stageSnapshot } from './game/snapshot';
+import { MAX_RPY_BYTES, Rpy } from './formats/rpy';
+import { ReplayInputSource } from './core/replay-input';
+import {
+  applyReplayStageSnapshot,
+  replayFastForwardContinues,
+  replaySlowdownAdvances,
+  replayStageEntry
+} from './game/replay-playback';
 
 interface TestHook {
   ready: boolean;
@@ -82,6 +90,15 @@ async function boot(): Promise<void> {
 
   let stage: StageScene | null = null;
   let menu: MenuFlow | null = null;
+  let activeReplay: {
+    replay: Rpy;
+    fileName: string;
+    stageIndex: number;
+    frame: number;
+    mode: ReplayPlaybackMode;
+    modeCounter: number;
+    source: ReplayInputSource;
+  } | null = null;
   // Hi-score carried across stage runs within this browser session.
   let sessionHiScore = 100000;
 
@@ -96,6 +113,7 @@ async function boot(): Promise<void> {
     carry: import('./game/stage-scene').RunCarry | null = null,
     practice = false
   ): StageScene {
+    activeReplay = null;
     const s = new StageScene(assets, audio, difficulty, character, stageNumber, carry);
     // Headless probes (?test=1 without ?menu=1) keep the scene alive forever;
     // real play gets the arcade flow: continue screen + return to title.
@@ -117,7 +135,7 @@ async function boot(): Promise<void> {
       stage = null;
       // Returning from practice parks the title cursor back on Practice
       // Start (exe FUN_00452e91 @ all.c:40457-40459).
-      menu = new MenuFlow(assets, audio, startFromMenu, practice ? 2 : 0);
+      menu = createMenu(practice ? 2 : 0);
       audio.preloadBgm(['th07_01']);
       audio.playBgm('th07_01');
     };
@@ -160,8 +178,128 @@ async function boot(): Promise<void> {
       opts?.practice ?? false
     );
 
+  function createMenu(initialTitleCursor = 0): MenuFlow {
+    return new MenuFlow(assets, audio, startFromMenu, initialTitleCursor, startReplayStage);
+  }
+
+  function showReplayMenu(replay: Rpy, fileName: string, stageIndex: number): void {
+    activeReplay = null;
+    stage = null;
+    menu = createMenu(3);
+    menu.showReplay(replay, fileName, stageIndex);
+    audio.preloadBgm(['th07_01']);
+    audio.playBgm('th07_01');
+  }
+
+  function advanceReplayStage(
+    replay: Rpy,
+    fileName: string,
+    stageIndex: number,
+    mode: ReplayPlaybackMode
+  ): void {
+    const next = stageIndex + 1;
+    const currentStage = replay.stages[stageIndex];
+    const nextStage = replay.stages[next];
+    // Native playback tests the immediately following physical offset slot;
+    // it does not skip a zero entry to a later present slot.
+    if (nextStage?.stage === currentStage.stage + 1) startReplayStage(replay, next, fileName, mode);
+    else showReplayMenu(replay, fileName, stageIndex);
+  }
+
+  // Browser replay playback uses the same constructor/restore order as the
+  // Node verifier: seed first, let manager bootstrap consume from it, then
+  // restore the remaining T7RP stage-entry fields. Starting from a selected
+  // middle stage continues only while each immediately following physical
+  // slot exists, as Th07.exe FUN_0045207e does.
+  function startReplayStage(
+    replay: Rpy,
+    stageIndex: number,
+    fileName: string,
+    mode: ReplayPlaybackMode
+  ): void {
+    const entry = replayStageEntry(replay, stageIndex);
+    const s = new StageScene(
+      assets,
+      audio,
+      replay.difficulty,
+      replay.character,
+      entry.runtimeStageNumber,
+      null,
+      entry.stage.rngSeed
+    );
+    s.mode = 'replay';
+    applyReplayStageSnapshot(s, replay, stageIndex);
+    s.onExitToTitle = () => showReplayMenu(replay, fileName, stageIndex);
+    s.onStageComplete = () => advanceReplayStage(replay, fileName, stageIndex, mode);
+    stage = s;
+    menu = null;
+    activeReplay = {
+      replay,
+      fileName,
+      stageIndex,
+      frame: 0,
+      mode,
+      modeCounter: 0,
+      source: new ReplayInputSource()
+    };
+    const [stageTrack, bossTrack] = stageBgmTracks(entry.runtimeStageNumber);
+    audio.preloadBgm([stageTrack, bossTrack]);
+    if (stageIndex + 1 < replay.stages.length) {
+      audio.preloadBgm([...stageBgmTracks(replayStageEntry(replay, stageIndex + 1).runtimeStageNumber)]);
+    }
+    audio.playBgm(stageTrack);
+  }
+
+  // Local-file loading remains wholly browser-side: no upload, no server
+  // path, and the hidden element provides a stable Playwright setInputFiles
+  // seam for visual replay acceptance.
+  const replayFileInput = document.createElement('input');
+  replayFileInput.id = 'replay-file';
+  replayFileInput.type = 'file';
+  replayFileInput.accept = '.rpy,application/octet-stream';
+  replayFileInput.hidden = true;
+  document.body.appendChild(replayFileInput);
+  replayFileInput.addEventListener('change', () => {
+    const file = replayFileInput.files?.[0];
+    if (!file) return;
+    if (file.size > MAX_RPY_BYTES) {
+      input.frame();
+      menu?.showReplayError(file.name, 'T7RP file exceeds 16 MiB safety limit');
+      replayFileInput.value = '';
+      return;
+    }
+    void (async () => {
+      try {
+        const buffer = await file.arrayBuffer();
+        const replay = new Rpy(new Uint8Array(buffer));
+        // Force validation of the shot byte before the menu presents it.
+        void replay.character;
+        if (replay.stages.length === 0) throw new Error('T7RP contains no playable stage');
+        // Consume the Z/Enter edge that opened the native file dialog. Its
+        // delayed delivery must not instantly confirm Stage 1 after loading.
+        input.frame();
+        menu?.showReplay(replay, file.name);
+      } catch (err) {
+        input.frame();
+        const message = err instanceof Error ? err.message : String(err);
+        menu?.showReplayError(file.name, message);
+      } finally {
+        replayFileInput.value = '';
+      }
+    })();
+  });
+  // File pickers require transient user activation. MenuFlow consumes input
+  // on the next rAF tick, so open the dialog synchronously on the physical
+  // key event while Replay is focused.
+  addEventListener('keydown', (event) => {
+    if ((event.code === 'KeyZ' || event.code === 'Enter') && !event.repeat && menu?.replayFileHotkeyActive()) {
+      replayFileInput.value = '';
+      replayFileInput.click();
+    }
+  });
+
   if (useMenu) {
-    menu = new MenuFlow(assets, audio, startFromMenu);
+    menu = createMenu();
     audio.preloadBgm(['th07_01']);
     audio.playBgm('th07_01');
   } else {
@@ -207,10 +345,57 @@ async function boot(): Promise<void> {
   const loop = new Loop({
     update: () => {
       if (simHalted) return;
-      const frame = input.frame();
+      const liveFrame = input.frame();
       try {
-        if (menu) menu.update(frame);
-        else if (stage) stage.update(frame);
+        if (menu) {
+          menu.update(liveFrame);
+        } else if (stage && activeReplay) {
+          const playback = activeReplay;
+          // Pause/menu time is outside the T7RP frame stream. Feed physical
+          // input to the pause UI and leave the replay cursor untouched.
+          if (stage.pauseState || liveFrame.pressed.has('pause')) {
+            stage.update(liveFrame);
+          } else {
+            const replayStage = playback.replay.stages[playback.stageIndex];
+            let advances = true;
+            if (playback.mode === 1) {
+              const recordedFps = replayStage.slowdown[Math.floor(playback.frame / 30)] & 0x7f;
+              // Th07.exe FUN_0042bfca @ all.c:19303 reproduces slowdown in
+              // discrete cadence bands, not by linear FPS interpolation.
+              // MSG playback bypasses these skips so dialogue timing remains
+              // tied to its recorded input stream.
+              if (!stage.dialogue) {
+                advances = replaySlowdownAdvances(recordedFps, ++playback.modeCounter);
+              }
+            }
+            // FUN_0043fda0 returns manager code 6 to immediately restart the
+            // priority chain in the same rendered frame. Skippable dialogue
+            // runs up to 3x; boss-only playback runs non-boss sections up to
+            // 5x. The two predicates can combine, meeting within 15 ticks.
+            for (let i = 0; advances && i < 15 && activeReplay === playback; i++) {
+              const word = replayStage.inputs[playback.frame];
+              if (word == null) {
+                advanceReplayStage(playback.replay, playback.fileName, playback.stageIndex, playback.mode);
+                break;
+              }
+              stage.update(playback.source.frame(word));
+              playback.frame++;
+              // A stage callback may already have replaced activeReplay.
+              if (activeReplay === playback && playback.frame >= replayStage.inputs.length) {
+                advanceReplayStage(playback.replay, playback.fileName, playback.stageIndex, playback.mode);
+              }
+              if (activeReplay !== playback) break;
+              if (!replayFastForwardContinues(
+                playback.mode,
+                playback.frame,
+                !!stage.dialogue?.skippable,
+                !!stage.bossActive
+              )) break;
+            }
+          }
+        } else if (stage) {
+          stage.update(liveFrame);
+        }
       } catch (err) {
         simHalted = true;
         reportFatal('simulation', err);
@@ -240,7 +425,23 @@ async function boot(): Promise<void> {
       ready: true,
       pause: () => loop.stop(),
       advance: (n: number) => loop.advance(n),
-      snapshot: () => (menu ? menu.snapshot() : stageSnapshot(stage!)),
+      snapshot: () => {
+        if (menu) return menu.snapshot();
+        const snapshot = stageSnapshot(stage!);
+        if (!activeReplay) return snapshot;
+        const replayStage = activeReplay.replay.stages[activeReplay.stageIndex];
+        return {
+          ...snapshot,
+          replay: {
+            fileName: activeReplay.fileName,
+            name: activeReplay.replay.name,
+            stage: replayStage.stage,
+            frame: activeReplay.frame,
+            totalFrames: replayStage.inputs.length,
+            playbackMode: activeReplay.mode
+          }
+        };
+      },
       pixelAt: (x: number, y: number) => Array.from(renderer.ctx.getImageData(x, y, 1, 1).data),
       capturePixel: (x: number, y: number) => {
         const surface = renderer.image('capture:@');

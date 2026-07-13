@@ -13,6 +13,7 @@ const MAGIC = 0x50523754; // "T7RP"
 const HEADER_SIZE = 0x54;
 const STAGE_SLOTS = 7; // 1-6 + Extra; Phantasm replays use th7_udXXXX slots too
 const SUBHEADER_SIZE = 0x2c;
+export const MAX_RPY_BYTES = 16 * 1024 * 1024;
 
 // Bits of the per-frame input word (a verbatim copy of DAT_004afe2c made by
 // the recording tick FUN_0043fc40; playback injects it at FUN_0043fe30).
@@ -94,6 +95,12 @@ export interface RpyStage {
   // over a Lunatic clear fits captures)
   inputs: Uint16Array; // per-frame input word (first u16 of each 4-byte record)
   auxFlags: Uint16Array; // second u16 (ctx+0x9e; opaque, usually 0)
+  // One playback-observed-FPS byte per 30 input frames from the matching
+  // +0x38 table block. The raw trailer has one leading recorder byte; native
+  // playback reads pointer+1 before advancing, so this array intentionally
+  // exposes raw[1..ceil(frames/30)]. Bit 7 is the slowdown marker and the low
+  // 7 bits are FPS.
+  slowdown: Uint8Array;
 }
 
 export const RPY_CHARACTERS = ['reimuA', 'reimuB', 'marisaA', 'marisaB', 'sakuyaA', 'sakuyaB'] as const;
@@ -101,7 +108,7 @@ export const RPY_CHARACTERS = ['reimuA', 'reimuB', 'marisaA', 'marisaB', 'sakuya
 export class Rpy {
   readonly version: number;
   readonly shotByte: number; // character*2 + subtype == StageScene.shotIndex
-  readonly difficulty: number; // 0=Easy .. 3=Lunatic, 4=Extra
+  readonly difficulty: number; // 0=Easy .. 3=Lunatic, 4=Extra, 5=Phantasm
   readonly date: string; // "MM/DD"
   readonly name: string;
   readonly score: number; // raw internal units; displayed value is ×10
@@ -110,6 +117,7 @@ export class Rpy {
 
   constructor(source: string | Uint8Array) {
     const raw = new BinaryView(source);
+    if (raw.length > MAX_RPY_BYTES) throw new Error('T7RP file exceeds 16 MiB safety limit');
     if (raw.length < HEADER_SIZE || raw.u32(0) !== MAGIC) throw new Error('not a T7RP replay');
     this.version = raw.u16(4);
     if ((this.version & 0xfff) !== 0x100) throw new Error(`unsupported T7RP version 0x${this.version.toString(16)}`);
@@ -127,6 +135,7 @@ export class Rpy {
     const dec = new BinaryView(data);
     const compSize = dec.u32(0x14);
     const decompSize = dec.u32(0x18);
+    if (decompSize > MAX_RPY_BYTES) throw new Error('T7RP decompressed body exceeds 16 MiB safety limit');
     if (HEADER_SIZE + compSize > data.length) throw new Error('T7RP truncated body');
     const image = new Uint8Array(HEADER_SIZE + decompSize);
     image.set(data.subarray(0, HEADER_SIZE));
@@ -136,6 +145,7 @@ export class Rpy {
 
     this.shotByte = v.u8(HEADER_SIZE + 0x02);
     this.difficulty = v.u8(HEADER_SIZE + 0x03);
+    if (this.difficulty > 5) throw new Error(`T7RP difficulty ${this.difficulty} is out of range`);
     this.date = v.cstring(HEADER_SIZE + 0x04);
     this.name = v.cstring(HEADER_SIZE + 0x0a).trim();
     this.score = v.u32(HEADER_SIZE + 0x18);
@@ -160,6 +170,14 @@ export class Rpy {
       this.stages.push(parseStage(v, stage, offset, end));
     }
     this.stages.sort((a, b) => a.stage - b.stage);
+    for (const stage of this.stages) {
+      const offset = trailerOffsets[stage.stage - 1];
+      const length = Math.ceil(stage.inputs.length / 30);
+      if (offset <= 0 || offset + 1 + length > v.length) {
+        throw new Error(`T7RP stage ${stage.stage} slowdown trailer out of bounds`);
+      }
+      stage.slowdown = v.bytes.slice(offset + 1, offset + 1 + length);
+    }
   }
 
   get character(): (typeof RPY_CHARACTERS)[number] {
@@ -199,7 +217,8 @@ function parseStage(v: BinaryView, stage: number, offset: number, end: number): 
     b26: v.u8(offset + 0x26),
     spellsCaptured: v.u8(offset + 0x27),
     inputs,
-    auxFlags
+    auxFlags,
+    slowdown: new Uint8Array(0)
   };
 }
 

@@ -122,13 +122,13 @@ test('spell-active is global: helpers spawned mid-spell fire raw ECL speeds', ()
     `raw 1.8/1.2 during the spell, got ${speeds.slice(0, 6)}`);
 });
 
-test('without a spell the rank-0 scaling applies (1.8 -> 1.3)', () => {
+test('fresh enemies use the native -0.15/+0.15 rank range (rank 0: 1.8 -> 1.65)', () => {
   const runtime = makeRuntime([[fire()]]);
   const game = makeHost();
   runtime.spawnEclEnemy(game, { subId: 0, x: 200, y: 100 });
   const speeds = game.enemyBullets.map((b) => b.speed);
-  assert.ok(speeds.some((v) => Math.abs(v - 1.3) < 1e-6),
-    `rank-0 non-spell speed 1.3 expected, got ${speeds.slice(0, 6)}`);
+  assert.ok(speeds.some((v) => Math.abs(v - 1.65) < 1e-6),
+    `rank-0 non-spell speed 1.65 expected, got ${speeds.slice(0, 6)}`);
 });
 
 test('op91 clears the global flag for every later emitter', () => {
@@ -137,7 +137,7 @@ test('op91 clears the global flag for every later emitter', () => {
   runtime.spawnEclEnemy(game, { subId: 0, x: 100, y: 100 });
   assert.equal(runtime.spellActive, false);
   runtime.spawnEclEnemy(game, { subId: 1, x: 200, y: 100 });
-  assert.ok(game.enemyBullets.some((b) => Math.abs(b.speed - 1.3) < 1e-6),
+  assert.ok(game.enemyBullets.some((b) => Math.abs(b.speed - 1.65) < 1e-6),
     'post-spell fire is rank-scaled again');
 });
 
@@ -147,20 +147,23 @@ function makeRealRuntime(stageNumber) {
   return new StageRuntime(TH07_DATA.stages[stageNumber], { etama, enemy: noAnm, effect: noAnm });
 }
 
-test('Sub36 (stage-2 road, Lunatic): op74(100) scales to 120, first auto-fire at update 120-r, HP gate freezes', () => {
+test('Sub36 (stage-2 road, Lunatic): allocator core advances op74 once, HP gate freezes', () => {
   const runtime = makeRealRuntime(2);
   const game = makeHost();
   const r = 37; // fixed op74 initial phase
   game.rng.u32InRange = () => r;
   const e = runtime.spawnEclEnemy(game, { subId: 36, x: 100, y: 60, life: 60 });
   assert.equal(game.enemyBullets.length, 0, 'op75 suppressed the immediate FIRE');
-  // First volley lands on update 120-r; none earlier.
-  for (let k = 1; k < 120 - r; k++) {
+  // FUN_0041da10 runs one complete FUN_0040f6c0 core synchronously, so the
+  // randomized phase r advances once before the manager's first update.
+  const firstManagerUpdate = 120 - r - 1;
+  for (let k = 1; k < firstManagerUpdate; k++) {
     runtime.updateEnemy(game, e);
     assert.equal(game.enemyBullets.length, 0, `no fire at update ${k}`);
   }
   runtime.updateEnemy(game, e);
-  assert.equal(game.enemyBullets.length, 10, 'first volley: count1*count2 = 2*5 bullets');
+  assert.equal(game.enemyBullets.length, 10,
+    `first volley at manager update ${firstManagerUpdate}: count1*count2 = 2*5 bullets`);
   assert.ok(game.enemyBullets.every((b) => b.sprite === 3 && b.spriteOffset === 10), 'Lunatic template 3:10');
   // Steady cadence: next volley exactly 120 updates later.
   for (let k = 1; k < 120; k++) {
@@ -264,12 +267,14 @@ test('var 10024 is the aim TOWARD the player (snapshot-then-absolute-fan idiom, 
     `fan center aims at the player (${game.enemyBullets[0].angle} vs ${expected})`);
 });
 
-test('op93 resolves variable life/item/score (stage-5 wrapper->child relay, COMBAT-001)', () => {
+test('op93 resolves life during t0, before the allocator writes wrapper item/score', () => {
   // The stage-5 pattern: an invisible wrapper carries the timeline's real
   // HP/item/score in its own hp/itemDrop/score fields and passes them to
   // the visible child via var refs 10027/10070/10071 (exe all.c:8972-9027,
   // paramMask 0x70 -> FUN_0040d750 resolution). Reading the raw words gave
-  // children 10027 HP.
+  // children 10027 HP. The allocator supplies HP before the synchronous t0
+  // core, but writes the timeline item and score after FUN_0040f6c0 returns;
+  // an op93 executed inside that core therefore sees the template -1/100.
   const spawnChild = instruction(0, 93, [
     i32(1), f32(0), f32(0), f32(0), i32(10027), i32(10070), i32(10071)
   ]);
@@ -280,8 +285,8 @@ test('op93 resolves variable life/item/score (stage-5 wrapper->child relay, COMB
   const child = game.enemies[1];
   assert.equal(child.hp, 80, 'child inherits the wrapper HP, not the var id');
   assert.equal(child.maxHp, 80);
-  assert.equal(child.ecl.itemDrop, 1, 'item relayed');
-  assert.equal(child.score, 1500, 'score relayed');
+  assert.equal(child.ecl.itemDrop, -1, 't0 child sees the wrapper template item');
+  assert.equal(child.score, 100, 't0 child sees the wrapper template score');
 });
 
 test('mode-3 orbit updates the live heading (exe +0x2b54) that op120/var10045 read', () => {
@@ -295,9 +300,9 @@ test('mode-3 orbit updates the live heading (exe +0x2b54) that op120/var10045 re
   const e = runtime.spawnEclEnemy(game, { subId: 0, x: 200, y: 150 });
   for (let i = 0; i < 10; i++) runtime.updateEnemy(game, e);
   const s = e.ecl;
-  assert.ok(s.frameVx !== 0 || s.frameVy !== 0, 'orbiter is moving');
-  assert.ok(Math.abs(s.heading - Math.atan2(s.frameVy, s.frameVx)) < 1e-9,
-    'heading tracks the frame movement delta');
+  assert.ok(s.axisSpeed.x !== 0 || s.axisSpeed.y !== 0, 'orbiter is moving');
+  assert.ok(Math.abs(s.heading - Math.atan2(s.axisSpeed.y, s.axisSpeed.x)) < 1e-9,
+    'heading tracks the live controller vector');
   assert.equal(s.angle, 0, 'the mode-1 polar angle stays untouched by mode 3');
   // The heading persists when the enemy stops (mode cleared, velocity zero).
   const lastHeading = s.heading;
@@ -323,8 +328,10 @@ test('auto-fire is hp-gated: a dead enemy neither fires nor advances its timer',
   for (let i = 0; i < 30; i++) runtime.updateEnemy(game, e);
   assert.equal(game.enemyBullets.length, 0, 'no auto-fire while hp<=0');
   e.hp = 50;
-  for (let i = 0; i < 11; i++) runtime.updateEnemy(game, e);
+  // The synchronous allocator core advanced the timer from 0 to 1 before
+  // death. Ten resumed manager ticks reach 11; the next reaches interval 12.
+  for (let i = 0; i < 10; i++) runtime.updateEnemy(game, e);
   assert.equal(game.enemyBullets.length, 0, 'timer was frozen, not banked, while dead');
   runtime.updateEnemy(game, e);
-  assert.ok(game.enemyBullets.length > 0, 'first volley lands a full interval after revival');
+  assert.ok(game.enemyBullets.length > 0, 'first volley lands after the remaining 11 manager ticks');
 });

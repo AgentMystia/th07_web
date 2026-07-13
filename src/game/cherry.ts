@@ -132,7 +132,11 @@ export class CherrySystem {
   private startBorder(): void {
     this.borderPending = false;
     this.borderTimer = BORDER_DURATION;
-    this.cherryPlus = 0;
+    // The live cherryPlus storage is repurposed as the border meter while
+    // state 4 is active. FUN_0043e890 leaves it pinned at 50000 on entry;
+    // FUN_0043e2e0 overwrites it with the countdown percentage each later
+    // player tick (Th07.exe v1.00b @ 0x43e890 / all.c:28735-28739).
+    this.cherryPlus = CHERRY_PLUS_MAX;
     this.events.onBorderStart?.();
   }
 
@@ -146,20 +150,42 @@ export class CherrySystem {
   tick(rate = 1): number {
     if (!this.borderActive) return 0;
     // Border countdown ticks at the global slow-motion rate
-    // (exe FUN_0043e2e0 via FUN_00436a06; spec-slowmo.md §3.2).
+    // (exe FUN_0043e2e0 via FUN_00436a06; spec-slowmo.md §3.2). The HUD
+    // value is written BEFORE the split timer advances, so the first active
+    // tick still exposes 50000 even though borderTimer becomes 539.
+    this.cherryPlus = Math.max(0,
+      Math.trunc((this.borderTimer * CHERRY_PLUS_MAX) / BORDER_DURATION));
     this.borderTimer = Math.max(0, this.borderTimer - rate);
     if (this.borderTimer === 0) {
-      // Th07.exe FUN_0043e620 (spec §4, CONFIRMED instruction-by-instruction
-      // @ 0x43e62b-0x43e68e): +10000 to both cherryMax (de56) and cherry
-      // (de03), then score += the POST-add cherry. The popup receives that
-      // same value ×10; only the score division is a lossless compiler no-op.
-      this.cherryMax += 10000;
-      this.cherry = Math.min(this.cherryMax, this.cherry + 10000);
-      const bonus = this.cherry;
-      this.events.onBorderEnd?.('survived', bonus);
-      return bonus;
+      return this.finishBorderSurvival();
     }
     return 0;
+  }
+
+  // FUN_00428392 calls FUN_0043e620 directly while its message/stage mini-VM
+  // is active and the Border marker is set (all.c:17791-17793). This also
+  // completes a just-deferred marker-2 request without ever exposing a
+  // 540-frame active ring. Stage 1's post-boss dialogue reaches 50000 on
+  // processing frame 10255 and the native PRE10256 already contains the
+  // +10000 max/cherry award with cherryPlus reset to zero.
+  forceBorderSurvival(): number {
+    if (!this.borderEngaged) return 0;
+    this.borderPending = false;
+    this.borderTimer = 0;
+    return this.finishBorderSurvival();
+  }
+
+  private finishBorderSurvival(): number {
+    // Th07.exe FUN_0043e620 (spec §4, CONFIRMED instruction-by-instruction
+    // @ 0x43e62b-0x43e68e): +10000 to both cherryMax (de56) and cherry
+    // (de03), then score += the POST-add cherry. The popup receives that
+    // same value ×10; only the score division is a lossless compiler no-op.
+    this.cherryMax += 10000;
+    this.cherry = Math.min(this.cherryMax, this.cherry + 10000);
+    this.cherryPlus = 0;
+    const bonus = this.cherry;
+    this.events.onBorderEnd?.('survived', bonus);
+    return bonus;
   }
 
   // Breaks the border. A hit is only absorbed by an ACTIVE border (exe
@@ -195,10 +221,14 @@ export class CherrySystem {
   //   local14 = stage < 5 ? stage*2 : 10          (all.c:13997-14003 —
   //     DAT_0062583c is the STAGE NUMBER, not a difficulty tier;
   //     spec-extra-phantasm.md §0 corrected the old reading)
-  //   divisor = isBoss ? 10 - floor(local14/3) : 30 - local14
+  //   focused = player+0x240b != 0
+  //   focused non-boss hits award no cherry at all
+  //   divisor = isBoss && !focused
+  //     ? 10 - floor(local14/3)
+  //     : 30 - local14
   //   gain = min(70, floor(damage/divisor) * 10)
-  //   if gain == 0 and bossTimerOdd: gain = 10
-  //   if shotTypeBit==0 (type-A shot, DAT_00625627=='\0') and gain in
+  //   if gain == 0 and (!focused || bossTimerOdd): gain = 10
+  //   if shotIndex==0 (ReimuA, DAT_00625627=='\0') and gain in
   //      {20,30} and bossTimerOdd: gain -= 10      (all.c:14198-14202)
   // `bossTimerOdd` is bit0 of the enemy's own boss-phase timer field
   // (`enemyFlags_2bcc`, PROBABLE identity — spec §3a/§5 item 3); this port
@@ -209,14 +239,21 @@ export class CherrySystem {
     damage: number,
     isBoss: boolean,
     stageNumber: number,
-    shotTypeBit: number,
-    bossTimerOdd: boolean
+    shotIndex: number,
+    bossTimerOdd: boolean,
+    focused = false
   ): void {
+    // Th07.exe FUN_0041ed50 @ 0x41f8c7-0x41f8ed gates this whole economy
+    // branch on boss || !focused. DAT_004b5ec3 is player+0x240b, the focus
+    // byte written by FUN_0043be00, not a spell/boss global.
+    if (!isBoss && focused) return;
     const local14 = stageNumber < 5 ? stageNumber * 2 : 10;
-    const divisor = isBoss ? 10 - Math.floor(local14 / 3) : 30 - local14;
+    const divisor = isBoss && !focused
+      ? 10 - Math.floor(local14 / 3)
+      : 30 - local14;
     let g = Math.min(70, Math.floor(damage / divisor) * 10);
-    if (g === 0 && bossTimerOdd) g = 10;
-    if (shotTypeBit === 0 && (g === 20 || g === 30) && bossTimerOdd) g -= 10;
+    if (g === 0 && (!focused || bossTimerOdd)) g = 10;
+    if (shotIndex === 0 && (g === 20 || g === 30) && bossTimerOdd) g -= 10;
     this.gain(g);
   }
 

@@ -42,6 +42,9 @@ const BOMB_PARAMS: Record<CharacterId, { unfocused: [number, number, number]; fo
 export const PLAYER_SPRITE_BASE = 1024;
 
 export interface PlayerBullet {
+  // Stable slot in Th07.exe's 96-entry player-shot pool. Each firing pass
+  // scans from slot 0, so slots freed by movement are reusable immediately.
+  poolSlot: number;
   x: number;
   y: number;
   vx: number;
@@ -89,8 +92,7 @@ export interface PlayerBullet {
 // 2026-07: settled unfocused = (∓24, 0), settled focused = (∓8, −32);
 // cross-validated vs the MarisaB laser gates (state 1 vs 3) and SakuyaB's
 // orbit rest point. Overturns the earlier 0x43cb30 (∓32,+8) misread —
-// see reference/re-specs/exe-player-shot.md §4. Tween stays 8f, x linear,
-// y quadratic.
+// see reference/re-specs/exe-player-shot.md §4.
 const ORB_OFFSETS = {
   unfocused: { 1: { x: -24, y: 0 }, 2: { x: 24, y: 0 } },
   focused: { 1: { x: -8, y: -32 }, 2: { x: 8, y: -32 } }
@@ -98,15 +100,12 @@ const ORB_OFFSETS = {
 
 // Frames to glide between the unfocused/focused layouts on a focus-state
 // change, and the interpolation formula, both CONFIRMED directly from the
-// exe's tween state machine (fcn.0043be00 @ 0x43ca0b-0x43ca56): x eases
-// LINEARLY in t while y eases QUADRATICALLY in t*t -- the two axes use
-// different easing. t = frame / GLIDE_FRAMES, with an internal frame
-// counter compared against 8 @ 0x43ca61 (fdiv by 0x48eacc = 8.0 @
-// 0x43ca1d). The live instance decoded had fromY=24/toY=8, producing
-// exactly y = 24 - 16*t*t (fmul 0x48ead4=32.0 @ 0x43ca2f, fadd
-// 0x48ed44=-32.0 @ 0x43ca35 for x; fmul 0x48ed68=-16.0 @ 0x43ca4d, fadd
-// 0x48ec78=24.0 @ 0x43ca50 for y) -- i.e. lerp(fromX,toX,t) and
-// lerp(fromY,toY,t*t) in general.
+// exe's tween state machine: the option X half-spread eases QUADRATICALLY,
+// while Y eases LINEARLY. Th07.exe FUN_0043be00 (v1.00b), all.c:28343-28345
+// and 28360-28362: focus-in is xHalf=24-16*t², y=-32*t; focus-out is
+// xHalf=8+16*t², y=-32+32*t, where t=frame/8 after the frame's counter
+// tick. Reversing these axes shifts the real shot spawn point because
+// FUN_00438b70 fires from the live option position.
 const GLIDE_FRAMES = 8;
 
 // Th07.exe FUN_0043a820 @ 0x43a820: the shot-cadence counter is hard-
@@ -150,6 +149,9 @@ export class Player {
   readonly focused: Sht;
   readonly anm: Anm;
   focusHeld = false;
+  // One-frame edge emitted by FUN_0043be00's option-layout state machine.
+  // StageScene consumes it to manage the authored focus-in effect slot.
+  focusTransition: 'in' | 'out' | null = null;
   // Frames elapsed since the last focus-state toggle, saturating at
   // GLIDE_FRAMES once the orb glide has settled; see orbOffset().
   private focusGlideFrame = GLIDE_FRAMES;
@@ -167,6 +169,9 @@ export class Player {
   // not "interval" frames later.
   fireFrame = -1;
   private fireFrameFrac = 0;
+  // FUN_0043a820 keeps the prior integer split-counter value separately and
+  // only runs the shooter table when the integer phase changes.
+  private prevFireFrame = -999;
   bullets: PlayerBullet[] = [];
   // MarisaB persistent-laser slot tracker (exe player+0x169c4/+0x169d0
   // 3-entry array, exe-player-shot.md §2.2): at most one live laser bullet
@@ -272,14 +277,8 @@ export class Player {
 
   // `rate` = global slow-motion rate: movement/orbit scale directly, the
   // player-side timers accumulate fractionally (spec-slowmo.md §3.1/§3.2).
-  update(input: InputFrame, rate = 1): void {
-    const focused = input.held.has('focus');
-    if (focused !== this.focusHeld) {
-      this.focusHeld = focused;
-      this.focusGlideFrame = 0;
-    } else if (this.focusGlideFrame < GLIDE_FRAMES) {
-      this.focusGlideFrame += rate;
-    }
+  update(input: InputFrame, rate = 1, allowShotArm = true): void {
+    this.updateFocusGlide(input.held.has('focus'), rate);
     if (this.invulnFrames > 0) this.invulnFrames = Math.max(0, this.invulnFrames - rate);
     if (this.bombInvuln > 0) this.bombInvuln = Math.max(0, this.bombInvuln - rate);
     if (this.bombTimer > 0) {
@@ -309,7 +308,16 @@ export class Player {
     // counter free-runs to 29 firing its remaining record phases ("release
     // inertia"), then FUN_0043a820 disarms it (>0x1d, or player states 1/2:
     // materialize/dying). Ticking + disarm live in fire().
-    if (this.shooting && this.fireFrame < 0) {
+    // FUN_0043be00 gates FUN_0043a930 (the disarmed -> frame-0 re-arm)
+    // on FUN_00429483()==0, the MSG-active predicate.  The surrounding
+    // player callback still runs for timestamp-only messages: an already
+    // armed 30-frame cycle keeps advancing in FUN_0043a820 and existing
+    // shots keep moving, but once that cycle expires holding Z cannot start
+    // another until the message ends.  Native Stage 6 trace, v1.00b:
+    // FUN_0043eef0 / FUN_0043a290 / FUN_0043a820 all execute at PRE
+    // 1915..2244 with DAT_0061c25c=0, while fireFrame reaches -1 and stays
+    // there until entry 22 ends at PRE2245.
+    if (allowShotArm && this.shooting && this.fireFrame < 0) {
       this.fireFrame = 0;
       this.fireFrameFrac = 0;
     }
@@ -322,6 +330,34 @@ export class Player {
     } else {
       this.orbitAngle += vx * Math.PI / 200;
       this.orbitAngle = Math.min(-3 * Math.PI / 10, Math.max(-7 * Math.PI / 10, this.orbitAngle));
+    }
+  }
+
+  private updateFocusGlide(focused: boolean, rate: number): void {
+    this.focusTransition = null;
+    let advancedOnReverse = false;
+    if (focused !== this.focusHeld) {
+      const enteringFocus = focused;
+      this.focusHeld = focused;
+      this.focusTransition = focused ? 'in' : 'out';
+      if (this.focusGlideFrame < GLIDE_FRAMES) {
+        // FUN_0043be00's switch cases are deliberately asymmetric. Reversing
+        // state 4 (unfocus -> focus) first advances the OLD split counter,
+        // complements its integer, clears the fraction, then advances state
+        // 2. Reversing state 2 (focus -> unfocus) complements first and only
+        // advances the new state. At rate 1 this makes 5 -> 3 in the former
+        // direction but 4 -> 5 in the latter (native traces f2600/f2395).
+        const oldWhole = Math.floor(this.focusGlideFrame + (enteringFocus ? rate : 0));
+        this.focusGlideFrame = Math.min(GLIDE_FRAMES, GLIDE_FRAMES - oldWhole + rate);
+        advancedOnReverse = true;
+      } else {
+        // A settled toggle initializes the opposite state at zero; its case
+        // body advances to `rate` on this same frame.
+        this.focusGlideFrame = 0;
+      }
+    }
+    if (!advancedOnReverse && this.focusGlideFrame < GLIDE_FRAMES) {
+      this.focusGlideFrame = Math.min(GLIDE_FRAMES, this.focusGlideFrame + rate);
     }
   }
 
@@ -347,13 +383,22 @@ export class Player {
     // Bombs latch a per-character speed multiplier (BOMB_PARAMS); SakuyaB
     // legitimately exceeds 1.0 — NOT clamped (exe-bombs.md §2).
     const speed = baseSpeed * (this.bombTimer > 0 ? this.bombSpeedMult : 1);
-    // Th07.exe (v1.00b) Player::Update clamp @ 0x43c3cc / 0x43c430: field-local
-    // x∈[0,384], y∈[0,448] (full playfield). Mins DAT_00625854/858 = 0; ranges
-    // DAT_0062585c/860 = 384/448 (confirmed via FUN_0041de20 @ 0x41dfeb/0x41e016).
+    // Th07.exe (v1.00b) Player::Update clamp @ 0x43c3cc-0x43c47c reads
+    // DAT_00625854/58/5c/60 = {8,16,368,416}: the player CENTER is limited
+    // to x∈[8,376], y∈[16,432], inset from the 384×448 field edges.
     // exe FUN_0043be00: velocity = inputDir * speed * DAT_0056baa8.
-    this.x = clamp(this.x + dx * speed * rate, 0, 384);
-    this.y = clamp(this.y + dy * speed * rate, 0, 448);
-    this.lastVx = dx * speed * rate;
+    // FUN_0043be00 @ 0x43c32d-0x43c39f stores the rate-scaled velocity in
+    // player+0x9cc/0x9d0 and then stores the position add back into the
+    // float32 player+0x930/0x934 fields before clamping. Keeping these in JS
+    // doubles accumulates sub-pixel drift across long replays: native Stage-2
+    // PRE9297 is (317.226684570,373.816131592), while the old WT state was
+    // (317.226537466,373.815521240), enough to move SakuyaA slot 32 just
+    // outside a boss hitbox and lose its first-hit id5 event.
+    const vx = Math.fround(dx * speed * rate);
+    const vy = Math.fround(dy * speed * rate);
+    this.x = clamp(Math.fround(this.x + vx), 8, 376);
+    this.y = clamp(Math.fround(this.y + vy), 16, 432);
+    this.lastVx = vx;
   }
 
   private updatePose(input: InputFrame): void {
@@ -391,9 +436,10 @@ export class Player {
     }
     const to = ORB_OFFSETS[this.focusHeld ? 'focused' : 'unfocused'][orb];
     if (this.focusGlideFrame >= GLIDE_FRAMES) return to;
-    const from = ORB_OFFSETS[this.focusHeld ? 'unfocused' : 'focused'][orb];
     const t = this.focusGlideFrame / GLIDE_FRAMES;
-    return { x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t * t };
+    const xHalf = this.focusHeld ? 24 - 16 * t * t : 8 + 16 * t * t;
+    const y = this.focusHeld ? -32 * t : -32 + 32 * t;
+    return { x: orb === 1 ? -xHalf : xHalf, y };
   }
 
   fire(rate = 1): PlayerBullet[] {
@@ -403,35 +449,39 @@ export class Player {
     if (this.dyingFrame >= 0 || this.materializeFrame >= 0) {
       this.fireFrame = -1;
       this.fireFrameFrac = 0;
+      this.prevFireFrame = -999;
       return [];
     }
     const out: PlayerBullet[] = [];
-    for (const shot of this.sht.shotsForPower(this.power)) {
-      const isLaser = shot.funcs[0] === 2 || shot.funcs[0] === 3;
-      if (isLaser) {
-        // MarisaB persistent lasers (FUN_00438db0/FUN_00438ef0): the record's
-        // delay field is a SLOT INDEX, not a cadence delay; a slot spawns at
-        // most one live beam, only while the option glide is settled in the
-        // record's own focus state (funcs0=2 ⇒ unfocused, 3 ⇒ focused).
-        const slotId = shot.delay;
-        if (slotId < 0 || slotId > 2 || this.laserSlots[slotId]) continue;
-        const settled = this.focusGlideFrame >= GLIDE_FRAMES;
-        const wantFocused = shot.funcs[0] === 3;
-        if (!settled || this.focusHeld !== wantFocused) continue;
+    if (this.fireFrame !== this.prevFireFrame) {
+      for (const shot of this.sht.shotsForPower(this.power)) {
+        const isLaser = shot.funcs[0] === 2 || shot.funcs[0] === 3;
+        if (isLaser) {
+          // MarisaB persistent lasers (FUN_00438db0/FUN_00438ef0): the record's
+          // delay field is a SLOT INDEX, not a cadence delay; a slot spawns at
+          // most one live beam, only while the option glide is settled in the
+          // record's own focus state (funcs0=2 ⇒ unfocused, 3 ⇒ focused).
+          const slotId = shot.delay;
+          if (slotId < 0 || slotId > 2 || this.laserSlots[slotId]) continue;
+          const settled = this.focusGlideFrame >= GLIDE_FRAMES;
+          const wantFocused = shot.funcs[0] === 3;
+          if (!settled || this.focusHeld !== wantFocused) continue;
+          const b = this.makeBullet(shot);
+          if (!b) continue;
+          if (shot.shotType === 5) b.history = [];
+          // funcs0=2 seeds the countdown from the record's interval field
+          // (130-330 by power); funcs0=3 seeds 999 (held indefinitely).
+          this.laserSlots[slotId] = { bullet: b, timer: wantFocused ? 999 : Math.max(1, shot.interval), fading: false };
+          out.push(b);
+          continue;
+        }
+        const interval = Math.max(1, shot.interval);
+        if (this.fireFrame % interval !== shot.delay % interval) continue;
         const b = this.makeBullet(shot);
-        if (!b) continue;
-        if (shot.shotType === 5) b.history = [];
-        // funcs0=2 seeds the countdown from the record's interval field
-        // (130-330 by power); funcs0=3 seeds 999 (held indefinitely).
-        this.laserSlots[slotId] = { bullet: b, timer: wantFocused ? 999 : Math.max(1, shot.interval), fading: false };
-        out.push(b);
-        continue;
+        if (b) out.push(b);
       }
-      const interval = Math.max(1, shot.interval);
-      if (this.fireFrame % interval !== shot.delay % interval) continue;
-      const b = this.makeBullet(shot);
-      if (b) out.push(b);
     }
+    this.prevFireFrame = this.fireFrame;
     // Advance the split counter (FUN_00436acc) and expire the cycle past
     // frame 29 (exe compares > 0x1d) — the held key re-arms it to 0 on the
     // next update tick, giving the seamless 30-frame loop.
@@ -448,6 +498,7 @@ export class Player {
     if (this.fireFrame > 29) {
       this.fireFrame = -1;
       this.fireFrameFrac = 0;
+      this.prevFireFrame = -999;
     }
     return out;
   }
@@ -461,10 +512,15 @@ export class Player {
     const rect = this.anm.sprites.get(scriptId) ?? this.anm.sprites.get(64);
     const source = shot.orb === 1 || shot.orb === 2 ? this.orbOffset(shot.orb) : { x: 0, y: 0 };
     return {
-      x: this.x + source.x + shot.x,
-      y: this.y + source.y + shot.y,
-      vx: Math.cos(shot.angle) * shot.speed,
-      vy: Math.sin(shot.angle) * shot.speed,
+      poolSlot: -1,
+      // FUN_00438b70 writes spawn position and velocity into the player's
+      // fixed shot slot as f32 fields. Keeping the constructor in double
+      // precision lets long-lived shots cross enemy hitboxes on a different
+      // wall frame even when their authored SHT values are identical.
+      x: Math.fround(this.x + source.x + shot.x),
+      y: Math.fround(this.y + source.y + shot.y),
+      vx: Math.fround(Math.cos(shot.angle) * shot.speed),
+      vy: Math.fround(Math.sin(shot.angle) * shot.speed),
       angle: shot.angle,
       speed: shot.speed,
       damage: shot.damage,

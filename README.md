@@ -102,8 +102,9 @@ node scripts/pixel-report.mjs /tmp/s.png
   机判、可定位到帧。
 - Extra / Phantasm 的覆盖与逆向证据少于 Stage 1-6；其开局 Bomb / Power
   仍采用社区惯例，状态为 PROBABLE。
-- Practice Start、Replay、Result、Music Room、Option、Quit 目前只显示在
-  原作菜单中，尚未接入；结局、replay 与 `score.dat` 持久化也未实现。
+- Practice Start 已接入；Replay 可在浏览器中选择并播放本地原版 `.rpy`
+  （含关卡选择与三种原版播放模式）。Result、Music Room、Option、Quit
+  尚未接入；结局、replay 保存和 `score.dat` 持久化也未实现。
 - Bomb 的共享演出层、符卡宣言、Boss 底部位置标记和部分后段大弹贴图
   映射仍有已标记的近似。更多细节见
   [AGENTS.md §7](AGENTS.md#7-approximations-registry-known-flagged-improvable)。
@@ -238,9 +239,10 @@ under `reference/` is committed, deployed, or loaded by the browser.
   to exact frames.
 - Extra and Phantasm have less coverage and executable evidence than Stages
   1-6. Their initial bomb/power values remain community-convention PROBABLEs.
-- Practice Start, Replay, Result, Music Room, Option, and Quit are visible but
-  not wired. Endings, replay storage, and persistent `score.dat` state are not
-  implemented.
+- Practice Start is wired, and Replay can load and play a browser-local
+  original `.rpy` with stage selection and the three original playback modes.
+  Result, Music Room, Option, and Quit are not wired. Endings, replay saving,
+  and persistent `score.dat` state are not implemented.
 - The shared bomb presentation layer, spell declaration, bottom-edge boss
   marker, and some late-stage large-bullet texture mapping remain explicitly
   marked approximations. See

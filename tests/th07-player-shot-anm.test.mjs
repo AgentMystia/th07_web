@@ -73,6 +73,18 @@ test('flight scripts persist; impact scripts self-remove on schedule', () => {
   assert.ok(frames >= 28 && frames <= 34, `reimu impact lifetime ~30f, got ${frames}`);
 });
 
+test('player-shot impact re-arm frees a t20 script after exactly 20 following ticks', () => {
+  // FUN_0043a980 -> FUN_004486e0 synchronously consumes the t=0 init before
+  // returning to the enemy manager. StageScene therefore seeds the runner's
+  // next-tick clock at 1 rather than replaying t=0 on the following frame.
+  const impact = new AnmRunner(ANMS.ply02, 97);
+  impact.frame = 1;
+  for (let i = 0; i < 19; i++) impact.update();
+  assert.equal(impact.removed, false);
+  impact.update();
+  assert.equal(impact.removed, true);
+});
+
 test('sakuya knife flight scripts carry the vanilla auto-rotate/alpha state', () => {
   for (const script of [64, 65]) {
     const runner = new AnmRunner(ANMS.ply02, script);

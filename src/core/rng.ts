@@ -27,7 +27,9 @@ export class Rng {
   }
 
   f(): number {
-    return this.u32() / 0xffffffff;
+    // Th07.exe FUN_0042ffc0 divides by the float constant 4294967296.0
+    // (@ 0x48eb88), so the generated interval is [0, 1), never exactly 1.
+    return this.u32() / 0x100000000;
   }
 
   range(v: number): number {

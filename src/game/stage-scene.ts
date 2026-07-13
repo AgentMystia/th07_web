@@ -1,4 +1,4 @@
-import { StageRuntime, type StageData } from './eclvm';
+import { advanceBulletExBehavior, StageRuntime, type StageData } from './eclvm';
 import type { GameHost, Enemy, EnemyBullet, EnemyLaser, ItemEntity, ItemType, EffectParticle } from './types';
 import { Rng } from '../core/rng';
 import { normalizeAngle, clamp } from '../core/util';
@@ -32,9 +32,8 @@ export interface RunCarry {
   cherryPlus: number;
   spellsCaptured: number;
   extendLevel: number;
-  // Rank at the NEXT stage's start: +16 per stage clear, capped 32 (see the
-  // rank field comment for the replay-derived evidence).
   rank: number;
+  rankAccumulator?: number;
 }
 
 // Item sprites live in etama.anm entry 1 (the etama2.png sheet), addressed
@@ -59,20 +58,58 @@ const ITEM_ARROW_OFFSET = 10;
 // exe-exact RNG draw cost (raw u16) per particle for the ambient effect types
 // ECL op117/118 spawn, = the DAT_00494fb0 spawnVetoFn's draw count (binary-read
 // confirmed; the paired perFrameGateFns draw ZERO). Only the effectIds stage 1
-// actually uses are listed; id22's real cost branches on launch vx sign
-// (handled at the call site). Effect draws share the gameplay RNG stream, so
+// actually uses are listed; id22's real cost branches only on the authored
+// random-angle sentinel (handled at the call site). Effect draws share the
+// gameplay RNG stream, so
 // these counts are load-bearing for bullet/fire alignment, not cosmetic.
-//   17 → FUN_00419bc0 (1 frand, discarded); 20 → FUN_0041a210 (10 frand+1 u32);
-//   22 → FUN_0041b020 (2 or 4).
-// NOTE (2026-07-12, verified this session but NOT yet wired in — see
-// spawnEnemyDeathEffect): the death/impact family ids 0-6 read the same table
-// (binary @ file 0x933b0): ids 0/1/2 vetoFn NULL = 0 draws; id3 → FUN_00419700
-// (2 frand = 4); ids 4/5/6 → FUN_004194d0 (2 frand = 4); shared gate zero. The
-// legacy spawnEffectParticles path draws 6 for id3/id5 — off by 2/particle. Not
-// corrected yet because it can't help alignment without the per-enemy
-// collision-order restructure (see spawnEnemyDeathEffect), and in isolation it
-// only shifts the hypersensitive first-death frame.
-const EFFECT_DRAW_COST: Record<number, number> = { 17: 2, 20: 22, 22: 2 };
+// Total per-particle raw-u16 costs combine two original paths:
+//   1. the effect table's DAT_00494fb0 spawnVetoFn (file offset 0x933b0), and
+//   2. the authored effect ANM's time-0 op59/op60 executed synchronously by
+//      FUN_004486e0 during allocation.
+// Ignoring (2) undercounted ambient families shared by stages 2-6 even when
+// the veto function itself was modeled exactly.
+const EFFECT_DRAW_COST: Record<number, number> = {
+  // Th07.exe v1.00b effect table + etama.anm entry-scoped scripts.
+  0: 0, 1: 0, 2: 0,
+  3: 4, 4: 4, 5: 4, 6: 4, 7: 4, 8: 4, 9: 4, 10: 4, 11: 4,
+  12: 0, 13: 0, 14: 0, 15: 0,
+  17: 6, 18: 6, 20: 22, 22: 6, 23: 0,
+  26: 14, 27: 12, 29: 6, 30: 16, 31: 16, 32: 6, 33: 6
+};
+const ENEMY_POOL_CAP = 0x1e0;
+const PLAYER_BULLET_POOL_CAP = 0x60;
+const ENEMY_BULLET_POOL_CAP = 0x400;
+const EFFECT_POOL_CAP = 400;
+const NATIVE_PI_F32 = 3.1415927410125732;
+const NATIVE_TAU_F32 = 6.2831854820251465;
+const NATIVE_HALF_PI_F32 = 1.5707963705062866;
+
+// Th07.exe FUN_0042fff0 @ 0x42fff0 accepts two float arguments, stores each
+// add/subtract back through a float local, and stops after at most 18 wraps.
+// This is observably different from a double-precision `% (2*Math.PI)` for
+// large authored angles and at SakuyaA's knife-hit boundaries.
+function normalizeNativeAngleF32(angle: number, delta = 0): number {
+  let value = Math.fround(Math.fround(angle) + Math.fround(delta));
+  for (let i = 0; i < 18 && value > NATIVE_PI_F32; i++) {
+    value = Math.fround(value - NATIVE_TAU_F32);
+  }
+  for (let i = 0; i < 18 && value < -NATIVE_PI_F32; i++) {
+    value = Math.fround(value + NATIVE_TAU_F32);
+  }
+  return value;
+}
+// DAT_00494fb0 maps the small effect id to a master ANM script. These are
+// the authored removal times of the corresponding etama scripts; Infinity
+// denotes an interrupt/gate-owned persistent VM. The optional per-frame
+// callbacks can still release a slot earlier (notably id20 below).
+const EFFECT_SCRIPT_LIFE: Record<number, number> = {
+  0: 20, 1: 20, 2: 40, 3: 40,
+  4: 30, 5: 30, 6: 30, 7: 30, 8: 30, 9: 30, 10: 30, 11: 30,
+  12: 40, 13: Infinity, 14: Infinity, 15: Infinity,
+  17: 60, 18: 240, 19: 120, 20: 300, 21: 40, 22: 90,
+  24: Infinity, 26: 300, 27: 300, 29: 30, 30: 300, 31: 300,
+  32: 90, 33: 120
+};
 const CLEAR_LOADING_ANM = ['loading', 'loading2', 'loading3'] as const;
 
 // SE slot table, Th07.exe @ 0x494a78 (38 entries × 8 bytes: {i32 wavIndex,
@@ -256,21 +293,16 @@ export function enameRowForBoss(stageNumber: number, rootSub: number): number {
 export class StageScene implements GameHost {
   rng = new Rng();
   difficulty = 1;
-  // Th07.exe DAT_00625884. The earlier "retail rank is 0" conclusion (BSS
-  // zero-fill + no visible writes) is DISPROVEN by real replay data: every
-  // T7RP per-stage snapshot records rank at sub-header +0x25 (writer @
-  // 0x4401fa, restore @ 0x440623), and real files carry 16 — never 0 — at
-  // run start (user run stage 1, and all three ZUN demo replays), then
-  // exactly 32 from stage 2 onward of a full run. rank 16 is the NEUTRAL
-  // point of the scale formulas (op73/74 interval = N + N/5 − 2·(N/5)·rank/32
-  // — identity at 16; FIRE adds Lo + (Hi−Lo)·rank/32), so 16 reproduces the
-  // ECL-nominal patterns the earlier hardcode got right. A machine-code scan
-  // of the exe shows no per-frame increment anywhere — rank is constant
-  // within a stage; the recorded 16→32 step across a stage boundary is
-  // modeled as +16 per stage clear, capped at 32 (PROBABLE: with only
-  // fresh=16 / after-stage-1=32 observed, +16-per-clear vs jump-to-32 are
-  // indistinguishable; both fit all current evidence).
+  // T7RP snapshots store the integer rank at +0x25. The live accumulator is
+  // separate: FUN_0042db77/FUN_0042dbf3 add/subtract event points and cross
+  // one integer rank per 100, clamped by the difficulty table @ 0x4955a8.
+  // Direct Stage-1 watchpoints show 16 -> 17 on a graze and ->18 on the
+  // processing-frame-1920 survival award; rank is not stage-constant.
   rank = 16;
+  rankAccumulator = 0;
+  private rankSurvivalTicks = 0;
+  private rankSurvivalFraction = 0;
+  private rankSurvivalAdvanced = false;
   // ECL var 10028 (Th07.exe DAT_00625627): character*2 + shotType.
   get shotIndex(): number {
     const c = this.playerObj.character;
@@ -284,17 +316,38 @@ export class StageScene implements GameHost {
   id = 1;
   player = { x: 192, y: 384 };
   enemies: Enemy[] = [];
+  private readonly enemySlots: (Enemy | null)[] = new Array(ENEMY_POOL_CAP).fill(null);
   enemyBullets: EnemyBullet[] = [];
+  private readonly enemyBulletSlots: (EnemyBullet | null)[] = new Array(ENEMY_BULLET_POOL_CAP).fill(null);
+  // Th07.exe DAT_0099fa60 (bullet manager +0x37a128) is a manager-entry
+  // census, not a continuously maintained live count. It intentionally
+  // remains stale after this pass culls bullets, and next frame's enemy FIRE
+  // uses that snapshot as FUN_00423480's whole-volley capacity gate.
+  enemyBulletManagerEntryCount = 0;
+  // Th07.exe bullet+0xbfe is NOT initialized by FUN_00421e90 and NOT cleared
+  // by FUN_00416c90. It is stale storage owned by the fixed slot: a special
+  // bullet that dies after 128 off-screen ticks can lend that value to the
+  // next ordinary bullet allocated in the same slot, delaying its cull.
+  private readonly enemyBulletOffscreenCounters = new Uint16Array(ENEMY_BULLET_POOL_CAP);
   enemyLasers: EnemyLaser[] = [];
   postBombLaserCounter = 0;
   items: ItemEntity[] = [];
   particles: EffectParticle[] = [];
-  power = 0;
+  private readonly effectSlots: (EffectParticle | null)[] = new Array(EFFECT_POOL_CAP).fill(null);
+  private effectPoolCursor = 0;
+  // GameHost's power view must be the live run-global player field. Keeping a
+  // second numeric copy here made ECL op119 see zero after replay snapshots,
+  // so its full-power branch emitted power drops that spawnItem then converted
+  // to bigCherry instead of the exe's point items (Stage 3, frame 2096).
+  get power(): number {
+    return this.playerObj?.power ?? 0;
+  }
   score = 0;
   focusHeld = false;
   runtime: StageRuntime;
   playerObj: Player;
   playerBullets: PlayerBullet[] = [];
+  private readonly playerBulletSlots: (PlayerBullet | null)[] = new Array(PLAYER_BULLET_POOL_CAP).fill(null);
   graze = 0;
   pointItems = 0;
   // Point-item extend ladder (exe stats +0x2c level / +0x30 threshold,
@@ -310,7 +363,6 @@ export class StageScene implements GameHost {
   // once per frame no matter how many requests (bug 2: se_damage00 spam).
   private sfxPlayedThisFrame = new Set<number>();
   // Th07.exe FUN_0041ebc0: enemy-body graze re-arms every 6 frames while touched.
-  private bodyGrazeCooldown = new Map<number, number>();
   // One cached AnmRunner per stg1bg script id, stepped forward to the
   // current STD frame; shared by every quad instance that references it
   // (see drawBackground / bgAnmFrame).
@@ -324,8 +376,10 @@ export class StageScene implements GameHost {
   // continue screen (3 credits, score reset to the continue count) and a
   // return to the title after game over or the stage-clear tally.
   // 'practice' = the vanilla Practice Start flavor: one stage, 8 lives, no
-  // continues, straight back to the title on clear or game over.
-  mode: 'arcade' | 'practice' | 'test' = 'arcade';
+  // continues, straight back to the title on clear or game over. 'replay'
+  // likewise has no continues and returns to the replay selector; unlike
+  // practice it keeps the ordinary HUD and all state comes from T7RP.
+  mode: 'arcade' | 'practice' | 'replay' | 'test' = 'arcade';
   onExitToTitle: (() => void) | null = null;
   // Fired (arcade mode, stages 1-5) when the player advances past the
   // stage-clear tally; the host tears this scene down and starts stage+1
@@ -424,6 +478,8 @@ export class StageScene implements GameHost {
   // actually removed from enemies this frame after all damage reductions.
   // Read by the ?test=1 snapshot; gameplay never consults them.
   homingTargetId: number | null = null;
+  private homingAim: { id: number; x: number; y: number; z: number } | null = null;
+  private aimBossLocked = false;
   settledDamageThisFrame = 0;
   // Test-only per-pass draw costs in ms (PERF-001 breakdown); rebuilt each
   // draw() and read via the ?test=1 hook. Gameplay never consults it.
@@ -442,6 +498,9 @@ export class StageScene implements GameHost {
   private readonly etamaItemBase: number;
   // Script-driven bomb visuals (see spawnBombEffects).
   private readonly playerEffects: PlayerEffects;
+  // Reserved generic-effect slot used by the player option state machine.
+  // Focus-in creates authored etama.anm effect 24; focus-out interrupts it.
+  private focusEffectRunner: AnmRunner | null = null;
   private prevBombTimer = 0;
   // Moving bomb attack hitboxes (exe player+0x9dc pool; see player-bombs.ts).
   private readonly bombEngine = new BombEngine();
@@ -456,9 +515,20 @@ export class StageScene implements GameHost {
   // Player-wide hit tally (exe player+0x240c): beams/attack slots pop a
   // spark on every 8th (lasers) / 4th (bomb slots) accumulated hit.
   private playerHitTally = 0;
-  // VALIDATION-EXPERIMENT: gates collidePlayerShots (set per frame from
-  // updatePlayerBullets' `collide` arg — false while a dialogue box is up).
+  // Compatibility gate used by focused tests which tick the shot manager
+  // without enabling collisions.
   private shotCollisionEnabled = true;
+  // FUN_0043a980 @ all.c:27626 rejects the whole 96-shot/112-attack scan
+  // when player+0x16a08 equals its previous integer value at +0x16a00.
+  // In the normal player state FUN_0043e2e0 snapshots current->previous,
+  // then advances the shared split counter with DAT_0056baa8. Consequently
+  // enemy collision runs only on integer-advance frames during slow motion
+  // (native Stage 5: rate 1/3, processing 6774/6775 skip, 6776 scans).
+  // State 3 invulnerability and state 4 Border countdown leave +0x16a00 at
+  // the -999 sentinel, so their collision scan remains wall-clock active.
+  private playerShotCollisionClockFrac = 0;
+  private playerShotCollisionClockSpecial = false;
+  private playerShotCollisionClockAdvanced = true;
   // Committed player hits with the striking entity's provenance — the primary
   // localization signal for replay-golden divergences (a replayed player only
   // dies where our simulation disagrees with the original). Ring-capped at 64.
@@ -495,12 +565,14 @@ export class StageScene implements GameHost {
     difficulty = 1,
     character: CharacterId = 'reimuA',
     stageNumber = 1,
-    carry: RunCarry | null = null
+    carry: RunCarry | null = null,
+    initialRngSeed?: number
   ) {
     // The native game loads every SE buffer before play. Web Audio otherwise
     // drops the first request while fetching it; se_pldead00 is normally used
     // only on the first miss, so without this preload that miss is silent.
     this.audio.preloadSfx(SFX_SLOTS.map(([file]) => file));
+    if (initialRngSeed != null) this.rng.seed = initialRngSeed & 0xffff;
     this.difficulty = difficulty;
     this.stageNumber = stageNumber;
     const stageData = (TH07_DATA.stages as unknown as Record<number, StageData>)[stageNumber];
@@ -550,7 +622,7 @@ export class StageScene implements GameHost {
           // the boss-kill sweep stays pinned at 50000, carries into the
           // next stage via RunCarry, and the first positive gain there
           // re-requests the border (the exe's re-fire-on-next-dc6f model).
-          if (this.stageClear || this.isDialogueBlocking() || p.bombTimer > 0 || p.bombInvuln > 0 ||
+          if (this.stageClear || this.isDialogueActive() || p.bombTimer > 0 || p.bombInvuln > 0 ||
               p.invulnFrames > 0 || p.materializeFrame >= 0 || p.dyingFrame >= 0) {
             return 'defer';
           }
@@ -584,6 +656,8 @@ export class StageScene implements GameHost {
       enemy: this.enemyAnm,
       effect: this.effectAnm
     });
+    this.runtime.reset();
+    this.runtime.initializeRandomCounters(this.rng);
     this.etamaItemBase = assets.anms.etama.entries[1].spriteBase;
     this.playerObj = new Player(character, assets.anms);
     this.playerEffects = new PlayerEffects(this.playerObj.anm);
@@ -613,8 +687,183 @@ export class StageScene implements GameHost {
       this.cherry.spellsCaptured = carry.spellsCaptured;
       this.extendLevel = carry.extendLevel;
       this.rank = carry.rank;
+      this.rankAccumulator = carry.rankAccumulator ?? 0;
       this.startStageTransition();
     }
+  }
+
+  // -- native fixed-slot pools ---------------------------------------------
+
+  private insertByPoolSlot<T extends { poolSlot: number }>(dense: T[], value: T): void {
+    let lo = 0;
+    let hi = dense.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (dense[mid].poolSlot <= value.poolSlot) lo = mid + 1;
+      else hi = mid;
+    }
+    dense.splice(lo, 0, value);
+  }
+
+  addEnemy(enemy: Enemy): boolean {
+    let slot = enemy.poolSlot;
+    if (slot < 0 || slot >= ENEMY_POOL_CAP || this.enemySlots[slot] !== null) {
+      slot = this.enemySlots.indexOf(null);
+    }
+    if (slot < 0) return false;
+    enemy.poolSlot = slot;
+    this.enemySlots[slot] = enemy;
+    this.insertByPoolSlot(this.enemies, enemy);
+    return true;
+  }
+
+  addEnemyBullet(bullet: EnemyBullet): boolean {
+    const slot = bullet.poolSlot;
+    if (slot < 0 || slot >= ENEMY_BULLET_POOL_CAP) return false;
+    if (this.enemyBulletSlots[slot]?.dead) this.enemyBulletSlots[slot] = null;
+    if (this.enemyBulletSlots[slot] !== null) return false;
+    bullet.offscreenFrames = this.enemyBulletOffscreenCounters[slot];
+    this.enemyBulletSlots[slot] = bullet;
+    this.insertByPoolSlot(this.enemyBullets, bullet);
+    return true;
+  }
+
+  clearEnemyBullets(): void {
+    this.enemyBullets.length = 0;
+    this.enemyBulletSlots?.fill(null);
+  }
+
+  removeEnemyBullet(bullet: EnemyBullet): void {
+    bullet.dead = true;
+    const slot = bullet.poolSlot;
+    if (this.enemyBulletSlots && slot >= 0 && slot < ENEMY_BULLET_POOL_CAP && this.enemyBulletSlots[slot] === bullet) {
+      this.enemyBulletSlots[slot] = null;
+    }
+  }
+
+  private addPlayerBullet(bullet: PlayerBullet): boolean {
+    const slot = this.playerBulletSlots.indexOf(null);
+    if (slot < 0) return false;
+    bullet.poolSlot = slot;
+    this.playerBulletSlots[slot] = bullet;
+    this.insertByPoolSlot(this.playerBullets, bullet);
+    return true;
+  }
+
+  private syncEnemySlots(): void {
+    const live = this.enemies.filter((enemy) => enemy && !enemy.dead);
+    let valid = live.length === this.enemySlots.reduce((n, enemy) => n + (enemy ? 1 : 0), 0);
+    if (valid) {
+      for (const enemy of live) {
+        if (enemy.poolSlot < 0 || enemy.poolSlot >= ENEMY_POOL_CAP || this.enemySlots[enemy.poolSlot] !== enemy) {
+          valid = false;
+          break;
+        }
+      }
+    }
+    if (valid) return;
+    this.enemySlots.fill(null);
+    const rebuilt: Enemy[] = [];
+    for (const enemy of live) {
+      let slot = Number.isInteger(enemy.poolSlot) ? enemy.poolSlot : -1;
+      if (slot < 0 || slot >= ENEMY_POOL_CAP || this.enemySlots[slot] !== null) slot = this.enemySlots.indexOf(null);
+      if (slot < 0) { enemy.dead = true; continue; }
+      enemy.poolSlot = slot;
+      this.enemySlots[slot] = enemy;
+      rebuilt.push(enemy);
+    }
+    rebuilt.sort((a, b) => a.poolSlot - b.poolSlot);
+    this.enemies = rebuilt;
+  }
+
+  private syncPlayerBulletSlots(): void {
+    const live = this.playerBullets.filter((bullet) => bullet && !bullet.dead);
+    let valid = live.length === this.playerBulletSlots.reduce((n, bullet) => n + (bullet ? 1 : 0), 0);
+    if (valid) {
+      for (const bullet of live) {
+        if (bullet.poolSlot < 0 || bullet.poolSlot >= PLAYER_BULLET_POOL_CAP || this.playerBulletSlots[bullet.poolSlot] !== bullet) {
+          valid = false;
+          break;
+        }
+      }
+    }
+    if (valid) return;
+    this.playerBulletSlots.fill(null);
+    const rebuilt: PlayerBullet[] = [];
+    for (const bullet of live) {
+      let slot = Number.isInteger(bullet.poolSlot) ? bullet.poolSlot : -1;
+      if (slot < 0 || slot >= PLAYER_BULLET_POOL_CAP || this.playerBulletSlots[slot] !== null) slot = this.playerBulletSlots.indexOf(null);
+      if (slot < 0) { bullet.dead = true; continue; }
+      bullet.poolSlot = slot;
+      this.playerBulletSlots[slot] = bullet;
+      rebuilt.push(bullet);
+    }
+    rebuilt.sort((a, b) => a.poolSlot - b.poolSlot);
+    this.playerBullets = rebuilt;
+  }
+
+  private syncEnemyBulletSlots(): void {
+    const live = this.enemyBullets.filter((bullet) => bullet && !bullet.dead);
+    let valid = live.length === this.enemyBulletSlots.reduce((n, bullet) => n + (bullet ? 1 : 0), 0);
+    if (valid) {
+      for (const bullet of live) {
+        if (bullet.poolSlot < 0 || bullet.poolSlot >= ENEMY_BULLET_POOL_CAP || this.enemyBulletSlots[bullet.poolSlot] !== bullet) {
+          valid = false;
+          break;
+        }
+      }
+    }
+    if (valid) return;
+    this.enemyBulletSlots.fill(null);
+    const rebuilt: EnemyBullet[] = [];
+    for (const bullet of live) {
+      let slot = Number.isInteger(bullet.poolSlot) ? bullet.poolSlot : -1;
+      if (slot < 0 || slot >= ENEMY_BULLET_POOL_CAP || this.enemyBulletSlots[slot] !== null) slot = this.enemyBulletSlots.indexOf(null);
+      if (slot < 0) { bullet.dead = true; continue; }
+      bullet.poolSlot = slot;
+      this.enemyBulletOffscreenCounters[slot] = bullet.offscreenFrames ?? this.enemyBulletOffscreenCounters[slot];
+      bullet.offscreenFrames = this.enemyBulletOffscreenCounters[slot];
+      this.enemyBulletSlots[slot] = bullet;
+      rebuilt.push(bullet);
+    }
+    rebuilt.sort((a, b) => a.poolSlot - b.poolSlot);
+    this.enemyBullets = rebuilt;
+  }
+
+  private syncFixedPools(): void {
+    this.syncEnemySlots();
+    this.syncPlayerBulletSlots();
+    this.syncEnemyBulletSlots();
+    this.syncEffectSlots();
+  }
+
+  private syncEffectSlots(): void {
+    const live = this.particles.filter((particle) => particle && particle.age < particle.life);
+    let valid = live.length === this.effectSlots.reduce((n, particle) => n + (particle ? 1 : 0), 0);
+    if (valid) {
+      for (const particle of live) {
+        if (particle.poolSlot < 0 || particle.poolSlot >= EFFECT_POOL_CAP ||
+            this.effectSlots[particle.poolSlot] !== particle) {
+          valid = false;
+          break;
+        }
+      }
+    }
+    if (valid) return;
+    this.effectSlots.fill(null);
+    const rebuilt: EffectParticle[] = [];
+    for (const particle of live) {
+      let slot = Number.isInteger(particle.poolSlot) ? particle.poolSlot : -1;
+      if (slot < 0 || slot >= EFFECT_POOL_CAP || this.effectSlots[slot] !== null) {
+        slot = this.effectSlots.indexOf(null);
+      }
+      if (slot < 0) continue;
+      particle.poolSlot = slot;
+      this.effectSlots[slot] = particle;
+      rebuilt.push(particle);
+    }
+    rebuilt.sort((a, b) => a.poolSlot - b.poolSlot);
+    this.particles = rebuilt;
   }
 
   // Next point-item extend threshold for the current level (all.c:22101-22120).
@@ -641,13 +890,58 @@ export class StageScene implements GameHost {
   }
 
   // Point-extend award, Th07.exe FUN_0042bf29 @ 0x42bf29: +1 life below 8
-  // lives, else +1 bomb below 8 bombs, else nothing. se_extend either way.
+  // lives, else +1 bomb below 8 bombs, else nothing. Both successful paths
+  // go through FUN_0042bcbc/FUN_0042bd01, which call FUN_00401700 and consume
+  // two u32 values from the shared gameplay RNG before the rank/SFX work.
   private awardExtend(): void {
     const p = this.playerObj;
     if (p.lives < 8) p.lives++;
     else if (p.bombs < 8) p.bombs++;
     else return;
+    this.refreshPowerHudRandomState();
+    this.adjustRank(200);
     this.playSfx(28);
+  }
+
+  private adjustRank(delta: number): void {
+    // Th07.exe FUN_0042db77/FUN_0042dbf3 @ 0x42db77/0x42dbf3.
+    // Difficulty rows {start,min,max}: E 16/12/20; N/H/L 16/10/32;
+    // Extra/Phantasm 16/15/16 (table @ 0x4955a8).
+    const bounds = this.difficulty === 0 ? { min: 12, max: 20 }
+      : this.difficulty <= 3 ? { min: 10, max: 32 }
+        : { min: 15, max: 16 };
+    this.rankAccumulator += Math.trunc(delta);
+    while (this.rankAccumulator >= 100) {
+      this.rank++;
+      this.rankAccumulator -= 100;
+    }
+    while (this.rankAccumulator < 0) {
+      this.rank--;
+      this.rankAccumulator += 100;
+    }
+    this.rank = Math.min(bounds.max, Math.max(bounds.min, this.rank));
+  }
+
+  private tickRankSurvival(): void {
+    // FUN_0041ed50 @ 0x41eda5-0x41ee20 checks the enemy-manager split
+    // counter before its per-frame tail advances it. A newly reached integer
+    // tick is rewarded when divisible by 2400-lives*240. The source operand
+    // is run stats +0x5c (the same lives float read by FUN_0042bf29), not the
+    // difficulty byte. Dialogue/time freeze skips updateEnemies entirely;
+    // slowmo advances the fraction only.
+    if (this.rankSurvivalAdvanced) {
+      const interval = 2400 - Math.trunc(this.playerObj.lives) * 240;
+      if (this.rankSurvivalTicks > 0 && this.rankSurvivalTicks % interval === 0) {
+        this.adjustRank(100);
+      }
+    }
+    this.rankSurvivalAdvanced = false;
+    this.rankSurvivalFraction += this.slowRate;
+    while (this.rankSurvivalFraction >= 1) {
+      this.rankSurvivalFraction -= 1;
+      this.rankSurvivalTicks++;
+      this.rankSurvivalAdvanced = true;
+    }
   }
 
   // Stage-clear bonus, exe-exact (FUN_00429446's credit block @
@@ -702,7 +996,8 @@ export class StageScene implements GameHost {
       cherryPlus: this.cherry.cherryPlus,
       spellsCaptured: this.cherry.spellsCaptured,
       extendLevel: this.extendLevel,
-      rank: Math.min(32, this.rank + 16)
+      rank: this.rank,
+      rankAccumulator: this.rankAccumulator
     };
   }
 
@@ -741,12 +1036,21 @@ export class StageScene implements GameHost {
     const shake = this.screenShake;
     this.shakeX = 0;
     this.shakeY = 0;
-    if (shake) {
-      const mag = shake.from + (shake.elapsed / shake.duration) * (shake.to - shake.from);
-      const pick = () => [0, mag, -mag][this.rng.u32InRange(3)];
-      this.shakeX = pick();
-      this.shakeY = pick();
-      if (++shake.elapsed >= shake.duration) this.screenShake = null;
+    if (shake && !this.isDialogueBlocking()) {
+      // Th07.exe (v1.00b) FUN_00445790 @ 0x4457c4-0x4457e6 advances
+      // the split counter BEFORE testing it against the duration. Thus a
+      // duration-N shake draws on counter values 1..N-1 (N-1 ticks), not
+      // 0..N-1. Drawing before the advance kept effect 9 alive one extra
+      // frame and consumed a spurious u32 pair (Stage 5 replay PRE5280).
+      shake.elapsed += this.slowRate;
+      if (shake.elapsed >= shake.duration) {
+        this.screenShake = null;
+      } else {
+        const mag = shake.from + (shake.elapsed / shake.duration) * (shake.to - shake.from);
+        const pick = () => [0, mag, -mag][this.rng.u32InRange(3)];
+        this.shakeX = pick();
+        this.shakeY = pick();
+      }
     }
     const flash = this.screenFlash;
     if (flash && ++flash.timer >= flash.duration) {
@@ -908,84 +1212,169 @@ export class StageScene implements GameHost {
     y: number,
     count: number,
     color: number,
-    seed?: { x: number; y: number; z: number }
+    seed?: { x: number; y: number; z: number },
+    ownerEnemyId?: number
   ): void {
     // The whole engine draws from ONE RNG stream (all 147 exe call sites share
     // state 0x495e00), so a decorative effect that consumes the wrong number of
-    // draws desyncs every later GAMEPLAY draw that frame. These are the etama
-    // ambient particles allocated by exe FUN_0041b320/FUN_0041b560 (ECL op
-    // 117/118) out of a 400-slot pool; each allocated particle draws exactly
-    // its DAT_00494fb0 spawnVetoFn count, and the per-frame gate functions for
-    // the types stage 1 uses draw ZERO (binary-read confirmed). We reproduce
-    // the exe DRAW COUNT exactly; the visual is an approximation. Because every
-    // draw is one seed step, drawing N raw u16 == the exe's frand/u32 mix
-    // summing to N — stream-identical regardless of the visual mapping.
+    // draws desyncs every later GAMEPLAY draw that frame. FUN_0041b320 scans a
+    // rolling, fixed 400-slot pool and only initializes (therefore only draws
+    // RNG for) a particle after it finds a free slot. A full scan stops the
+    // entire request. This capacity/order contract is observable in Stage 3,
+    // where a four-snow request at processing frame 939 finds only two slots.
+    const requested = Math.max(0, count | 0);
     const spec = EFFECT_DRAW_COST[effectId];
-    if (spec !== undefined) {
-      // exe caps at free pool slots (<=400); stage-1 per-call counts are <=64,
-      // within our visual cap, so this bound never trims a real draw here.
-      const n = Math.min(Math.max(0, count | 0), 64);
-      // effectId 22 (FUN_0041b020): 4 raw draws when the launch velocity.x <= 0
-      // (its `+600` field, seeded from op118's operand — DAT_0048ec28 == 0.0),
-      // else 2. Other spec'd types are a fixed raw count (id17=2, id20=22).
-      const perParticle = effectId === 22 ? (!seed || seed.x <= 0 ? 4 : 2) : spec;
-      const snow = perParticle >= 12;
-      for (let i = 0; i < n; i++) {
-        // Draw EXACTLY `perParticle` raw u16 — one seed step each, so this
-        // matches the exe spawnVetoFn's frand/u32 mix seed-for-seed. Map the
-        // first two draws to a drift velocity (visual only).
+    for (let tries = 0, remaining = requested; tries < EFFECT_POOL_CAP && remaining > 0; tries++) {
+      const slot = this.effectPoolCursor;
+      this.effectPoolCursor = (this.effectPoolCursor + 1) % EFFECT_POOL_CAP;
+      if (this.effectSlots[slot] !== null) continue;
+
+      let particle: EffectParticle;
+      if (effectId === 20 || effectId === 26 || effectId === 27 ||
+          effectId === 30 || effectId === 31) {
+        // Th07.exe DAT_00494fb0: ids 20/26/27/30/31 all install
+        // FUN_0041a050 as their per-frame gate. Their spawn initializers are
+        // FUN_0041a210/a600/a8d0/ab50/ad80 respectively. They are genuine
+        // world-space particles, not fixed 300-frame screen sprites: omitting
+        // the shared camera-cone/ground gate left hundreds of stale id30/31
+        // slots alive in Stage 5 and changed which later RNG-visible effects
+        // the rolling 400-slot allocator could accept.
+        const camera = this.runtime.std.camera();
+        const facing = this.runtime.std.facing();
+        const r = (): number => this.rng.f();
+        const scaled = (value: number): number => Math.fround(Math.fround(value) * this.slowRate);
+        const origin = (dx: number, dy: number, dz: number) => ({
+          x: Math.fround(camera.x + facing.x / 2 + dx),
+          y: Math.fround(camera.y + facing.y / 2 + dy),
+          z: Math.fround(camera.z + facing.z / 2 + dz)
+        });
+        const launchX = Math.fround(seed?.x ?? 0);
+        const launchY = Math.fround(seed?.y ?? 0);
+        const launchZ = Math.fround(seed?.z ?? 0);
+        let pos: { x: number; y: number; z: number };
+        let vx: number;
+        let vy: number;
+        let vz: number;
+        let ax = 0;
+        let ay = 0;
+        let az = 0;
+        if (effectId === 20) {
+          // FUN_0041a210: ten frand calls plus one u32 tint branch.
+          pos = origin(r() * 120 - 60, r() * 200 - 100, r() * 100 - 100);
+          vx = scaled(launchX + r() * 0.06 - 0.03);
+          vy = scaled(launchY + r() * 0.06 - 0.03);
+          vz = scaled(launchZ + r() * 0.1 + 0.03);
+          ax = scaled(r() * 0.0002 - 0.0001);
+          ay = scaled(r() * 0.0002 - 0.0001);
+        } else if (effectId === 26 || effectId === 27) {
+          // FUN_0041a600 / FUN_0041a8d0. The caller's launch-x is the
+          // authored orbital divisor (+0x258); real stage data keeps it
+          // non-zero. Both variants bake slowRate into their velocity once.
+          const dx = Math.fround(r() * 160 - 80);
+          const dy = Math.fround(r() * 160 - 80);
+          pos = origin(dx, dy, -(r()) - 50);
+          vx = scaled(-dy / launchX);
+          vy = scaled(dx / launchX);
+          vz = scaled(effectId === 26 ? r() * 0.1 + 0.09 : -(r() * 0.2) - 0.06);
+          // FUN_0041a600 has one additional unconditional u32 tint branch.
+          // It occurs after the two angle draws below.
+        } else if (effectId === 30) {
+          // FUN_0041ab50 deliberately does not slowRate-scale its launch
+          // vector; its per-frame manager clock supplies the rate behavior.
+          pos = origin(r() * 160 - 80, r() * 160 - 80, 1 - r());
+          vx = Math.fround(launchX + r() * 0.06 - 0.03);
+          vy = Math.fround(launchY + r() * 0.06 - 0.03);
+          vz = Math.fround(launchZ + r() * 0.02 + 0.01);
+        } else {
+          // FUN_0041ad80 (id31): falling world flakes with a constant
+          // -0.015 z acceleration. Velocity is spawn-time slowRate baked.
+          pos = origin(r() * 160 - 80, r() * 160 - 80, r() * 200);
+          vx = scaled(launchX + r() * 0.06 - 0.03);
+          vy = scaled(launchY + r() * 0.06 - 0.03);
+          vz = scaled(launchZ - r() * 0.1);
+          az = Math.fround(-0.015);
+        }
+        const angle = Math.fround(r() * Math.PI * 2 - Math.PI);
+        const angularVelocity = Math.fround(r() * 0.031415928 - 0.015707964);
+        if (effectId === 20 || effectId === 26) this.rng.u32();
+        const world = { ...pos, vx, vy, vz, ax, ay, az, angle, angularVelocity };
+        particle = {
+          id: this.id++, poolSlot: slot, effectId,
+          x, y, vx: 0, vy: 0, age: 0, life: 300,
+          color, size: 3, kind: 'snow', world,
+          ...(ownerEnemyId == null ? {} : { ownerEnemyId })
+        };
+      } else if (spec !== undefined) {
+        // Effect ids 22/32 use FUN_0041b020's sentinel branch in addition to
+        // four unconditional ANM time-0 draws. Th07.exe (v1.00b) @ 0x41b02c
+        // compares launch-x with the f64 constant -990.0 @ 0x48ec28: values
+        // <= -990 request a random angle (8 total draws), while ordinary
+        // signed launch vectors are deterministic (6). Treating the low
+        // dword of that f64 as a standalone 0.0 caused every negative half of
+        // Stage 1 Sub51's orbit to overdraw by two.
+        const conditional = effectId === 22 || effectId === 32;
+        const perParticle = conditional ? (seed && seed.x <= -990 ? 8 : 6) : spec;
+        // Draw EXACTLY `perParticle` raw u16. The first pair only drives the
+        // port's fallback visual; authored lifetime/capacity remains exact.
         let vx = 0;
         let vy = 0;
         for (let d = 0; d < perParticle; d++) {
-          const r = this.rng.u16();
+          const raw = this.rng.u16();
           if (d === 0) {
-            const ang = (r / 65536) * Math.PI * 2;
+            const ang = (raw / 65536) * Math.PI * 2;
             vx = Math.cos(ang);
             vy = Math.sin(ang);
           } else if (d === 1) {
-            const sp = (0.3 + (r / 65536) * 0.9) * this.slowRate;
-            vx *= sp;
-            vy *= sp;
+            const speed = (0.3 + (raw / 65536) * 0.9) * this.slowRate;
+            vx *= speed;
+            vy *= speed;
           }
         }
         if (seed) {
           vx += seed.x * 0.02;
           vy += seed.y * 0.02;
         }
-        this.particles.push({
-          id: this.id++,
-          x,
-          y,
-          vx,
-          vy,
-          age: 0,
-          life: snow ? 180 : 24,
-          color,
-          size: snow ? 3 : 2,
-          kind: snow ? 'snow' : 'spark'
-        });
+        const snow = effectId === 26 || effectId === 27 || effectId === 30 || effectId === 31;
+        particle = {
+          id: this.id++, poolSlot: slot, effectId,
+          x, y, vx, vy, age: 0,
+          life: EFFECT_SCRIPT_LIFE[effectId] ?? 24,
+          color, size: snow ? 3 : 2, kind: snow ? 'snow' : 'spark',
+          ...(ownerEnemyId == null ? {} : { ownerEnemyId })
+        };
+      } else {
+        // Unrecovered ids 16/25/28 keep the legacy visual/RNG model, but now
+        // still obey the native fixed-pool allocation contract.
+        const isSnow = effectId >= 18;
+        const angle = this.rng.range(Math.PI * 2);
+        const speed = (isSnow ? 0.2 + this.rng.range(0.5) : 0.5 + this.rng.range(2)) * this.slowRate;
+        particle = {
+          id: this.id++, poolSlot: slot, effectId,
+          x: x + (isSnow ? this.rng.range(384) - 192 : 0),
+          y: y + (isSnow ? this.rng.range(64) - 32 : 0),
+          vx: isSnow ? -0.3 - this.rng.range(0.4) : Math.cos(angle) * speed,
+          vy: isSnow ? 0.7 + this.rng.range(0.8) : Math.sin(angle) * speed,
+          age: 0, life: isSnow ? 240 : 24 + this.rng.u32InRange(16),
+          color, size: isSnow ? 2 + this.rng.range(2) : 3,
+          kind: isSnow ? 'snow' : 'spark',
+          ...(ownerEnemyId == null ? {} : { ownerEnemyId })
+        };
       }
-      return;
+      this.effectSlots[slot] = particle;
+      this.insertByPoolSlot(this.particles, particle);
+      remaining--;
     }
-    // Not-yet-RE'd effectIds (bomb/deathbomb/enemy-death bursts 0/2/3/5/6/12/16):
-    // legacy approximation. Draw counts here are NOT exe-verified — tracked as
-    // the remaining stage-1 budget gap (id3 enemy-death is the largest).
-    const isSnow = effectId >= 18;
-    for (let i = 0; i < Math.min(count, 64); i++) {
-      const angle = this.rng.range(Math.PI * 2);
-      const speed = (isSnow ? 0.2 + this.rng.range(0.5) : 0.5 + this.rng.range(2)) * this.slowRate;
-      this.particles.push({
-        id: this.id++,
-        x: x + (isSnow ? this.rng.range(384) - 192 : 0),
-        y: y + (isSnow ? this.rng.range(64) - 32 : 0),
-        vx: isSnow ? -0.3 - this.rng.range(0.4) : Math.cos(angle) * speed,
-        vy: isSnow ? 0.7 + this.rng.range(0.8) : Math.sin(angle) * speed,
-        age: 0,
-        life: isSnow ? 240 : 24 + this.rng.u32InRange(16),
-        color,
-        size: isSnow ? 2 + this.rng.range(2) : 3,
-        kind: isSnow ? 'snow' : 'spark'
-      });
+  }
+
+  releaseEnemyEffects(ownerEnemyId: number): void {
+    // FUN_0041dda0 sets the six op100 aura handles' +0x2ce release byte.
+    // FUN_004198b0 then fades them for 16 effect-manager ticks before freeing
+    // their general-pool slots; release happens ahead of priority-11 effects,
+    // so the first fade tick is the same frame as enemy removal.
+    for (const particle of this.particles) {
+      if (particle.ownerEnemyId === ownerEnemyId && particle.releaseFrames == null) {
+        particle.releaseFrames = 16;
+      }
     }
   }
 
@@ -1032,8 +1421,12 @@ export class StageScene implements GameHost {
     });
   }
 
-  isDialogueBlocking(): boolean {
+  isDialogueActive(): boolean {
     return !!this.dialogue && !this.dialogue.done;
+  }
+
+  isDialogueBlocking(): boolean {
+    return !!this.dialogue && this.dialogue.blocking;
   }
 
   consumeDialogueResume(): boolean {
@@ -1078,8 +1471,10 @@ export class StageScene implements GameHost {
     tally.seen++;
     this.spellHistory.set(spellId, tally);
     this.playSfx(14);
-    // Declaration charge burst at the boss (se_cat00 above is the charge SE).
-    if (this.bossActive) this.spawnEffectParticles(3, this.bossActive.x, this.bossActive.y, 24, 0xffffffff);
+    // Th07.exe (v1.00b) FUN_0040ee30 @ 0x40ee30 allocates one template-0x19
+    // spell-presentation entity here. It does not request the generic id-3
+    // particle family (and therefore consumes no gameplay RNG at declaration).
+    // The authored presentation is represented by `spellcard`/`spellBanner`.
   }
 
   endBossSpell(): boolean {
@@ -1119,7 +1514,7 @@ export class StageScene implements GameHost {
     // 10 ignores the immunity bit) — and the spell is marked failed
     // (DAT_012f40a8 -> 2) so the op91 that follows skips the scored sweep.
     this.phaseTimedOut = true;
-    this.enemyBullets.length = 0;
+    this.clearEnemyBullets();
     this.cancelLasers(true);
   }
 
@@ -1144,20 +1539,11 @@ export class StageScene implements GameHost {
     this.addScore(value);
   }
 
-  spawnEnemyDeathEffect(e: Enemy): void {
-    // APPROXIMATION (id3×12 = 72 raw draws) — STILL the legacy burst. The
-    // per-enemy collision restructure (see updateEnemies / collidePlayerShots)
-    // is now in place, so id5/death draws DO interleave in exe order; but wiring
-    // the exact death model below on top of it REDUCED the ghost kill-match
-    // (131→101) because the id5 impact-spark CADENCE isn't exe-exact yet (exe
-    // FUN_0043a980: per-bullet first-hit id5 [ours matches] PLUS every-4th-hit
-    // id3/id5 via a global counter). Add the death model + id5 every-4th cadence
-    // TOGETHER, then re-measure. Verified exe death model — FUN_0041ed50 death
-    // switch (all.c 14310-14370), default fairy (0x2e14=0→id0, 0x2e15=0→id4,
-    // 0x2e10=-1): id0×1 (0) + id4×4 (16) ALWAYS, + id4×6 (24) + 0-draw item on a
-    // GLOBAL 1-in-3 counter (deaths #0,3,6…). Veto costs (effect table @ file
-    // 0x933b0): id0/1/2 NULL=0; id3=FUN_00419700=4; id4/5/6=FUN_004194d0=4.
-    this.spawnEffectParticles(3, e.x, e.y, 12, 0xffffffff);
+  spawnEnemyDeathEffect(e: Enemy, deathMode = e.ecl.deathMode & 7): void {
+    // StageRuntime owns the executable's complete preburst -> item -> common
+    // effect order. This optional hook remains as a test-observation seam.
+    void e;
+    void deathMode;
   }
 
   // Th07.exe FUN_00422ea0(1) (op80, spell declare, full-power crossing):
@@ -1169,7 +1555,7 @@ export class StageScene implements GameHost {
       if (b.dead) continue;
       this.spawnItem('cherry', b.x, b.y, { state: 1 });
     }
-    this.enemyBullets.length = 0;
+    this.clearEnemyBullets();
     // FUN_00422ea0(1) also converts each non-immune live laser at its
     // origin and every 32 px along [nearDist, farDist).
     this.cancelLaserField(false, true);
@@ -1191,7 +1577,7 @@ export class StageScene implements GameHost {
       total += value;
       value = Math.min(8000, value + 20);
     }
-    this.enemyBullets.length = 0;
+    this.clearEnemyBullets();
     // FUN_00423100 does not apply the bomb-immunity flag to lasers. Their
     // converted items do not contribute to the escalating score total.
     this.cancelLaserField(true, true);
@@ -1259,19 +1645,31 @@ export class StageScene implements GameHost {
       spawnDuration: 0,
       spawnMoveScale: 1,
       exFlags: 0,
+      exSlots: [null, null, null, null, null],
+      exFireFlags: flags,
+      exBehaviorIndex: 0,
+      exRampElapsed: 0,
+      exRampFrac: 0,
       exAccel: null,
+      exAccelElapsed: 0,
+      exAccelFrac: 0,
       exAngle: null,
+      exAngleElapsed: 0,
+      exAngleFrac: 0,
       exDir: null,
+      exDirElapsed: 0,
+      exDirFrac: 0,
       exBounce: null,
-      dirTimes: undefined,
+      dirTimes: 0,
+      exBounceTimes: 0,
       dead: false
     });
-    this.enemyBullets.length = 0;
-    this.enemyBullets.push(
-      make(p.x, 0),
-      make(p.x + 160, 0),
-      make(p.x + 160, 0x1000)
-    );
+    this.clearEnemyBullets();
+    const bullets = [make(p.x, 0), make(p.x + 160, 0), make(p.x + 160, 0x1000)];
+    bullets.forEach((bullet, poolSlot) => {
+      bullet.poolSlot = poolSlot;
+      this.addEnemyBullet(bullet);
+    });
     return true;
   }
 
@@ -1287,10 +1685,7 @@ export class StageScene implements GameHost {
 
   update(input: InputFrame): void {
     this.frame++;
-    // Refresh the shared SakuyaA aim snapshot before anything fires this
-    // frame (positions are unchanged since the previous frame's enemy pass,
-    // matching the exe's scan-in-enemy-loop timing).
-    this.updateSakuyaAimCache();
+    this.syncFixedPools();
     // The continue screen freezes gameplay entirely, like the original.
     if (this.continueScreen) {
       this.updateContinueScreen(input);
@@ -1324,7 +1719,7 @@ export class StageScene implements GameHost {
         (this.stageClearTimer > 90 && input.pressed.has('shoot')) || this.stageClearTimer > 900;
       if (this.mode !== 'test' && advance && !this.stageCompleteFired) {
         this.stageCompleteFired = true;
-        if (this.mode === 'arcade' && this.stageNumber < 6 && this.onStageComplete) {
+        if (((this.mode === 'arcade' && this.stageNumber < 6) || this.mode === 'replay') && this.onStageComplete) {
           this.onStageComplete(this.carryState());
         } else {
           // Stage 6 / Extra / Phantasm end the credit; practice always
@@ -1337,24 +1732,22 @@ export class StageScene implements GameHost {
     const p = this.playerObj;
     this.sfxPlayedThisFrame.clear();
     this.settledDamageThisFrame = 0;
-    // During a story-dialogue box the player keeps FULL movement control, as
-    // in the original PCB: only damage is suspended. What freezes is the rest
-    // of the simulation -- enemy/boss scripts, enemy-bullet motion, the
-    // player's own shots and bomb, and every collision test -- so you can
-    // reposition while the conversation is up but neither deal nor take
-    // damage. (The exe's DAT_0061c25c freeze, exe-misc-ecl-ops.md §2, covers
-    // the boss timer, enemy-bullet motion and stage spawns; player movement
-    // is deliberately NOT gated by it.) `frozen` is captured once at the top
-    // of the frame; the dialogue box's own advance below may clear
-    // `this.dialogue` mid-frame, taking effect next frame.
+    // Full story dialogue uses the global DAT_0061c25c freeze. `frozen` is
+    // captured once at the top of the frame; the dialogue box's own advance
+    // below may clear `this.dialogue` mid-frame, taking effect next frame.
     const frozen = this.isDialogueBlocking();
+    // Timestamp-only MSG tracks (Stage 5/6 entry 22) leave DAT_0061c25c at
+    // zero: player, enemy, effect, item, and bullet managers all keep running.
+    // FUN_00429483 is a narrower MSG-active predicate used by input-triggered
+    // actions such as bomb/border activation and the shot-cycle re-arm.
+    const messageActive = this.isDialogueActive();
     // The exe reads the bomb button as a raw HELD bit (DAT_004afe30 bit 2 @
     // 0x43d9c3/0x43db3b — gameplay buttons have no edge detection at all),
     // so a bomb held across a dialogue unblock or across the cooldown fires
     // on the first frame the gates open. Bombing during the deathbomb
     // window (p.hitState) still rescues; the squish/materialize are closed
     // by the meter gate inside tryBomb().
-    if (!frozen && input.held.has('bomb') && (p.controllable || p.hitState) && !this.gameOver) {
+    if (!messageActive && input.held.has('bomb') && (p.controllable || p.hitState) && !this.gameOver) {
       if (this.cherry.borderEngaged) {
         // Th07.exe FUN_0043d9a0 @ 0x43d9ac-0x43d9f2: bombing during a
         // border (active OR pending) invokes the free break instead of a
@@ -1372,10 +1765,39 @@ export class StageScene implements GameHost {
         this.onBombUsed();
       }
     }
-    if (!frozen) this.cherry.retryBorderStart();
-    // Movement runs every frame, dialogue or not.
-    p.update(input, this.slowRate);
-    this.focusHeld = p.focusHeld;
+    if (!messageActive) this.cherry.retryBorderStart();
+    // FUN_0043eef0 returns immediately while the full-dialogue global
+    // DAT_0061c25c is set: movement, player ANM, timers and shot MOVE/FIRE
+    // all stop. Timestamp-only MSG leaves that global zero, so the callback
+    // still runs; only FUN_0043a930's shot-cycle re-arm is suppressed by the
+    // narrower FUN_00429483 message-active predicate.
+    if (!frozen) {
+      // FUN_0043e2e0 precedes movement, shot MOVE/FIRE, and the priority-10
+      // enemy manager. Snapshot the state before Player.update consumes the
+      // last invulnerability tick, matching the native state dispatcher.
+      this.tickPlayerShotCollisionClock(p.invulnFrames > 0 || this.cherry.borderActive);
+      p.update(input, this.slowRate, !messageActive);
+      this.focusHeld = p.focusHeld;
+      if (p.focusTransition === 'in') {
+        const entryIndex = 1;
+        const entry = this.assets.anms.etama.entries[entryIndex];
+        // Th07.exe (v1.00b) FUN_0043c9a5 @ 0x43c99b creates effect id 24
+        // only on focus-in. Its master script 0x2c2 resolves to etama.anm
+        // entry 1 / local script 26; time-0 op60 consumes one u32 from the
+        // shared gameplay RNG. A fresh focus-in replaces the reserved slot.
+        this.focusEffectRunner = new AnmRunner(this.assets.anms.etama, 26, {
+          entryIndex,
+          spriteIndexOffset: entry.spriteBase,
+          rng: this.rng
+        });
+      } else if (p.focusTransition === 'out' && this.focusEffectRunner) {
+        this.focusEffectRunner.interrupt(1);
+      }
+    }
+    // The popup/ascii manager is priority 1, ahead of every gameplay
+    // manager. Existing popups age now; item pickups later this frame create
+    // fresh entries that do not tick until the next scheduler pass.
+    this.updatePopups();
     if (!frozen) {
       const death = p.tickDeath(this.slowRate);
       if (death === 'effects') this.onPlayerDeath();
@@ -1385,27 +1807,8 @@ export class StageScene implements GameHost {
         // counts down, FUN_00422ea0(0) runs every frame — silent, itemless,
         // skips bomb-immune lasers.
         this.respawnClearFrames--;
-        for (const b of this.enemyBullets) b.dead = true;
+        this.clearEnemyBullets();
         this.cancelLasers(false);
-      }
-      if (!this.gameOver) {
-        const volley = this.playerObj.fire(this.slowRate);
-        if (volley.some((b) => b.sfxId >= 0)) this.playSfx(0);
-        // Th07.exe FUN_00438b70: the shot SE fires per spawn event of the one
-        // shooter with sfxId>=0 (always SE 0), not on a free-running 8f clock.
-        for (const b of volley) {
-          if (b.behaviorFunc === 4) this.aimBulletAtSpawn(b);
-          else if (b.behaviorFunc === 5) {
-            // Th07.exe FUN_00439160 (SakuyaB): bullets fly at orbitAngle + the
-            // shot's own deviation from straight-up — the whole fan banks with
-            // strafe. At rest (orbit = -π/2) this is exactly the table angle.
-            const spread = b.angle - -Math.PI / 2;
-            b.angle = this.playerObj.orbitAngle + spread;
-            b.vx = Math.cos(b.angle) * b.speed;
-            b.vy = Math.sin(b.angle) * b.speed;
-          }
-          this.playerBullets.push(b);
-        }
       }
       this.stageFrame++;
     }
@@ -1415,14 +1818,6 @@ export class StageScene implements GameHost {
     if (this.stageTransitionTiles.some((tile) => !tile.runner.removed)) {
       this.stageTransitionTimer++;
       for (const tile of this.stageTransitionTiles) tile.runner.update(this.slowRate);
-    }
-    if (this.dialogue) {
-      this.dialogue.update(input.pressed.has('shoot'), input.held.has('skip'));
-      if (this.dialogue.resumeTicket) {
-        this.dialogue.resumeTicket = false;
-        this.dialogueResume = true;
-      }
-      if (this.dialogue.done) this.dialogue = null;
     }
     if (this.spellBanner > 0) this.spellBanner--;
     if (this.spellcard) {
@@ -1442,48 +1837,71 @@ export class StageScene implements GameHost {
       this.borderMessage.age++;
       if (--this.borderMessage.timer <= 0) this.borderMessage = null;
     }
-    if (!this.stageClear && this.runtime.isTimelineComplete() && !this.bossActive && this.enemies.length <= 1) {
-      this.clearTimer++;
-      if (this.clearTimer > 180) {
-        this.stageClear = true;
-        this.audio.fadeOutBgm(4);
-        this.computeClearBonus();
-        this.startStageClearPresentation();
-      }
-    }
     if (!frozen) {
       // FUN_0043eef0 returns before the state-4 border timer while dialogue
       // freeze DAT_0061c25c is set; the 540-frame clock pauses with gameplay.
       const borderBonus = this.cherry.tick(this.slowRate);
       if (borderBonus > 0) this.addScore(borderBonus);
-      this.runtime.update(this);
-      // VALIDATION-EXPERIMENT: player-shot MOVEMENT first (exe FUN_0043a290 in
-      // the player subsystem), THEN the enemy manager whose per-enemy pass now
-      // does the shot COLLISION (collidePlayerShots) at current bullet positions.
+      // Native scheduler order (FUN_0042e420 + priority registrations):
+      // player(8) -> enemies(10) -> effects(11) -> item+bullets/lasers(12).
+      // Inside the player callback, existing shots move before the firing
+      // pass allocates new shots (FUN_0043eef0 @ all.c:29061-29063).
+      // FUN_0043eef0 keeps calling MOVE/ANM -> FIRE -> aim-cache reset while
+      // timestamp-only MSG is active (DAT_0061c25c remains zero).  Player
+      // update above prevents a disarmed cycle from re-arming; fire() still
+      // drains any cycle that was already armed when the message began.
       this.updatePlayerBullets();
-      this.updateEnemies();
+      this.firePlayerBullets();
+      // FUN_0043edc0 runs after firing and clears both target snapshots.
+      // The enemy manager below repopulates them for the NEXT player tick.
+      this.clearPlayerAimCaches();
+      if (p.bombTimer > 0) this.prepareBombEffects();
+    }
+    // FUN_0041ed50 (priority 10) and the generic effect manager (priority
+    // 11) do NOT honor DAT_0061c25c. Full story dialogue freezes the player
+    // and priority-12 item/bullet callback, but invisible ECL controllers,
+    // enemies, movement/collision and ambient effects continue. The only
+    // enemy-tail exception is the boss timer, gated in tickEnemyManagerTail.
+    this.updateEnemies();
+    if (this.focusEffectRunner && !this.focusEffectRunner.removed) {
+      this.focusEffectRunner.update(this.slowRate);
+    }
+    this.updateParticles();
+    if (!frozen) {
+      // FUN_004241c0 calls the item manager at the head of the priority-12
+      // bullet callback (all.c:16039-16042). Items therefore update after
+      // effects, before bullets/lasers, and freeze with dialogue gameplay.
+      // Cancellation items created later in this callback wait until the
+      // next frame for their first update.
+      this.updateItems();
       this.updateBullets();
       this.updateLasers();
-      this.checkPlayerCollision();
       if (this.postBombLaserCounter > 0) this.postBombLaserCounter--;
-    } else {
-      // Dialogue up: in-flight player shots keep moving and leave the
-      // screen (the exe's shot manager keeps running; only firing and
-      // damage are suspended). collide=false skips the enemy hit tests.
-      this.updatePlayerBullets(false);
     }
-    // The popup manager is rate-scaled but is not part of the dialogue-frozen
-    // gameplay managers; update existing entries before this frame's item
-    // collections create fresh entries at their exact pickup coordinates.
-    this.updatePopups();
-    this.updateItems();
-    this.updateParticles();
-    // Bomb damage / bullet-cancel is suspended while a dialogue box is up
-    // (no damage dealt during dialogue), even though the player may keep
-    // moving -- otherwise a bomb still active when dialogue opens would keep
-    // clearing bullets and damaging the frozen boss for the whole
-    // conversation.
-    if (!frozen && p.bombTimer > 0) this.applyBombEffects();
+    // The MSG manager is registered at priority 13 (FUN_00426656 via
+    // FUN_0042e290(..., 0xd), all.c:18954), after enemies/effects and the
+    // item+bullet+laser priority-12 callback. A timeline op8 created inside
+    // this frame's enemy manager therefore gets its first interpreter tick
+    // at this tail, not at the start of the next frame. `frozen` remains the
+    // frame-start snapshot above: a dialogue that already existed freezes
+    // this frame's gameplay, then may advance/end here; a newly-created empty
+    // entry can end here without inventing a one-frame freeze next tick.
+    // The message/stage mini-VM force-completes any engaged Border before
+    // advancing its own script (FUN_00428392 -> FUN_0043e620,
+    // all.c:17791-17793). This is distinct from the global gameplay-freeze
+    // predicate: timestamp-only dialogue is active here too.
+    if (this.isDialogueActive() && this.cherry.borderEngaged) {
+      const forcedBorderBonus = this.cherry.forceBorderSurvival();
+      if (forcedBorderBonus > 0) this.addScore(forcedBorderBonus);
+    }
+    if (this.dialogue) {
+      this.dialogue.update(input.pressed.has('shoot'), input.held.has('skip'));
+      if (this.dialogue.resumeTicket) {
+        this.dialogue.resumeTicket = false;
+        this.dialogueResume = true;
+      }
+      if (this.dialogue.done) this.dialogue = null;
+    }
     // Bomb over: release the interrupt-gated bomb visuals (label 1 is the
     // fade-out path in the player bomb scripts) and tear down the form runner.
     if (this.prevBombTimer > 0 && p.bombTimer === 0) {
@@ -1494,12 +1912,28 @@ export class StageScene implements GameHost {
     this.prevBombTimer = p.bombTimer;
     this.playerEffects.update(this.slowRate);
     this.tickScreenFx();
+    // The stage object arms its results screen on the same scheduler tick
+    // that the last authored timeline wait is consumed. Native Stage 1 has
+    // PRE10475 and then leaves gameplay; there is no PRE10476 player tick.
+    // The former synthetic 180-frame grace let the ambient Sub1 manager run
+    // one extra snow tick in the recorded stream and delayed the clear bonus
+    // beyond the replay boundary.
+    if (!this.stageClear && this.runtime.isTimelineComplete() && !this.bossActive && this.enemies.length <= 1) {
+      this.stageClear = true;
+      this.clearTimer = 1;
+      this.audio.fadeOutBgm(4);
+      this.computeClearBonus();
+      this.startStageClearPresentation();
+    }
     if (this.score > this.hiScore) this.hiScore = this.score;
   }
 
   private onBombUsed(): void {
     this.playSfx(14);
     this.spawnEffectParticles(3, this.playerObj.x, this.playerObj.y, 24, 0xffffffff);
+    // FUN_0043d9a0 @ 0x43dc31-0x43dc40: every successful bomb subtracts
+    // 200 rank points. A free Border break never enters this path.
+    this.adjustRank(-200);
     // Th07.exe FUN_00431d10: bombing flags every live item for collection
     // (same state=1 autocollect the border uses in updateItems).
     for (const it of this.items) if (!it.dead) it.state = 1;
@@ -1617,8 +2051,7 @@ export class StageScene implements GameHost {
     }
   }
 
-  private applyBombEffects(): void {
-    const p = this.playerObj;
+  private prepareBombEffects(): void {
     // Per-form choreography updates the attack-slot pool (Th07.exe bomb tick
     // functions 0x407840-0x40cbf0 write player+0x9dc slots each frame).
     this.tickBombChoreography();
@@ -1628,39 +2061,44 @@ export class StageScene implements GameHost {
     // generator for every enemy and every bullet in a dense field.
     this.activeBombSlots.length = 0;
     for (const slot of this.bombEngine.activeSlots()) this.activeBombSlots.push(slot);
-    // Slot consumption, exe FUN_0043a980 @ 0x43a980: every active slot's
-    // AABB (pos ± radius/2) is tested against the enemy box EVERY frame;
-    // overlapping slots each apply their damage value per frame (the /5
-    // score credit and the 70 cap happen in settlePendingDamage).
-    for (const e of this.enemies) {
-      // shotCollision: bomb damage flows through the same bit4-gated hit
-      // test as shots (Th07.exe FUN_0041ed50) — emitters with op104=0 are
-      // bomb-immune too.
-      if (!e.ecl.canTakeDamage || !e.ecl.interactable || !e.ecl.shotCollision) continue;
-      for (const s of this.activeBombSlots) {
-        const hw = (e.ecl.hitbox.x + s.radiusX) / 2;
-        const hh = (e.ecl.hitbox.y + s.radiusY) / 2;
-        if (Math.abs(e.x - s.x) <= hw && Math.abs(e.y - s.y) <= hh) {
-          this.damageEnemy(e, s.damage, 'bomb');
-          s.hitTally += s.damage;
-        }
+  }
+
+  // Compatibility seam for focused unit tests that exercise bomb collision
+  // without running the full scheduler. Shipped gameplay uses the native
+  // per-enemy/per-bullet interleaving above.
+  private applyBombEffects(): void {
+    this.prepareBombEffects();
+    for (const e of this.enemies) this.collideBombSlots(e);
+    for (const b of this.enemyBullets) this.cancelBulletWithBombSlots(b);
+  }
+
+  private collideBombSlots(e: Enemy, hitbox = e.ecl.hitbox): void {
+    if (!e.ecl.canTakeDamage || !e.ecl.interactable || !e.ecl.shotCollision) return;
+    // FUN_0043a980 scans attack slots 0..111 after the 96 player-shot slots.
+    for (const s of this.activeBombSlots) {
+      const hw = (hitbox.x + s.radiusX) / 2;
+      const hh = (hitbox.y + s.radiusY) / 2;
+      if (Math.abs(e.x - s.x) > hw || Math.abs(e.y - s.y) > hh) continue;
+      this.damageEnemy(e, s.damage, 'bomb');
+      s.hitTally += s.damage;
+      // Player+0x240c is one global hit counter. Every fourth attack-slot
+      // contact emits id3 for slots 0..95, id5 for slots 96..111
+      // (FUN_0043a980 @ all.c:27687-27712).
+      if ((++this.playerHitTally & 3) === 0) {
+        this.spawnEffectParticles(s.poolSlot < 0x60 ? 3 : 5, e.x, e.y, 1, 0xffffffff);
       }
     }
-    for (const b of this.enemyBullets) {
-      if (b.dead || (b.flags & 0x1000) !== 0) continue;
-      for (const s of this.activeBombSlots) {
-        if (Math.abs(b.x - s.x) <= s.radiusX / 2 && Math.abs(b.y - s.y) <= s.radiusY / 2) {
-          // Bomb attack-slot contact is a spiritual-strike cancel. Normal
-          // Bomb zones pass type 6 to FUN_0043e730/e7e0; FUN_0043b040 then
-          // writes it to player+0x2404 (DAT_004b5ebc), read by the bullet loop
-          // at all.c:16160. Unlike the Border-break circle's type 8, this is
-          // the grey type-6 item; both bypass full-power promotion. The touch
-          // stays spatial (exe-bombs.md §4), never a full-screen sweep.
-          this.spawnItem('cherry', b.x, b.y, { state: 1 });
-          b.dead = true;
-          break;
-        }
-      }
+  }
+
+  private cancelBulletWithBombSlots(b: EnemyBullet): void {
+    if (b.dead || (b.flags & 0x1000) !== 0) return;
+    for (const s of this.activeBombSlots) {
+      if (Math.abs(b.x - s.x) > s.radiusX / 2 || Math.abs(b.y - s.y) > s.radiusY / 2) continue;
+      // Bomb attack-slot contact becomes a type-6 auto-collecting Cherry
+      // item; unlike a Border break this remains strictly spatial.
+      this.spawnItem('cherry', b.x, b.y, { state: 1 });
+      this.removeEnemyBullet(b);
+      return;
     }
   }
 
@@ -1691,6 +2129,9 @@ export class StageScene implements GameHost {
       for (let i = 0; i < 5; i++) this.spawnDeathDrop('power', p.x, p.y);
       this.cherry.onDeath(p.sht.cherryLossOnDeath, p.character.startsWith('sakuya'));
     }
+    // FUN_0043dca0 @ 0x43df6a-0x43df79: the miss penalty lands after the
+    // power/cherry/drop bookkeeping, on the death-commit frame.
+    this.adjustRank(-0x640);
     // The exe does NOT clear the field at the miss — the respawn arms a
     // 60-frame continuous silent cancel instead (see onPlayerRespawn).
     this.playerEffects.clear();
@@ -1778,10 +2219,12 @@ export class StageScene implements GameHost {
       return;
     }
     if (input.pressed.has('up')) {
-      ps.cursor = (ps.cursor + 2) % 3;
+      // Replay playback exposes only Resume / Return to Title; the native
+      // replay-bit branch never lets the cursor reach Retry (FUN_004023c0).
+      ps.cursor = this.mode === 'replay' ? ps.cursor ^ 1 : (ps.cursor + 2) % 3;
       select();
     } else if (input.pressed.has('down')) {
-      ps.cursor = (ps.cursor + 1) % 3;
+      ps.cursor = this.mode === 'replay' ? ps.cursor ^ 1 : (ps.cursor + 1) % 3;
       select();
     }
     if (input.pressed.has('shoot') || input.pressed.has('confirm')) {
@@ -1824,6 +2267,7 @@ export class StageScene implements GameHost {
     ctx.fillRect(0, 0, 640, 480);
     ctx.restore();
     ps.runners.forEach((runner, i) => {
+      if (this.mode === 'replay' && i === 3) return;
       const frame = runner.spriteFrame();
       if (!frame) return;
       // Cursor highlight: unselected rows draw tinted down (the authored
@@ -1919,19 +2363,27 @@ export class StageScene implements GameHost {
     // op43 damage-sharing poll) reads it.
     e.damageThisFrame = 0;
     if (raw <= 0) return;
-    // DAT_00625627 = the shot-type bit (A=0 / B=1); the formulas below gate
-    // on it being 0 (type-A shots).
-    const shotTypeBit = this.playerObj.character.endsWith('B') ? 1 : 0;
+    // Replay load writes DAT_00625627 as the complete shot byte
+    // character*2+type (0 ReimuA .. 5 SakuyaB), not merely the A/B bit.
+    // The quirks below compare it to zero and therefore apply to ReimuA only.
+    const shotIndex = this.shotIndex;
     // Cherry gain uses the UNREDUCED damage — the exe computes it before
     // the per-stage reductions below (all.c:14189 vs 14200-14209). The
     // divisor input is the STAGE number (local_14 = min(stage*2,10),
     // all.c:13997-14003 — DAT_0062583c is the stage, not the difficulty;
     // spec-extra-phantasm.md §0).
-    this.cherry.onShotHit(raw, e.ecl.isBoss, this.stageNumber, shotTypeBit, (e.ecl.bossTimer & 1) === 1);
-    // Per-stage type-A shot-damage reduction vs NON-boss enemies
-    // (all.c:14200-14209, gated on DAT_00625627=='\0' and bit6 clear):
+    this.cherry.onShotHit(
+      raw,
+      e.ecl.isBoss,
+      this.stageNumber,
+      shotIndex,
+      (e.ecl.bossTimer & 1) === 1,
+      this.playerObj.focusHeld
+    );
+    // Per-stage ReimuA shot-damage reduction vs NON-boss enemies
+    // (all.c:14198-14209, gated on DAT_00625627=='\0' and bit6 clear):
     // stage 4 -> dmg - dmg/4 - dmg/16 (11/16), stages 5-6 -> dmg/2.
-    if (shotTypeBit === 0 && !e.ecl.isBoss && shotRaw > 0) {
+    if (shotIndex === 0 && !e.ecl.isBoss && shotRaw > 0) {
       if (this.stageNumber === 4) {
         shotRaw = shotRaw - Math.trunc(shotRaw / 4) - Math.trunc(shotRaw / 16);
       } else if (this.stageNumber === 5 || this.stageNumber === 6) {
@@ -1953,37 +2405,19 @@ export class StageScene implements GameHost {
   }
 
   private updatePlayerBullets(collide = true): void {
-    // Th07.exe FUN_0043edc0/FUN_0041ed50 (exe-player-funcs1.md §2): the homing
-    // target is a single per-frame cache shared by every ReimuA amulet/orb —
-    // the eligible enemy minimizing |e.x - player.x| (Y ignored entirely).
-    // Reset+repopulated once per frame here, not per-bullet.
-    const px = this.playerObj.x;
-    let homingTarget: Enemy | null = null;
-    let homingBestDx = Infinity;
-    for (const e of this.enemies) {
-      // The exe's homing-target repopulate lives inside the bit4-gated shot
-      // block (FUN_0041ed50 all.c:14258+) — shot-transparent emitters are
-      // never homing candidates.
-      if (!e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.canTakeDamage || !e.ecl.shotCollision) continue;
-      const dx = Math.abs(e.x - px);
-      if (dx < homingBestDx) {
-        homingBestDx = dx;
-        homingTarget = e;
-      }
-    }
+    this.syncPlayerBulletSlots();
+    // FUN_0043edc0 clears the shared target after the prior firing pass;
+    // FUN_0041ed50 repopulates it per enemy after collision but before death.
+    // Therefore this player tick consumes the snapshot built last frame,
+    // including an enemy killed during that pass.
+    const homingTarget = this.homingAim;
     this.homingTargetId = homingTarget?.id ?? null;
     const rate = this.slowRate;
     this.shotCollisionEnabled = collide;
     this.tickLaserSlots();
-    for (const b of this.playerBullets) {
-      // EXPERIMENT: exe fires bullets (FUN_0043a820) AFTER movement
-      // (FUN_0043a290), so a bullet spawned THIS frame is at its spawn position
-      // when the enemy manager collides it — it does not integrate velocity yet.
-      // We fire before this pass, so skip the spawn-frame move to match.
-      const fresh = b.age === 0;
-      // Player-shot age is a rate-scaled split counter (exe FUN_0043a290
-      // tail); parity checks below use the integer part.
-      b.age += rate;
+    for (let slot = 0; slot < PLAYER_BULLET_POOL_CAP; slot++) {
+      const b = this.playerBulletSlots[slot];
+      if (!b) continue;
       if (b.state === 'fired') {
         if (b.shotType === 1 || b.shotType === 2) this.steerHomingBullet(b, homingTarget);
         else if (b.shotType === 3) {
@@ -2001,10 +2435,11 @@ export class StageScene implements GameHost {
       // velocity (× the global rate) every frame; the per-shot ANM VM ticks
       // alongside and the bullet dies when its script removes itself (impact
       // scripts end in remove(); flight scripts end in static and never do).
-      if (!fresh) {
-        b.x += b.vx * rate;
-        b.y += b.vy * rate;
-      }
+      // FUN_0043a290 @ all.c:27472-27475 stores each rate-scaled add back
+      // into the slot's float32 position fields. Per-tick f32 rounding is
+      // observable at long-window id5 collision boundaries (Stages 2/3).
+      b.x = Math.fround(b.x + b.vx * rate);
+      b.y = Math.fround(b.y + b.vy * rate);
       // Beam release fade: the VM consumes the interrupt only while parked
       // at its waitInt checkpoint (exe FUN_0044aa20 @ all.c:36279) — the
       // request re-tries every frame until then.
@@ -2015,21 +2450,49 @@ export class StageScene implements GameHost {
       b.runner.update(rate);
       if (b.runner.removed) {
         b.dead = true;
+      } else if (b.shotType !== 4 && b.shotType !== 5) {
+        // FUN_0043a290 calls FUN_0042bdc7 with the live shot sprite's exact
+        // width/height. A flat 32px margin kept tall Sakuya knives alive one
+        // extra frame above the field, letting them hit newly spawned enemies
+        // after their authored sprite had already left the playfield.
+        const halfW = b.rect.w / 2;
+        const halfH = b.rect.h / 2;
+        const onscreen = b.x + halfW >= 0 && b.x - halfW <= 384 &&
+          b.y + halfH >= 0 && b.y - halfH <= 448;
+        if (!onscreen) b.dead = true;
+      }
+      // FUN_0043a290 advances the split age counter at the tail, after the
+      // behavior callback, position integration, cull, and ANM tick.
+      b.age += rate;
+      if (b.dead && this.playerBulletSlots[slot] === b) this.playerBulletSlots[slot] = null;
+    }
+    this.playerBullets = this.playerBullets.filter((b) => !b.dead);
+  }
+
+  private firePlayerBullets(): void {
+    if (this.gameOver) return;
+    const volley = this.playerObj.fire(this.slowRate);
+    let playedShotSfx = false;
+    for (const b of volley) {
+      if (b.behaviorFunc === 4) this.aimBulletAtSpawn(b);
+      else if (b.behaviorFunc === 5) {
+        const spread = b.angle - -Math.PI / 2;
+        b.angle = Math.fround(this.playerObj.orbitAngle + spread);
+        b.vx = Math.fround(Math.cos(b.angle) * b.speed);
+        b.vy = Math.fround(Math.sin(b.angle) * b.speed);
+      }
+      if (!this.addPlayerBullet(b)) {
+        b.dead = true;
+        for (let i = 0; i < this.playerObj.laserSlots.length; i++) {
+          if (this.playerObj.laserSlots[i]?.bullet === b) this.playerObj.laserSlots[i] = null;
+        }
         continue;
       }
-      // VALIDATION-EXPERIMENT: player-shot-vs-enemy collision moved OUT of this
-      // (bullet-outer) pass into collidePlayerShots(e), called PER ENEMY inside
-      // updateEnemies (exe FUN_0043a980 @ all.c:14176 runs inside the enemy
-      // manager, per enemy in slot order, with immediate damage). `collide`
-      // controls it via collisionEnabled below.
-      // Bounds cull, exe FUN_0043a290 (FUN_0042bdc7): skipped entirely for
-      // the persistent beam types — their lifetime is the laser-slot timer.
-      if (b.shotType !== 4 && b.shotType !== 5 &&
-          (b.y < -32 || b.x < -32 || b.x > 416 || b.y > 480)) b.dead = true;
+      if (b.sfxId >= 0) playedShotSfx = true;
     }
-    let w = 0;
-    for (const b of this.playerBullets) if (!b.dead) this.playerBullets[w++] = b;
-    this.playerBullets.length = w;
+    // FUN_00438b70: the shot SE is tied to the accepted spawn event of the
+    // one shooter whose SHT record carries sfxId>=0.
+    if (playedShotSfx) this.playSfx(0);
   }
 
   // VALIDATION-EXPERIMENT: exe FUN_0043a980 (all.c:14176), called PER ENEMY
@@ -2040,14 +2503,67 @@ export class StageScene implements GameHost {
   // pass). A single-hit bullet becomes 'collided' on its first enemy and is
   // then skipped by later enemies (replacing the old inner-loop `break`).
   private collidePlayerShots(e: Enemy): void {
-    if (!this.shotCollisionEnabled) return;
+    if (!this.shotCollisionEnabled || !this.playerShotCollisionClockAdvanced) return;
     if (!e.ecl.shotCollision || !e.ecl.interactable || e.ecl.invisible || e.dead) return;
+    this.collidePlayerShotsInBox(e, e.ecl.hitbox);
+    const second = e.ecl.hitbox2;
+    if (!second || second.x <= 0) return;
+    const shotBefore = e.pendingShotDmg;
+    const bombBefore = e.pendingBombDmg;
+    this.collidePlayerShotsInBox(e, second);
+    const secondaryShot = e.pendingShotDmg - shotBefore;
+    const secondaryBomb = e.pendingBombDmg - bombBefore;
+    // FUN_0041ed50's second FUN_0043a980 scan is always mutating (shots can
+    // impact and effects spawn), but its damage contributes only when no
+    // attack slot set local_18; then the aggregate is truncated /2.5.
+    if (secondaryBomb === 0) {
+      e.pendingShotDmg = shotBefore + Math.trunc(secondaryShot / 2.5);
+      e.pendingBombDmg = bombBefore;
+    } else {
+      e.pendingShotDmg = shotBefore;
+      e.pendingBombDmg = bombBefore;
+    }
+  }
+
+  private tickPlayerShotCollisionClock(specialState: boolean): void {
+    if (specialState) {
+      // FUN_0043e2e0 states 3/4 decrement +0x16a08 without refreshing
+      // +0x16a00, so the two fields remain unequal on every wall frame.
+      this.playerShotCollisionClockSpecial = true;
+      this.playerShotCollisionClockAdvanced = true;
+      return;
+    }
+    if (this.playerShotCollisionClockSpecial) {
+      // Both state exits reset the timer's fractional word to zero before
+      // returning to the normal incrementing branch.
+      this.playerShotCollisionClockFrac = 0;
+      this.playerShotCollisionClockSpecial = false;
+    }
+    const rate = Math.fround(this.slowRate);
+    if (rate > 0.99) {
+      // FUN_00436acc's fast path increments the integer directly and leaves
+      // any pre-existing fractional residue untouched.
+      this.playerShotCollisionClockAdvanced = true;
+      return;
+    }
+    this.playerShotCollisionClockFrac = Math.fround(this.playerShotCollisionClockFrac + rate);
+    if (this.playerShotCollisionClockFrac >= 1) {
+      this.playerShotCollisionClockFrac = Math.fround(this.playerShotCollisionClockFrac - 1);
+      this.playerShotCollisionClockAdvanced = true;
+    } else {
+      this.playerShotCollisionClockAdvanced = false;
+    }
+  }
+
+  private collidePlayerShotsInBox(e: Enemy, hitbox: { x: number; y: number; z: number }): void {
     const anm = this.playerObj.anm;
-    for (const b of this.playerBullets) {
+    for (let slot = 0; slot < PLAYER_BULLET_POOL_CAP; slot++) {
+      const b = this.playerBulletSlots[slot];
+      if (!b) continue;
       if (b.dead) continue;
       if (b.state !== 'fired' && b.shotType !== 3) continue;
-      const hw = (e.ecl.hitbox.x + b.hitboxW) / 2;
-      const hh = (e.ecl.hitbox.y + b.hitboxH) / 2;
+      const hw = (hitbox.x + b.hitboxW) / 2;
+      const hh = (hitbox.y + b.hitboxH) / 2;
       if (Math.abs(b.x - e.x) <= hw && Math.abs(b.y - e.y) <= hh) {
         if (b.shotType === 4 || b.shotType === 5) {
           if ((Math.floor(b.age) & 1) === 0) {
@@ -2075,7 +2591,17 @@ export class StageScene implements GameHost {
           }
           this.damageEnemy(e, b.damage);
           b.state = 'collided';
-          if (anm.hasScript(b.impactScript)) b.runner = new AnmRunner(anm, b.impactScript);
+          if (anm.hasScript(b.impactScript)) {
+            b.runner = new AnmRunner(anm, b.impactScript);
+            // FUN_0043a980 re-arms the slot through FUN_004486e0 after the
+            // player's ANM pass has already run. Its split clock has consumed
+            // the synchronous t=0 init, so the first following player tick is
+            // t=1; a remove authored at t=20 therefore frees the slot on the
+            // twentieth following tick. Starting AnmRunner at zero kept every
+            // impact alive one extra frame and changed which SHT record won a
+            // full 96-slot pool (native Stage 3 processing frame 2811).
+            b.runner.frame = 1;
+          }
           this.spawnEffectParticles(5, b.x, b.y, 1, 0xffffffff);
           if (b.shotType !== 3) {
             b.vx /= 8;
@@ -2086,13 +2612,14 @@ export class StageScene implements GameHost {
       }
       if (b.shotType === 5 && b.history) {
         for (const hpt of b.history) {
-          if (Math.abs(hpt.x - e.x) <= (e.ecl.hitbox.x + 10) / 2 &&
-              Math.abs(hpt.y - e.y) <= (e.ecl.hitbox.y + b.hitboxH) / 2) {
+          if (Math.abs(hpt.x - e.x) <= (hitbox.x + 10) / 2 &&
+              Math.abs(hpt.y - e.y) <= (hitbox.y + b.hitboxH) / 2) {
             this.damageEnemy(e, 1, this.playerObj.bombTimer > 0 ? 'bomb' : 'shot');
           }
         }
       }
     }
+    this.collideBombSlots(e, hitbox);
   }
 
   // MarisaB laser-slot upkeep, Th07.exe FUN_0043a290 head + the shared
@@ -2171,43 +2698,46 @@ export class StageScene implements GameHost {
   // nothing moves in between.
   private sakuyaAim: { x: number; y: number } | null = null;
 
-  private updateSakuyaAimCache(): void {
-    if (!this.playerObj.character.startsWith('sakuya')) {
-      this.sakuyaAim = null;
-      return;
-    }
-    // Sakuya's aimed knives use their own target cache with a maximum
-    // firing angle: an enemy only qualifies while the angle from the PLAYER
-    // to it lies inside [-120°, -60°) — ±30° around straight up
-    // (Th07.exe FUN_0041ed50 @ all.c:14267-14278, gated on character
-    // DAT_00625625 == 2; cone floats @ 0x48edc4/0x48edc0). Anything beside
-    // or below her is never aimed at — the knives fly their table angle.
-    //
-    // Selection among qualifiers (Th07.exe FUN_0041ed50 @ all.c:14258-14300,
-    // Sakuya cache DAT_004b5eec/f0, sentinel y = -900 @ 0x48eb6c): ONE
-    // position snapshot per frame shared by every knife of the volley —
-    // the FIRST cone-qualified non-boss in pool order wins (the cache is
-    // only written while it still holds the sentinel); a cone-qualified
-    // BOSS takes the cache with min |e.x - player.x| and locks it against
-    // non-bosses (DAT_004b5ef8).
+  private clearPlayerAimCaches(): void {
+    this.homingAim = null;
+    this.sakuyaAim = null;
+    this.aimBossLocked = false;
+  }
+
+  private accumulatePlayerAimCaches(e: Enemy): void {
+    // FUN_0041ed50 @ all.c:14258-14300 runs inside the interactable +
+    // shot-collision block, after damage but before the death switch. It is
+    // intentionally NOT gated on canTakeDamage, and a lethal target remains
+    // cached for the next player tick.
+    if (e.dead || !e.ecl.interactable || e.ecl.invisible || !e.ecl.shotCollision) return;
     const px = this.playerObj.x;
     const py = this.playerObj.y;
-    let cache: { x: number; y: number } | null = null;
-    let locked = false;
-    for (const e of this.enemies) {
-      if (!e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.canTakeDamage || !e.ecl.shotCollision) continue;
-      const angle = Math.atan2(e.y - py, e.x - px);
-      if (angle < -2.0943952 || angle >= -1.0471976) continue;
-      if (e.ecl.isBoss) {
-        if (!locked || !cache || Math.abs(e.x - px) < Math.abs(cache.x - px)) {
-          cache = { x: e.x, y: e.y };
-          locked = true;
+    const sakuya = this.playerObj.character.startsWith('sakuya');
+    const angle = Math.atan2(e.y - py, e.x - px);
+    const inSakuyaCone = angle >= -2.0943952 && angle < -1.0471976;
+    if (e.ecl.isBoss) {
+      if (!this.aimBossLocked || !this.homingAim ||
+          Math.abs(e.x - px) < Math.abs(this.homingAim.x - px)) {
+        this.homingAim = { id: e.id, x: e.x, y: e.y, z: e.z };
+      }
+      if (sakuya) {
+        if (inSakuyaCone && (!this.aimBossLocked || !this.sakuyaAim ||
+            Math.abs(e.x - px) < Math.abs(this.sakuyaAim.x - px))) {
+          this.sakuyaAim = { x: e.x, y: e.y };
+          this.aimBossLocked = true;
         }
-      } else if (!locked && !cache) {
-        cache = { x: e.x, y: e.y };
+      } else {
+        this.aimBossLocked = true;
       }
     }
-    this.sakuyaAim = cache;
+    if (this.aimBossLocked) return;
+    // With no locked boss, Reimu's cache chooses the lowest-on-screen enemy
+    // (largest Y), not nearest X. Sakuya takes the first cone-qualified actor
+    // in ascending pool-slot order.
+    if (!this.homingAim || this.homingAim.y < e.y) {
+      this.homingAim = { id: e.id, x: e.x, y: e.y, z: e.z };
+    }
+    if (sakuya && !this.sakuyaAim && inSakuyaCone) this.sakuyaAim = { x: e.x, y: e.y };
   }
 
   // ReimuA homing amulet (shotType 1) / focused orb (shotType 2), Th07.exe
@@ -2215,7 +2745,7 @@ export class StageScene implements GameHost {
   // algorithms bar 4 constants). Operates directly on b.vx/b.vy — angle is
   // never consulted or written. `target` is the per-frame shared cache from
   // updatePlayerBullets, not a per-bullet nearest search.
-  private steerHomingBullet(b: PlayerBullet, target: Enemy | null): void {
+  private steerHomingBullet(b: PlayerBullet, target: { x: number; y: number } | null): void {
     const maxSpeed = b.shotType === 1 ? 10 : 18;
     const accel = b.shotType === 1 ? 0.33333334 : 0.6;
     const homing = target !== null && b.age <= 39;
@@ -2263,93 +2793,92 @@ export class StageScene implements GameHost {
     // velocity from the table stays — and no 1.5× boost.
     const target = this.sakuyaAim;
     if (!target) return;
-    const spread = b.angle - -Math.PI / 2; // table angle relative to straight up
-    b.angle = Math.atan2(target.y - b.y, target.x - b.x) + spread;
-    b.speed *= 1.5;
-    b.vx = Math.cos(b.angle) * b.speed;
-    b.vy = Math.sin(b.angle) * b.speed;
+    // FUN_00439070 @ 0x4390c9-0x439105 casts the x87 atan2 result to float
+    // BEFORE FUN_0042fff0 adds the record's `(angle + pi/2)` float. That
+    // helper then wraps by repeated float32 TAU adds/subtracts. Collapsing
+    // this into one JS-double expression shifts SakuyaA knife vx by ~2e-5;
+    // native Stage-2 slot 32 then hits at processing 9297 while WT misses its
+    // 22px X boundary by 0.00011 and loses one id5 draw event.
+    const dx = Math.fround(target.x - b.x);
+    const dy = Math.fround(target.y - b.y);
+    const aim = Math.fround(Math.atan2(dy, dx));
+    const spread = Math.fround(b.angle + NATIVE_HALF_PI_F32);
+    // FUN_00439070 writes angle, the 1.5x speed, and the derived vector back
+    // into float32 slot fields before the shot's first manager tick.
+    b.angle = normalizeNativeAngleF32(aim, spread);
+    b.speed = Math.fround(b.speed * 1.5);
+    b.vx = Math.fround(Math.cos(b.angle) * b.speed);
+    b.vy = Math.fround(Math.sin(b.angle) * b.speed);
   }
 
-  private checkPlayerCollision(): void {
+  private checkEnemyBulletCollision(b: EnemyBullet): void {
     const p = this.playerObj;
-    // Th07.exe: graze runs during invuln/bomb (states 3/4); only materialize/dying block it. player.hit() already no-ops while invulnerable.
-    if (this.gameOver || !p.alive) return;
+    if (b.dead || this.gameOver || !p.alive) return;
+    const dx = Math.abs(b.x - p.x);
+    const dy = Math.abs(b.y - p.y);
+    if (!b.grazed && b.age > 15 &&
+        dx <= b.grazeW / 2 + p.grazeboxHalf + 20 &&
+        dy <= b.grazeH / 2 + p.grazeboxHalf + 20) {
+      b.grazed = true;
+      this.onGrazeAward(b.x, b.y);
+    }
+    if (dx > b.grazeW / 2 + p.hitboxHalf || dy > b.grazeH / 2 + p.hitboxHalf) return;
+    // FUN_0043b200 result 1 consumes the touching bullet while the player is
+    // materializing, invulnerable, bombing, or already in the deathbomb state.
+    if (p.invulnFrames > 0 || p.bombInvuln > 0 || p.hitState) {
+      this.removeEnemyBullet(b);
+      return;
+    }
+    this.onPlayerHit(b);
+  }
+
+  private collideEnemyBody(e: Enemy): void {
+    const p = this.playerObj;
+    if (this.gameOver || !p.alive || !e.ecl.collisionEnabled ||
+        !e.ecl.interactable || e.ecl.invisible || e.dead) return;
+    // FUN_0041ebc0 runs first at the live head, then at position-history
+    // indices 1,7,13,... below. Each call performs graze before body hit.
+    this.collideEnemyBodyAt(e, e.x, e.y, e.ecl.hitbox);
+
+    // op138's +0x4f30/+0x4f34 history contract. FUN_0041ed50 samples every
+    // sixth record starting at one, stopping before trailStart (all.c:
+    // 14154-14171). Bit 1 tapers the hitbox against that same denominator.
+    const s = e.ecl;
+    if (s.trailFlags === 0 || s.trailStart <= 1) return;
+    const limit = Math.min(s.trailStart, s.trailHistory.length);
+    for (let i = 1; i < limit; i += 6) {
+      const point = s.trailHistory[i];
+      const scale = (s.trailFlags & 2) !== 0 ? 1 - i / s.trailStart : 1;
+      this.collideEnemyBodyAt(e, point.x, point.y, {
+        x: e.ecl.hitbox.x * scale,
+        y: e.ecl.hitbox.y * scale,
+        z: e.ecl.hitbox.z * scale
+      });
+    }
+  }
+
+  private collideEnemyBodyAt(
+    e: Enemy,
+    x: number,
+    y: number,
+    hitbox: { x: number; y: number; z: number }
+  ): void {
+    const p = this.playerObj;
     const px = p.x;
     const py = p.y;
-    const hit = p.hitboxHalf;
-    // The Supernatural Border does NOT make the player skip collision: a
-    // bullet (or body) reaching the kill hitbox BREAKS the border instead of
-    // killing -- onPlayerHit() enters the 40-frame state-3 invulnerability
-    // and creates the original expanding cancel field. So the same
-    // graze+kill path below runs whether or not a border is up; only the
-    // outcome of a kill contact differs. (A prior version special-cased the
-    // border here with a graze-only early return, which made it fully
-    // invincible and always pay the survive bonus -- the breakBorder path was
-    // unreachable.)
-    for (const b of this.enemyBullets) {
-      if (b.dead) continue;
-      // Zone result 2 has precedence over graze/player AABB. A 0x1000-
-      // immune bullet inside the Border-break circle is therefore neither
-      // converted nor allowed to fall through into the player test.
-      // Th07.exe bullet loop @ all.c:16153-16170.
-      const wave = this.borderClearWave;
-      if (wave) {
-        const wx = b.x - wave.x;
-        const wy = b.y - wave.y;
-        if (wx * wx + wy * wy < wave.radius * wave.radius) continue;
-      }
-      const dx = Math.abs(b.x - px);
-      const dy = Math.abs(b.y - py);
-      // Th07.exe FUN_0043b350: bulletFull/2 + sht.grazebox/2 + flat 20.0 pad.
-      if (!b.grazed && b.age > 15 && dx <= b.grazeW / 2 + p.grazeboxHalf + 20 && dy <= b.grazeH / 2 + p.grazeboxHalf + 20) {
-        // exe: 16-frame minimum age before graze eligibility
-        b.grazed = true;
-        this.onGrazeAward();
-      }
-      // exe FUN_004241c0: kill test runs from spawn; only graze has a min age (outer gate +0xbf0 unresolved)
-      if (dx <= b.grazeW / 2 + hit && dy <= b.grazeH / 2 + hit) {
-        // FUN_0043b200 returns result 1 in player states 1/2/3; the caller
-        // consumes the bullet without an item. This applies to ordinary
-        // spawn/respawn/bomb invulnerability as well as the 40f Border
-        // aftermath, not only to Border state (all.c:27785-27791).
-        if (p.invulnFrames > 0 || p.bombInvuln > 0 || p.hitState) {
-          b.dead = true;
-          continue;
-        }
-        this.onPlayerHit(b);
-        return;
-      }
-    }
-    for (const l of this.enemyLasers) {
-      if (!l.inUse) continue;
-      const result = this.checkLaserCollision(l);
-      if (result === 'hit') {
-        this.onPlayerHit(null, 'laser');
-        return;
-      }
-      if (result === 'graze') this.onGrazeAward();
-    }
-    for (const e of this.enemies) {
-      if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead) continue;
-      // Th07.exe FUN_0041ebc0: body kill uses hitbox*(1/1.5)/2 = /3
-      if (Math.abs(e.x - px) <= e.ecl.hitbox.x / 3 + hit && Math.abs(e.y - py) <= e.ecl.hitbox.y / 3 + hit) {
-        this.onPlayerHit(null, 'body');
-        return;
-      }
-    }
     // Th07.exe FUN_0041ebc0: enemy bodies are grazable, region hitbox/1.4
-    // (= *(1/0.7)/2), re-attempted every 6 frames while touching -- only
-    // when op136 armed `sweepItemFlag` (`+0x2e29` bit5, see the
-    // borderActive branch above for the full citation).
-    for (const e of this.enemies) {
-      if (!e.ecl.collisionEnabled || !e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.sweepItemFlag) continue;
-      const cd = this.bodyGrazeCooldown.get(e.id) ?? 0;
-      if (cd > 0) { this.bodyGrazeCooldown.set(e.id, cd - 1); continue; }
-      if (Math.abs(e.x - px) <= e.ecl.hitbox.x / 1.4 + p.grazeboxHalf + 20 &&
-          Math.abs(e.y - py) <= e.ecl.hitbox.y / 1.4 + p.grazeboxHalf + 20) {
-        this.bodyGrazeCooldown.set(e.id, 6);
-        this.onGrazeAward();
-      }
+    // (= *(1/0.7)/2), only when op136 armed +0x2e29 bit5 and the per-enemy
+    // +0x2bcc clock advanced this manager pass to a multiple of six. The
+    // +0x2bc4 comparison prevents repeat awards while slowmo holds a tick.
+    const timer = Math.trunc(e.ecl.bossTimer);
+    if (e.ecl.sweepItemFlag && timer !== (e.ecl.bossTimerPrevious ?? -999) && timer % 6 === 0 &&
+        Math.abs(x - px) <= hitbox.x / 1.4 + p.grazeboxHalf + 20 &&
+        Math.abs(y - py) <= hitbox.y / 1.4 + p.grazeboxHalf + 20) {
+      this.onGrazeAward(x, y);
+    }
+    if (Math.abs(x - px) <= hitbox.x / 3 + p.hitboxHalf &&
+        Math.abs(y - py) <= hitbox.y / 3 + p.hitboxHalf) {
+      this.onPlayerHit(null, 'body');
     }
   }
 
@@ -2358,7 +2887,27 @@ export class StageScene implements GameHost {
   // bonus grows by 2500 + floor(cherry/1500)*20 (all.c:27969; the exe
   // accumulator DAT_012f40b0 is reset at each declare, so accumulating
   // only while a card is active is equivalent).
-  private onGrazeAward(): void {
+  private onGrazeAward(sourceX = this.playerObj.x, sourceY = this.playerObj.y): void {
+    const p = this.playerObj;
+    // Th07.exe (v1.00b) FUN_0043bb30 @ 0x43bc2f-0x43bc81: every graze
+    // spawns generic effect id 8 at the midpoint between player and contact.
+    // During an active Border, an UNFOCUSED player uses three red particles;
+    // every other state uses one white particle. The native tests
+    // player+0x240d (Border state) then player+0x240b (focus byte) at
+    // 0x43bc42-0x43bc70; character is not consulted. DAT_00494fb0 maps id8
+    // to FUN_004194d0, four raw RNG draws per particle, so this cosmetic
+    // branch is gameplay-stream-visible.
+    const borderUnfocused = this.cherry.borderActive && !p.focusHeld;
+    this.spawnEffectParticles(
+      8,
+      (p.x + sourceX) / 2,
+      (p.y + sourceY) / 2,
+      borderUnfocused ? 3 : 1,
+      borderUnfocused ? 0xffff8080 : 0xffffffff
+    );
+    // FUN_0043bb30 @ 0x43bc81-0x43bc8d: effect allocation precedes the
+    // rank award; every bullet/laser/body graze contributes six points.
+    this.adjustRank(6);
     this.graze++;
     this.addScore(200);
     this.cherry.onGraze(this.focusHeld);
@@ -2427,7 +2976,7 @@ export class StageScene implements GameHost {
     // Cherry items. FUN_0043eb00 passes 8 at all.c:28984; FUN_0043b040 writes
     // it through player+0x2404 / DAT_004b5ebc before the spawn at
     // all.c:16160/16169.
-    if (sourceBullet) sourceBullet.dead = true;
+    if (sourceBullet) this.removeEnemyBullet(sourceBullet);
     // Exe FUN_0043eb00: any prior player state (incl. 2 = deathbomb window)
     // is overwritten to state 3 (invuln) — the miss is cancelled outright.
     if (rescueDeathbomb) p.hitState = false;
@@ -2437,75 +2986,145 @@ export class StageScene implements GameHost {
     // Th07.exe FUN_0043eb00 @ 0x43ed6c-0x43ed89.
     this.playSfx(7);
     this.playSfx(33);
-    // The original bullet loop can test later pool entries against the new
-    // radius-32 field on the creation frame. Sweep once now; the direct
-    // source is already dead and therefore produces no item.
-    this.sweepBorderClearWave();
-  }
-
-  private sweepBorderClearWave(): void {
-    const wave = this.borderClearWave;
-    if (!wave) return;
-    for (const b of this.enemyBullets) {
-      if (b.dead || (b.flags & 0x1000) !== 0) continue;
-      const dx = b.x - wave.x;
-      const dy = b.y - wave.y;
-      if (dx * dx + dy * dy < wave.radius * wave.radius) {
-        this.spawnItem('pointBullet', b.x, b.y, { state: 1 });
-        b.dead = true;
-      }
-    }
+    // The bullet manager continues from its current slot; only later slots
+    // in the native 0,1023..1 traversal see this new radius on this frame.
   }
 
   private updateEnemies(): void {
-    // VALIDATION-EXPERIMENT: single per-enemy pass matching exe FUN_0041ed50's
-    // enemy loop — fire(ECL) → player-shot collision+id5 → settle(IMMEDIATE
-    // damage this same frame) → death. Player bullets have already MOVED this
-    // frame (updatePlayerBullets now runs before updateEnemies). The old model
-    // settled last frame's damage before the ECL; here the ECL still sees the
-    // prior frame's collision (settled at the end of that enemy's prior
-    // iteration), so the fire-sees-prev-HP ordering is unchanged — what changes
-    // is that death now happens the SAME frame as the killing hit (exe-faithful)
-    // and id5/death draws interleave per enemy.
-    for (const e of this.enemies) {
-      if (e.dead) continue;
+    this.tickRankSurvival();
+    // FUN_0041ed50 processes authored timeline entries before scanning the
+    // native 480-slot enemy pool (all.c:14016-14039). Timeline spawns are
+    // therefore eligible later in this same pass.
+    this.runtime.update(this);
+    for (let slot = 0; slot < ENEMY_POOL_CAP; slot++) {
+      const e = this.enemySlots[slot];
+      if (!e || e.dead) continue;
       e.frame++;
-      this.runtime.updateEnemy(this, e);
+      let transitioned: boolean;
+      do {
+        this.runtime.tickEnemyCore(this, e);
+        if (e.dead) break;
+        this.runtime.integrateEnemyPosition(e, this.slowRate);
+        this.updateEnemyTrailHistory(e);
+        this.updateEnemyCull(e);
+        if (e.dead) break;
+        transitioned = this.runtime.processEnemyCallbacks(this, e);
+      } while (transitioned);
+      if (e.dead) {
+        if (this.enemySlots[slot] === e) {
+          this.enemySlots[slot] = null;
+          this.runtime.releaseEnemy(this, e);
+        }
+        continue;
+      }
+      // Regular ANM VM ticking occurs after cull/callbacks and before every
+      // collision scan (all.c:14139-14147).
+      this.runtime.updateEnemyAnm(e, this.slowRate);
+      this.collideEnemyBody(e);
       this.collidePlayerShots(e);
       this.settlePendingDamage(e);
-      const offscreen = e.x < -64 || e.x > 448 || e.y < -64 || e.y > 512;
-      // op137 (exe `+0x2e2a` bit7, exe-misc-ecl-ops.md §4): exempts an
-      // enemy from this cull even after it's been seen and gone offscreen
-      // -- e.g. a decorative particle emitter whose position legitimately
-      // wanders outside the visible rect.
-      if (offscreen && e.ecl.seen && !e.ecl.offscreenCullExempt) e.dead = true;
-      if (!e.ecl.seen && !offscreen) e.ecl.seen = true;
+      this.accumulatePlayerAimCaches(e);
       if (!e.dead && e.hp <= 0) {
         const keep = this.runtime.killEnemy(this, e);
         if (!keep) e.dead = true;
       }
+      this.runtime.tickEnemyManagerTail(this, e);
+      if (e.dead && this.enemySlots[slot] === e) {
+        this.enemySlots[slot] = null;
+        this.runtime.releaseEnemy(this, e);
+      }
     }
-    let w = 0;
     for (const e of this.enemies) {
-      if (!e.dead) this.enemies[w++] = e;
-      else this.runtime.releaseEnemy(this, e);
+      if (!e.dead) continue;
+      const slot = e.poolSlot;
+      if (slot >= 0 && slot < ENEMY_POOL_CAP && this.enemySlots[slot] === e) {
+        this.enemySlots[slot] = null;
+        this.runtime.releaseEnemy(this, e);
+      }
     }
-    this.enemies.length = w;
+    this.enemies = this.enemies.filter((e) => !e.dead);
+  }
+
+  private updateEnemyTrailHistory(e: Enemy): void {
+    const s = e.ecl;
+    if (s.trailFlags === 0 || s.trailCount <= 0) return;
+    // Th07.exe FUN_0041ed50 @ all.c:14075-14100: after the movement
+    // integrator and before culling, shift the configured history toward
+    // the oldest slot and write the current position at index zero. The
+    // native enemy object has exactly 96 entries; op138 never clears them.
+    const count = Math.min(96, s.trailCount, s.trailHistory.length);
+    for (let i = count - 1; i > 0; i--) {
+      const dst = s.trailHistory[i];
+      const src = s.trailHistory[i - 1];
+      dst.x = src.x;
+      dst.y = src.y;
+      dst.z = src.z;
+    }
+    const head = s.trailHistory[0];
+    head.x = e.x;
+    head.y = e.y;
+    head.z = e.z;
+  }
+
+  private updateEnemyCull(e: Enemy): void {
+    // FUN_0041ed50 uses the current live ANM sprite dimensions through
+    // FUN_0042bdc7 before advancing that ANM VM. Actors without a drawable
+    // frame never arm the seen-then-offscreen latch.
+    const frame = e.ecl.anmRunner?.spriteFrame();
+    if (!frame) return;
+    const halfW = frame.w / 2;
+    const halfH = frame.h / 2;
+    const onscreenAt = (x: number, y: number): boolean =>
+      x + halfW >= 0 && x - halfW <= 384 &&
+      y + halfH >= 0 && y - halfH <= 448;
+    const onscreen = onscreenAt(e.x, e.y);
+    if (!e.ecl.seen) {
+      if (onscreen) e.ecl.seen = true;
+      return;
+    }
+    if (onscreen || e.ecl.offscreenCullExempt) return;
+    // FUN_0041ed50 @ 0x41f363-0x41f45f: op138 trail actors are released
+    // only after the head AND history[count-1] no longer overlap the field.
+    // This preserves the fixed-slot lifetime that SakuyaA's native target
+    // cache observes; culling the head alone permutes later enemy slots.
+    const s = e.ecl;
+    if (s.trailFlags !== 0 && s.trailCount > 0) {
+      const oldest = s.trailHistory[Math.min(96, s.trailCount, s.trailHistory.length) - 1];
+      if (oldest && onscreenAt(oldest.x, oldest.y)) return;
+    }
+    e.dead = true;
   }
 
   private updateBullets(): void {
+    this.syncEnemyBulletSlots();
+    // FUN_004241c0 @ 0x424203-0x4242ee: clear the counter, then increment it
+    // once for every slot that is live on entry. Later frees in this manager
+    // pass do not decrement it. Since enemies (priority 10) fire before the
+    // bullet manager (priority 12), their next pass observes this exact
+    // latched value even when the underlying fixed slots are already free.
+    this.enemyBulletManagerEntryCount = this.enemyBulletSlots.reduce(
+      (count, bullet) => count + (bullet && !bullet.dead ? 1 : 0), 0
+    );
     const wave = this.borderClearWave;
     if (wave && wave.createdFrame < this.frame) {
       // FUN_0043d8f0 updates the zone before the bullet manager tests it.
       wave.radius += 16;
       wave.ticksLeft--;
     }
-    for (const b of this.enemyBullets) {
-      if (b.dead) continue;
-      // op-79 0x2000 grace ticks first (exe FUN_004241c0 all.c:16144-16146,
-      // decremented just before the position add).
+    const updateSlot = (slot: number): void => {
+      const b = this.enemyBulletSlots[slot];
+      if (!b || b.dead) return;
+      const wasInSpawnState = (b.spawnAge ?? b.spawnDuration) < b.spawnDuration;
+      // Native spawn states 2/3/4 skip behavior, cull, bomb and player
+      // collision until their authored ANM ends. On the ending tick control
+      // falls through into state 1 and performs the normal move as well.
+      if (!this.updateBulletMotion(b)) return;
+      // op-79 0x2000 grace ticks in normal state (exe FUN_004241c0
+      // all.c:16144-16146), immediately before the full-speed position add.
+      // updateBulletMotion performs that add, so preserve the same frame's
+      // observable countdown here before cull/collision.
       if (b.graceFrames && b.graceFrames > 0) b.graceFrames--;
-      this.updateBulletMotion(b);
+      this.cancelBulletWithBombSlots(b);
       if (wave && !b.dead && (b.flags & 0x1000) === 0) {
         const dx = b.x - wave.x;
         const dy = b.y - wave.y;
@@ -2513,7 +3132,7 @@ export class StageScene implements GameHost {
         // bullets become auto-collecting type-8 unboxed Cherry items.
         if (dx * dx + dy * dy < wave.radius * wave.radius) {
           this.spawnItem('pointBullet', b.x, b.y, { state: 1 });
-          b.dead = true;
+          this.removeEnemyBullet(b);
         }
       }
       // Exe cull, FUN_004241c0 @ all.c:16150-16195: a live grace count skips
@@ -2529,46 +3148,92 @@ export class StageScene implements GameHost {
         const onscreen = b.x + halfW >= 0 && b.x - halfW <= 384 && b.y + halfH >= 0 && b.y - halfH <= 448;
         if (onscreen) {
           b.offscreenFrames = 0;
+          this.enemyBulletOffscreenCounters[slot] = 0;
         } else if ((b.exFlags & 0xdc0) === 0) {
-          if (b.offscreenFrames && b.offscreenFrames > 0) b.offscreenFrames--;
+          if (b.offscreenFrames && b.offscreenFrames > 0) {
+            b.offscreenFrames--;
+            this.enemyBulletOffscreenCounters[slot] = b.offscreenFrames;
+          }
           else b.dead = true;
         } else {
           b.offscreenFrames = (b.offscreenFrames ?? 0) + 1;
+          this.enemyBulletOffscreenCounters[slot] = b.offscreenFrames;
           if (b.offscreenFrames >= 128) b.dead = true;
         }
       }
-    }
-    let w = 0;
-    for (const b of this.enemyBullets) if (!b.dead) this.enemyBullets[w++] = b;
-    this.enemyBullets.length = w;
+      if (!b.dead) this.checkEnemyBulletCollision(b);
+      // FUN_004241c0 advances the normal-state split counter at the common
+      // tail, after movement, cull and collision. On a spawn-ANM completion
+      // tick the native reset survives to the next PRE state (age remains 0);
+      // the first increment occurs on the following normal-entry tick.
+      if (!b.dead && !wasInSpawnState) b.age += this.slowRate;
+      if (b.dead && this.enemyBulletSlots[slot] === b) this.enemyBulletSlots[slot] = null;
+    };
+    // FUN_004241c0's pointer wrap is unusual but unambiguous: slot 0 first,
+    // then 1023 down through 1 (all.c:16038-16049,16197-16203).
+    updateSlot(0);
+    for (let slot = ENEMY_BULLET_POOL_CAP - 1; slot >= 1; slot--) updateSlot(slot);
+    this.enemyBullets = this.enemyBullets.filter((b) => !b.dead);
     if (wave && wave.ticksLeft <= 0) this.borderClearWave = null;
   }
 
   // Per-frame bullet ex-behaviors, matching Th07.exe FUN_004241c0 @ 0x4241c0.
-  // Each activated behavior bit in b.exFlags (exe +0xbf4, built at spawn via
-  // the op-79 cond gate — see eclvm resolveExBehaviors) runs as an INDEPENDENT
+  // Each activated behavior bit in b.exFlags (exe +0xbf4, promoted by
+  // FUN_004229f0 — see advanceBulletExBehavior) runs as an INDEPENDENT
   // if in the order 0x1, 0x10, 0x20, 0x40/0x100/0x80, 0xc00, then velocity is
   // added to position ONCE. Every behavior reads only its OWN op-79 slot's
   // resolved params and clears its own bit when finished.
-  private updateBulletMotion(b: EnemyBullet): void {
+  private updateBulletMotion(b: EnemyBullet): boolean {
     const rate = this.slowRate;
-    if (b.age < b.spawnDuration) {
-      b.x += b.vx * b.spawnMoveScale;
-      b.y += b.vy * b.spawnMoveScale;
-      b.age += rate;
-      return;
+    // Test/dev-created bullets predating the fixed queue contract are still
+    // accepted; retail bullets initialize every field in FUN_00421e90.
+    b.exRampElapsed ??= 0;
+    b.exRampFrac ??= 0;
+    b.exAccelElapsed ??= 0;
+    b.exAccelFrac ??= 0;
+    b.exAngleElapsed ??= 0;
+    b.exAngleFrac ??= 0;
+    b.exDirElapsed ??= 0;
+    b.exDirFrac ??= 0;
+    b.dirTimes ??= 0;
+    b.exBounceTimes ??= 0;
+    const spawnAge = b.spawnAge ?? b.spawnDuration;
+    if (spawnAge < b.spawnDuration) {
+      // Enemy-bullet storage is float32. FUN_004241c0 performs its spawn-
+      // state multiply/add on x87, then writes the result back to the slot's
+      // f32 position fields every manager tick. Keeping JS doubles here
+      // accumulated a 0.006px drift over long slowmo fields and moved native
+      // graze boundaries by one frame (Stage 5 slot 738 @ PRE7774).
+      b.x = Math.fround(b.x + b.vx * b.spawnMoveScale);
+      b.y = Math.fround(b.y + b.vy * b.spawnMoveScale);
+      b.spawnAge = spawnAge + rate;
+      if (b.spawnAge < b.spawnDuration) return false;
+      // Th07.exe FUN_004241c0 @ 0x424843-0x424860: an ending spawn ANM
+      // changes state to 1, resets the normal age counter, and falls through
+      // to the ordinary behavior/full-velocity move on this same tick.
+      b.spawnAge = b.spawnDuration;
+      b.age = 0;
     }
-    const age = b.age - b.spawnDuration;
+    // Constructor promotion happens in FUN_00421e90. Every normal-state
+    // manager tick performs exactly one further queue pass BEFORE executing
+    // active behavior routines (FUN_004241c0 @ all.c:16120).
+    advanceBulletExBehavior(b);
     if (b.exFlags & 1) {
       // speed-ramp (FUN_00423840): velocity = polar(angle, speed + 5·decay)
       // for 17 frames; then just clears the bit. Never writes the speed
       // scalar, so it composes cleanly with accel/angle-change.
-      if (age <= 16) {
-        const extra = 5 - (age * 5) / 16;
+      const elapsed = b.exRampElapsed + b.exRampFrac;
+      if (b.exRampElapsed < 17) {
+        const extra = 5 - (elapsed * 5) / 16;
         b.vx = Math.cos(b.angle) * (b.speed + extra) * rate;
         b.vy = Math.sin(b.angle) * (b.speed + extra) * rate;
       } else {
         b.exFlags &= ~1;
+      }
+      b.exRampFrac += rate;
+      while (b.exRampFrac >= 1) {
+        b.exRampFrac -= 1;
+        b.exRampElapsed++;
       }
     }
     if ((b.exFlags & 0x10) && b.exAccel) {
@@ -2577,11 +3242,16 @@ export class StageScene implements GameHost {
       // doesn't — writing hypot() here would feed the speed-ramp into a
       // runaway loop = the "supersonic" bug). Runs while age < limit.
       const ac = b.exAccel;
-      if (age >= ac.limit) b.exFlags &= ~0x10;
+      if (b.exAccelElapsed >= ac.limit) b.exFlags &= ~0x10;
       else {
         b.vx += Math.cos(ac.angle) * ac.mag * rate;
         b.vy += Math.sin(ac.angle) * ac.mag * rate;
         b.angle = Math.atan2(b.vy, b.vx);
+      }
+      b.exAccelFrac += rate;
+      while (b.exAccelFrac >= 1) {
+        b.exAccelFrac -= 1;
+        b.exAccelElapsed++;
       }
     }
     if ((b.exFlags & 0x20) && b.exAngle) {
@@ -2592,7 +3262,7 @@ export class StageScene implements GameHost {
       // id 1 installs this behavior mid-life) is below the duration; the
       // counter advances fractionally under slowmo (FUN_00436acc).
       const an = b.exAngle;
-      const elapsed = b.exAngleElapsed ?? 0;
+      const elapsed = b.exAngleElapsed;
       if (elapsed >= an.limit) b.exFlags &= ~0x20;
       else {
         b.angle = normalizeAngle(b.angle + an.angleDelta * rate);
@@ -2600,29 +3270,32 @@ export class StageScene implements GameHost {
         b.vx = Math.cos(b.angle) * b.speed * rate;
         b.vy = Math.sin(b.angle) * b.speed * rate;
       }
-      b.exAngleFrac = (b.exAngleFrac ?? 0) + rate;
+      b.exAngleFrac += rate;
       while (b.exAngleFrac >= 1) {
         b.exAngleFrac -= 1;
-        b.exAngleElapsed = (b.exAngleElapsed ?? 0) + 1;
+        b.exAngleElapsed++;
       }
     }
-    if ((b.exFlags & 0x40) && b.exDir) this.dirChangeBullet(b, age, 'relative');
-    else if ((b.exFlags & 0x100) && b.exDir) this.dirChangeBullet(b, age, 'absolute');
-    else if ((b.exFlags & 0x80) && b.exDir) this.dirChangeBullet(b, age, 'aimed');
-    if ((b.exFlags & 0x400) && b.exBounce) this.bounceBullet(b, true);
-    if ((b.exFlags & 0x800) && b.exBounce) this.bounceBullet(b, false);
-    b.x += b.vx;
-    b.y += b.vy;
-    b.age += rate;
+    if ((b.exFlags & 0x40) && b.exDir) this.dirChangeBullet(b, 'relative');
+    if ((b.exFlags & 0x100) && b.exDir) this.dirChangeBullet(b, 'absolute');
+    if ((b.exFlags & 0x80) && b.exDir) this.dirChangeBullet(b, 'aimed');
+    if ((b.exFlags & 0xc00) && b.exBounce) this.bounceBullet(b, (b.exFlags & 0x400) !== 0);
+    // Default bullet integration is the same f32 store-back (`pos += vel`)
+    // at all.c:16147-16149. Math.fround is therefore state semantics, not a
+    // rendering approximation.
+    b.x = Math.fround(b.x + b.vx);
+    b.y = Math.fround(b.y + b.vy);
+    return true;
   }
 
-  private dirChangeBullet(b: EnemyBullet, age: number, mode: 'relative' | 'absolute' | 'aimed'): void {
+  private dirChangeBullet(b: EnemyBullet, mode: 'relative' | 'absolute' | 'aimed'): void {
     const d = b.exDir!;
     const interval = Math.max(1, d.interval | 0);
     const maxTimes = Math.max(1, d.maxTimes | 0);
-    const times = b.dirTimes ?? 0;
+    const times = b.dirTimes;
+    const elapsed = b.exDirElapsed + b.exDirFrac;
     let speed: number;
-    if (age >= interval * (times + 1)) {
+    if (b.exDirElapsed >= interval) {
       b.dirTimes = times + 1;
       if (b.dirTimes >= maxTimes) {
         b.exFlags &= mode === 'relative' ? ~0x40 : mode === 'absolute' ? ~0x100 : ~0x80;
@@ -2632,11 +3305,18 @@ export class StageScene implements GameHost {
       else b.angle = Math.atan2(this.player.y - b.y, this.player.x - b.x) + d.angle;
       b.speed = d.newSpeed;
       speed = b.speed;
+      b.exDirElapsed = 0;
+      b.exDirFrac = 0;
     } else {
-      speed = b.speed - ((age - interval * times) * b.speed) / interval;
+      speed = b.speed - (elapsed * b.speed) / interval;
     }
     b.vx = Math.cos(b.angle) * speed * this.slowRate;
     b.vy = Math.sin(b.angle) * speed * this.slowRate;
+    b.exDirFrac += this.slowRate;
+    while (b.exDirFrac >= 1) {
+      b.exDirFrac -= 1;
+      b.exDirElapsed++;
+    }
   }
 
   private bounceBullet(b: EnemyBullet, includeBottom: boolean): void {
@@ -2648,8 +3328,8 @@ export class StageScene implements GameHost {
     b.speed = bo.speed;
     b.vx = Math.cos(b.angle) * b.speed * this.slowRate;
     b.vy = Math.sin(b.angle) * b.speed * this.slowRate;
-    b.dirTimes = (b.dirTimes ?? 0) + 1;
-    if (b.dirTimes >= maxTimes) b.exFlags &= includeBottom ? ~0x400 : ~0x800;
+    b.exBounceTimes++;
+    if (b.exBounceTimes >= maxTimes) b.exFlags &= 0xf3ff;
   }
 
   // Additive two-pass beam: a soft colored outer quad at displayWidth plus
@@ -2728,6 +3408,13 @@ export class StageScene implements GameHost {
             ? Math.min(l.width, ((l.phaseFrame + (l.phaseFrac ?? 0)) * l.width) / Math.max(1, l.growDuration))
             : 1.2;
         }
+        // FUN_004241c0 performs player collision inside each fixed laser
+        // slot, before the phase counter is advanced at the common tail
+        // (all.c:16258-16315). A separate post-update collision pass tests
+        // phase N+1 and loses every 12-frame graze boundary; Stage-3 native
+        // slot 1 at PRE4504 is phase 12 and consumes id8's four RNG draws,
+        // while the old ordering first advanced it to 13.
+        this.resolveLaserCollision(l);
         if (l.phaseFrame >= l.growDuration) {
           l.state = 1;
           l.phaseFrame = 0;
@@ -2736,6 +3423,7 @@ export class StageScene implements GameHost {
         }
       } else if (l.state === 1) {
         l.displayWidth = l.width;
+        this.resolveLaserCollision(l);
         if (l.phaseFrame >= l.holdDuration) {
           l.state = 2;
           l.phaseFrame = 0;
@@ -2745,6 +3433,7 @@ export class StageScene implements GameHost {
         if ((l.flags & 1) === 0) {
           l.displayWidth = Math.max(0, l.width - (l.phaseFrame * l.width) / Math.max(1, l.shrinkDuration));
         }
+        this.resolveLaserCollision(l);
         if (l.phaseFrame >= l.shrinkDuration) l.inUse = false;
       }
       if (l.nearDist >= 640) l.inUse = false;
@@ -2767,6 +3456,12 @@ export class StageScene implements GameHost {
     }
   }
 
+  private resolveLaserCollision(l: EnemyLaser): void {
+    const result = this.checkLaserCollision(l);
+    if (result === 'hit') this.onPlayerHit(null, 'laser');
+    else if (result === 'graze') this.onGrazeAward();
+  }
+
   // Player-vs-laser test, exe FUN_0043b650 (all.c:27867-27925) via
   // spec-lasers.md §7: rotate (player - anchor) by -angle into the beam's
   // local frame, then AABB the player hitbox against a box whose along-
@@ -2780,8 +3475,12 @@ export class StageScene implements GameHost {
     const p = this.playerObj;
     const dx = p.x - l.x;
     const dy = p.y - l.y;
-    const sin = Math.sin(-l.angle);
-    const cos = Math.cos(-l.angle);
+    // FUN_00430070 uses outX = sin(a)*dy + cos(a)*dx and
+    // outY = cos(a)*dy - sin(a)*dx. Feeding -a here mirrors every angled
+    // beam across its anchor; axis-aligned tests hid the error. The native
+    // Stage-3 slot-1 graze at processing 4504 is the boundary witness.
+    const sin = Math.sin(l.angle);
+    const cos = Math.cos(l.angle);
     const along = sin * dy + cos * dx;
     const perp = cos * dy - sin * dx;
     const phw = p.hitboxHalf;
@@ -2802,13 +3501,14 @@ export class StageScene implements GameHost {
   private updateItems(): void {
     const p = this.playerObj;
     const sht = p.sht;
-    // Th07.exe FUN_00430c10 @ 0x430eb2-0x430f1e: the PoC trigger is
-    // (round(power) >= 128 OR shotType >= 4, i.e. SakuyaA/B bypasses the
-    // power gate, disasm @ 0x430ee7-0x430eee) AND player.y < pocLine
-    // (strict FCOMP <). On success the item's state byte (+0x27f) is written
-    // to 1 — a PERMANENT latch; leaving the trigger zone never un-latches.
+    // Th07.exe FUN_00430c10 @ all.c:21958-21961: the PoC trigger is
+    // (power >= 128 OR difficulty > 3 [Extra/Phantasm]) AND player.y <
+    // pocLine (strict FCOMP <). DAT_0061c260 is the difficulty byte, not the
+    // character/shot selector; treating it as Sakuya made Lunatic drops home
+    // eleven to twenty-four frames too early in the replay oracle.
+    // On success the item's state byte (+0x27f) is permanently latched to 1.
     const pocActive = p.alive
-      && (p.power >= 128 || p.character.startsWith('sakuya'))
+      && (p.power >= 128 || this.difficulty > 3)
       && p.y < sht.pocLineY;
     for (const it of this.items) {
       it.age++;
@@ -2844,12 +3544,24 @@ export class StageScene implements GameHost {
           it.x += Math.cos(angle) * sht.autocollectSpeed * this.slowRate;
           it.y += Math.sin(angle) * sht.autocollectSpeed * this.slowRate;
         } else {
-          // exe FUN_00430c10: item motion is rate-scaled (spec-slowmo.md §3.1).
-          it.vy = Math.min(3, it.vy + 0.03 * this.slowRate);
+          // FUN_00430c10 @ all.c:21978-21991 integrates the current velocity
+          // first, then applies gravity for the next frame.
+          it.vx = 0;
+          if (it.vy < -2.2) it.vy = -2.2;
           it.x += it.vx * this.slowRate;
           it.y += it.vy * this.slowRate;
+          if (it.vy >= 3) it.vy = 3;
+          else it.vy += 0.03 * this.slowRate;
         }
-        if (it.y > 480) it.dead = true;
+        // Th07.exe FUN_00430c10 @ 0x431098 compares against
+        // DAT_00625850(448) + DAT_0048ead0(16), in playfield coordinates.
+        if (it.y > 464) {
+          it.dead = true;
+          // FUN_00430c10 @ 0x4310ae-0x4310ba: every ordinary item that
+          // leaves the bottom subtracts three rank points, regardless of
+          // item type. Tween-state death drops bypass this cull branch.
+          this.adjustRank(-3);
+        }
       }
       // Th07.exe FUN_0043b480 (item pickup): AABB overlap of the item box
       // (± itemRadius × DAT_0048eaa4/DAT_0048eac0 = ×0.5 → ±10) against the
@@ -2882,6 +3594,11 @@ export class StageScene implements GameHost {
         if (p.power < 128) {
           const before = this.powerTier(p.power);
           p.power = Math.min(128, p.power + add);
+          // Th07.exe (v1.00b) FUN_00430860 @ 0x43089b calls
+          // FUN_00401700 after every below-cap power change. That HUD-state
+          // refresh consumes two u32 values from the shared gameplay RNG,
+          // even though the generated display fields are not modeled here.
+          this.refreshPowerHudRandomState();
           if (this.powerTier(p.power) > before) {
             this.spawnScorePopup(-1, it.x, it.y, 0xffffc0a0);
             this.playSfx(0x1f);
@@ -2889,6 +3606,9 @@ export class StageScene implements GameHost {
             this.spawnScorePopup(10, it.x, it.y, 0xffffffff);
           }
           if (p.power === 128) {
+            // Item cases 0/2 call FUN_00401700 a second time when the gain
+            // crosses 128 (all.c:22029 / 22137), before the field cancel.
+            this.refreshPowerHudRandomState();
             // Crossing to full power: FUN_00431da0 converts every other
             // live power/bigPower item to bigCherry (all.c:22034/22142),
             // then FUN_00422ea0(1) clears the field to cherry items — the
@@ -2901,6 +3621,9 @@ export class StageScene implements GameHost {
           this.addScore(12800);
           this.spawnScorePopup(128000, it.x, it.y, 0xffffff00);
         }
+        // Collect case 0 calls FUN_0042db77(1) after both the below-cap and
+        // max-power branches. Case 2 (bigPower) has no rank call.
+        if (it.type === 'power') this.adjustRank(1);
         // bigPower at max: the exe path shows uninitialized garbage and
         // credits nothing (confirmed v1.00b bug) — the port draws nothing.
         break;
@@ -2918,6 +3641,9 @@ export class StageScene implements GameHost {
           this.cancelBulletsToItems();
         }
         p.power = 128;
+        // Item case 4 unconditionally refreshes the same HUD state after
+        // writing full power (Th07.exe @ 0x43165a / all.c:22179).
+        this.refreshPowerHudRandomState();
         this.addScore(100);
         this.spawnScorePopup(1000, it.x, it.y, 0xffffffff);
         break;
@@ -2930,6 +3656,9 @@ export class StageScene implements GameHost {
         // collection line or when auto-collected, white otherwise.
         const yellow = it.state === 1 || it.y <= p.sht.pocLineY;
         this.spawnScorePopup(pts * 10, it.x, it.y, yellow ? 0xffffff00 : 0xffffffff);
+        // FUN_00430c10 @ 0x43151f-0x43154f: position alone selects the
+        // award. Strictly above the PoC line is +10; on/below it is +3.
+        this.adjustRank(it.y < p.sht.pocLineY ? 10 : 3);
         // Extend ladder (exe item-collect case 1 @ all.c:22099-22125).
         while (this.pointItems >= this.extendThreshold) {
           this.awardExtend();
@@ -2944,11 +3673,23 @@ export class StageScene implements GameHost {
         this.cherry.onBigCherryItem();
         break;
       case 'bomb':
-        p.bombs = Math.min(8, p.bombs + 1);
+        if (p.bombs < 8) {
+          p.bombs++;
+          // Item collect case 3, Th07.exe v1.00b @ 0x43153f-0x431558
+          // (all.c:22162-22167): a successful stock increase calls
+          // FUN_0042bd01(1), whose tail is FUN_00401700 (two u32 / four
+          // raw draws). A capped pickup skips the refresh but still awards
+          // the case's +5 rank below.
+          this.refreshPowerHudRandomState();
+        }
+        // Collect case 3 awards +5 even when the bomb stock is already 8.
+        this.adjustRank(5);
         break;
       case 'life':
-        p.lives = Math.min(8, p.lives + 1);
-        this.playSfx(28);
+        // Collect case 5 shares FUN_0042bf29 with point-item extends: award
+        // a life, or a bomb when lives are full, and +200 rank only when one
+        // of those resources was actually granted.
+        this.awardExtend();
         break;
       case 'cherry': {
         // exe case 6 (spec §3b): +20 cherry, score = grazeScaledValue/10.
@@ -2980,12 +3721,68 @@ export class StageScene implements GameHost {
     }
   }
 
+  private refreshPowerHudRandomState(): void {
+    // FUN_00401700 @ 0x401700 performs two FUN_0042ff90 u32 draws.
+    this.rng.u32();
+    this.rng.u32();
+  }
+
   private updateParticles(): void {
     for (const p of this.particles) {
+      let alive = true;
+      if (p.world) {
+        // FUN_0041a050 @ 0x41a050 is shared by effect ids
+        // 20/26/27/30/31 and runs before their ANM tick, including on the
+        // allocation frame: integrate acceleration/velocity, then retain the
+        // slot only inside the camera's 0.94 cosine cone and above the
+        // world-space ground plane (negative z).
+        const w = p.world;
+        w.vx = Math.fround(w.vx + w.ax);
+        w.vy = Math.fround(w.vy + w.ay);
+        w.vz = Math.fround(w.vz + w.az);
+        w.x = Math.fround(w.x + w.vx);
+        w.y = Math.fround(w.y + w.vy);
+        w.z = Math.fround(w.z + w.vz);
+        w.angle = Math.fround(normalizeAngle(w.angle + w.angularVelocity));
+
+        const std = this.runtime.std;
+        const camera = std.camera();
+        const facing = std.facing();
+        const dx = w.x - camera.x;
+        const dy = w.y - camera.y;
+        const dz = w.z - camera.z;
+        const dl = Math.hypot(dx, dy, dz) || 1;
+        const fl = Math.hypot(facing.x, facing.y, facing.z) || 1;
+        const dot = (dx * facing.x + dy * facing.y + dz * facing.z) / (dl * fl);
+        alive = dot >= 0.94 && w.z < 0;
+        if (alive) {
+          const projected = std.project(w.x, w.y, w.z, std.cameraFrame(std.frame), {
+            x: 0, y: 0, width: PLAYFIELD.width, height: PLAYFIELD.height
+          });
+          if (projected) {
+            p.x = projected.x;
+            p.y = projected.y;
+          }
+        }
+      } else {
+        p.x += p.vx;
+        p.y += p.vy;
+      }
+
+      if (p.ownerEnemyId != null && p.releaseFrames == null) {
+        const owner = this.enemies.find((enemy) => enemy.id === p.ownerEnemyId && !enemy.dead);
+        if (owner) {
+          p.x = owner.x;
+          p.y = owner.y;
+        }
+      }
+      if (p.releaseFrames != null && --p.releaseFrames <= 0) alive = false;
       p.age++;
-      p.x += p.vx;
-      p.y += p.vy;
-      if (p.age >= p.life || p.y > 470) p.age = p.life;
+      if (p.age >= p.life) alive = false;
+      if (!alive) {
+        p.age = p.life;
+        if (this.effectSlots[p.poolSlot] === p) this.effectSlots[p.poolSlot] = null;
+      }
     }
     let w = 0;
     for (const p of this.particles) if (p.age < p.life) this.particles[w++] = p;
@@ -3090,18 +3887,20 @@ export class StageScene implements GameHost {
         // scale 2.0 shrinking to 1.0, additive, alpha fading 0->255 over
         // 32f (clipped by the 24f script end). Draw-time only; movement/
         // collision keep the byte-confirmed spawnDuration model.
-        if (b.sprite === 10 && (b.flags & 0xe) !== 0 && b.age < 24) {
+        const spawnAge = Math.min(b.spawnDuration, b.spawnAge ?? b.spawnDuration);
+        const visualAge = spawnAge + b.age;
+        if (b.sprite === 10 && (b.flags & 0xe) !== 0 && visualAge < 24) {
           r.drawSpriteInBatch(
             b.rect.imageKey, b.rect.x, b.rect.y, b.rect.w, b.rect.h,
             ox + b.x, oy + b.y,
             b.angle + Math.PI / 2,
-            2 - b.age / 24,
-            Math.min(1, b.age / 32),
+            2 - visualAge / 24,
+            Math.min(1, visualAge / 32),
             'lighter'
           );
           continue;
         }
-        const spawning = b.age < b.spawnDuration;
+        const spawning = spawnAge < b.spawnDuration;
         r.drawSpriteInBatch(
           b.rect.imageKey,
           b.rect.x,
@@ -3111,8 +3910,8 @@ export class StageScene implements GameHost {
           ox + b.x,
           oy + b.y,
           b.angle + Math.PI / 2,
-          spawning ? 1.6 - 0.6 * (b.age / Math.max(1, b.spawnDuration)) : 1,
-          spawning ? 0.6 + 0.4 * (b.age / Math.max(1, b.spawnDuration)) : 1,
+          spawning ? 1.6 - 0.6 * (spawnAge / Math.max(1, b.spawnDuration)) : 1,
+          spawning ? 0.6 + 0.4 * (spawnAge / Math.max(1, b.spawnDuration)) : 1,
           spawning ? 'lighter' : 'source-over'
         );
       }
@@ -3162,6 +3961,9 @@ export class StageScene implements GameHost {
         r.drawAnmFrame(frame, ox + b.x, oy + b.y, opts);
       }
       this.playerEffects.draw(r, ox, oy);
+      if (this.focusEffectRunner) {
+        r.drawAnmFrame(this.focusEffectRunner.spriteFrame(), ox + p.x, oy + p.y);
+      }
       this.drawPopups(r, ox, oy);
       // Option orbs (yin-yang, local sprite 128).
       if (p.alive && p.power >= 8) {
@@ -3982,11 +4784,10 @@ export class StageScene implements GameHost {
     // drawn one text row ABOVE the cherry/cherryMax line (base+2 vs base+11),
     // in the purple B/G/R 0xb0/0x80/0xc0 — right-aligned over the cherry
     // field so it never collides with cherryMax.
-    // While a border is up, the exe repurposes the display as the border
-    // countdown = 50000 * timerLeft / 540 (mode-4 recompute, all.c:28735).
-    const plusVal = this.cherry.borderActive
-      ? Math.trunc((50000 * this.cherry.borderTimer) / BORDER_DURATION)
-      : Math.max(0, Math.trunc(this.cherry.cherryPlus));
+    // While a border is up, the exe repurposes the live cherryPlus storage
+    // itself as the countdown. CherrySystem preserves the native write-before-
+    // timer-advance order, including the repeated 50000 first active tick.
+    const plusVal = Math.max(0, Math.trunc(this.cherry.cherryPlus));
     r.text(`+${plusVal}`, PLAYFIELD.x + 84, 444, { size: 10, color: '#c080b0', align: 'right' });
 
     if (this.bossActive) {

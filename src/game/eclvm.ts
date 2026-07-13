@@ -3,6 +3,7 @@ import { Anm, AnmRunner } from '../formats/anm';
 import { Std } from '../formats/std';
 import { Msg } from '../formats/msg';
 import { normalizeAngle, clamp, TAU } from '../core/util';
+import type { Rng } from '../core/rng';
 import type { GameHost, Enemy, EnemyBullet, EclState, EclContext, BulletProps, BulletExSlot, ItemType, EnemyLaser } from './types';
 
 // TH07 ECL virtual machine. Opcode semantics were derived by aligning thtk's
@@ -17,67 +18,79 @@ import type { GameHost, Enemy, EnemyBullet, EclState, EclContext, BulletProps, B
 const ENEMY_BULLET_CAP = 1024;
 const ENEMY_LASER_CAP = 64;
 
-// Resolve a fired bullet's ex-behaviors from the enemy's op-79 slots, exactly
-// mirroring the exe's per-frame queue processor FUN_004229f0 @ 0x4229f0 (but
-// collapsed to one pass at spawn). Each frame the exe advances one slot: it
-// STOPS at the first opcode==0 slot, STOPS at a cond==0 slot once any behavior
-// is already active (the cond gate), otherwise activates the slot iff its
-// opcode bit is in the fire flags. Because the behavior-flag set only grows,
-// a single pass yields the same activation set. The cond gate is why Letty's
-// accel slot (cond 0, after speed-ramp) never activates in the real game.
-// Sentinels: accel angle f1<=-990 -> keep bullet angle (DAT_0048eba4);
-// dir/bounce speed f1/f0<=-999 -> keep bullet speed (DAT_0048eba0).
-function resolveExBehaviors(
-  slots: (BulletExSlot | null)[],
-  fireFlags: number,
-  spawnAngle: number,
-  spawnSpeed: number
-): Pick<import('./types').EnemyBullet, 'exFlags' | 'exAccel' | 'exAngle' | 'exDir' | 'exBounce' | 'graceFrames'> {
-  let exFlags = 0;
-  let graceFrames = 0;
-  let exAccel: { mag: number; angle: number; limit: number } | null = null;
-  let exAngle: { speedDelta: number; angleDelta: number; limit: number } | null = null;
-  let exDir: { angle: number; newSpeed: number; interval: number; maxTimes: number } | null = null;
-  let exBounce: { speed: number; maxTimes: number } | null = null;
-  for (let idx = 0; idx < 5; idx++) {
-    const slot = slots[idx];
-    if (!slot || slot.opcode === 0) break; // end of queue (exe: pfVar1[4]==0 -> return)
-    if (slot.cond === 0 && exFlags !== 0) break; // cond gate (exe: cond==0 && flags!=0 -> return)
-    if ((fireFlags & slot.opcode) === 0) continue; // opcode not enabled by this FIRE
+// Advance one fired bullet's copied op-79 queue exactly as FUN_004229f0
+// @ 0x4229f0. Construction calls it once; FUN_004241c0 calls it on every
+// normal-state bullet-manager tick, including the spawn-ANM transition tick.
+// Unselected slots and 0x2000 grace slots can be skipped in one invocation,
+// but at most ONE movement behavior is promoted before returning.
+export function advanceBulletExBehavior(bullet: EnemyBullet): void {
+  if (!bullet.exSlots) return;
+  let idx = bullet.exBehaviorIndex ?? 0;
+  while (idx < 5) {
+    const slot = bullet.exSlots[idx];
+    if (!slot || slot.opcode === 0) return;
+    // cond==0 waits at this slot while ANY earlier behavior flag is active.
+    if (slot.cond === 0 && bullet.exFlags !== 0) return;
+    idx++;
+    bullet.exBehaviorIndex = idx;
+    if ((bullet.exFireFlags & slot.opcode) === 0) continue;
     if (slot.opcode === 0x2000) {
-      // Not a movement behavior: a frame-counted cull/collision grace.
-      // Th07.exe FUN_004229f0 @ all.c:15449-15452 stores it into bullet
-      // +0xbf0 WITHOUT touching the behavior flags or consuming the
-      // one-slot-per-frame budget (its branch loops instead of returning).
-      // arg3 carries the frame count — e.g. Chen's 陰陽 orbs use 300.
-      graceFrames = Math.max(graceFrames, slot.arg3 | 0);
+      // +0xbf0 grace does not set +0xbf4 and does not consume the one-slot
+      // movement budget; native immediately examines the next queue entry.
+      bullet.graceFrames = Math.max(bullet.graceFrames ?? 0, slot.arg3 | 0);
       continue;
     }
-    exFlags |= slot.opcode;
     switch (slot.opcode) {
+      case 1:
+        bullet.exFlags |= 1;
+        bullet.exRampElapsed = 0;
+        bullet.exRampFrac = 0;
+        break;
       case 0x10:
-        exAccel = { mag: slot.f0, angle: slot.f1 <= -990 ? spawnAngle : slot.f1, limit: slot.arg3 };
+        bullet.exFlags |= 0x10;
+        bullet.exAccel = {
+          mag: slot.f0,
+          angle: slot.f1 <= -990 ? bullet.angle : slot.f1,
+          limit: slot.arg3
+        };
+        bullet.exAccelElapsed = 0;
+        bullet.exAccelFrac = 0;
         break;
       case 0x20:
-        exAngle = { speedDelta: slot.f0, angleDelta: slot.f1, limit: slot.arg3 };
+        bullet.exFlags |= 0x20;
+        bullet.exAngle = { speedDelta: slot.f0, angleDelta: slot.f1, limit: slot.arg3 };
+        bullet.exAngleElapsed = 0;
+        bullet.exAngleFrac = 0;
         break;
       case 0x40:
       case 0x80:
       case 0x100:
-        exDir = { angle: slot.f0, newSpeed: slot.f1 <= -999 ? spawnSpeed : slot.f1, interval: slot.arg3, maxTimes: slot.arg4 };
+        bullet.exFlags |= slot.opcode;
+        bullet.exDir = {
+          angle: slot.f0,
+          newSpeed: slot.f1 <= -999 ? bullet.speed : slot.f1,
+          interval: slot.arg3,
+          maxTimes: slot.arg4
+        };
+        bullet.exDirElapsed = 0;
+        bullet.exDirFrac = 0;
+        bullet.dirTimes = 0;
         break;
       case 0x400:
       case 0x800:
-        exBounce = { speed: slot.f0 <= -999 ? spawnSpeed : slot.f0, maxTimes: slot.arg3 };
+        bullet.exFlags |= slot.opcode;
+        bullet.exBounce = {
+          speed: slot.f0 <= -999 ? bullet.speed : slot.f0,
+          maxTimes: slot.arg3
+        };
+        bullet.exBounceTimes = 0;
         break;
-      case 1:
-        break; // speed-ramp: flag only, no params
       default:
         warnOnce(`ex${slot.opcode}`, `op-79 opcode 0x${slot.opcode.toString(16)} has no behavior mapping`);
         break;
     }
+    return;
   }
-  return { exFlags, exAccel, exAngle, exDir, exBounce, graceFrames };
 }
 
 // Item ids as used by ECL drop fields, confirmed against Th07.exe (v1.00b)
@@ -210,6 +223,10 @@ export class StageRuntime {
   // pattern parameters here and child emitters read them back.
   globalsInt = new Int32Array(4);
   globalsFloat = new Float64Array(4);
+  // Every native ANM VM consumes the same gameplay RNG at 0x495e00.
+  // Enemy runners are created from ECL dispatch, so retain the host stream
+  // for constructors reached indirectly by pose changes and auxiliary slots.
+  private anmRng: Rng | undefined;
 
   constructor(stage: StageData, anms: { etama: Anm; enemy: Anm; effect: Anm }) {
     this.ecl = new Ecl(stage.ecl);
@@ -227,8 +244,6 @@ export class StageRuntime {
 
   reset(): void {
     this.timelineCursors = this.ecl.timelines.map(() => ({ index: 0, frame: 0 }));
-    this.randomItemIndex = 0;
-    this.randomSpawnIndex = 0;
     this.bulletPoolCursor = 0;
     this.bossSlots = [];
     this.bossRegistered = false;
@@ -237,6 +252,15 @@ export class StageRuntime {
     this.globalsInt.fill(0);
     this.globalsFloat.fill(0);
     this.std.reset();
+  }
+
+  initializeRandomCounters(rng: Rng): void {
+    // Th07.exe (v1.00b) FUN_00421410 @ 0x42148c / 0x4214c4 seeds the
+    // process-global enemy-death phase and RANDOM_ITEMS cursor from the live
+    // gameplay stream when the stage managers are initialized. Replay setup
+    // restores the recorded stage seed before these two calls.
+    this.randomSpawnIndex = rng.u16InRange(3);
+    this.randomItemIndex = rng.u16InRange(8);
   }
 
   isTimelineComplete(): boolean {
@@ -274,7 +298,12 @@ export class StageRuntime {
         cursor.index++;
       }
       // Timeline clock advances at the global rate (spec-slowmo.md §3.2).
-      if (!held && !game.isDialogueBlocking?.()) cursor.frame += rate;
+      // Th07.exe (v1.00b) FUN_0041de20 @ all.c:13533-13720 has no
+      // manager-wide dialogue gate here.  Timeline op 9 implements the
+      // authored wait locally by cancelling this tail increment while the
+      // message manager is active; op 8 starting a message must not freeze
+      // the clock on its own.
+      if (!held) cursor.frame += rate;
     }
   }
 
@@ -288,20 +317,23 @@ export class StageRuntime {
         // DAT_00495bf4 (any boss registered) is set — consumed, not deferred.
         if (this.bossRegistered) return null;
         this.spawnLog.push({ t, time: evt.time, sub: evt.arg0 });
-        // Spawn enemy. op bit 1 = mirrored (as in TH06's even/odd pairs).
-        // TH07-TODO: semantics of bit 2 (ops 4/6) unverified; treated as plain.
+        // Timeline op 2 passes the mirror flag into FUN_0041da10, so its
+        // synchronous allocator core already sees it. Op 6 is subtly
+        // different: the exe sets enemy+0x2e28 bit 6 only AFTER that core
+        // returns (all.c:13581-13587 / 13643-13665).
         let { x = 0, y = 0, z = 0 } = evt;
         if (x <= -990) x = game.rng.range(384);
         if (y <= -990) y = game.rng.range(448);
         if (z <= -990) z = game.rng.range(800);
-        this.spawnEclEnemy(game, {
+        const enemy = this.spawnEclEnemy(game, {
           subId: evt.arg0,
           x, y, z,
           life: evt.life ?? -1,
           item: evt.item ?? -1,
           score: evt.score ?? -1,
-          mirrored: (evt.op & 2) !== 0
+          mirrored: evt.op === 2
         });
+        if (evt.op === 6) enemy.ecl.mirrored = true;
         return null;
       }
       case 8:
@@ -309,7 +341,11 @@ export class StageRuntime {
         return null;
       case 9:
         if (game.consumeDialogueResume?.()) return null;
-        return game.isDialogueBlocking?.() ? 'hold' : null;
+        // FUN_00429446 polls the MSG manager's active message index (unless
+        // op 6 left a one-frame resume ticket). This is deliberately NOT the
+        // gameplay-freeze predicate: timestamp-only message tracks remain
+        // active and hold their authored timeline while gameplay continues.
+        return game.isDialogueActive?.() ? 'hold' : null;
       case 10: {
         const boss = this.bossSlots[evt.i0 ?? 0];
         if (this.isEnemyActive(game, boss)) boss!.ecl.pendingInterrupt = evt.i1 ?? 0;
@@ -332,23 +368,31 @@ export class StageRuntime {
     } = opts;
     const hasLife = life >= 0;
     const hasScore = score >= 0;
-    const ecl = this.makeEnemyState(subId, mirrored, item, parent);
+    // The native template still carries its default random-drop marker during
+    // the synchronous t0 core. Both allocators write itemDrop and score only
+    // after FUN_0040f6c0 returns (all.c:13395-13412/13448-13474).
+    const ecl = this.makeEnemyState(subId, mirrored, -1, parent);
     if (initialVars) {
       const count = Math.min(ecl.vars.length, initialVars.length);
       for (let i = 0; i < count; i++) ecl.vars[i] = Number(initialVars[i]);
     }
     const e: Enemy = {
       id: game.id++,
+      poolSlot: -1,
       x, y, z,
       hp: hasLife ? life | 0 : 1,
       maxHp: hasLife ? life | 0 : 1,
       pendingShotDmg: 0,
       pendingBombDmg: 0,
-      score: hasScore ? score | 0 : 100,
+      score: 100,
       frame: 0,
       ecl
     };
-    game.enemies.push(e);
+    if (game.addEnemy) {
+      if (!game.addEnemy(e)) e.dead = true;
+    } else {
+      game.enemies.push(e);
+    }
     this.logLifecycle(game, 'spawn', e, parent?.id);
     // Apply the timeline life/score BEFORE the initial ECL run so a t=0
     // op110 (set HP) is not clobbered by the spawn-event life afterwards.
@@ -357,10 +401,19 @@ export class StageRuntime {
     // stage-4+ multi-slot boss back to 1 and let the first player shot
     // fire its death-callback (op99(-1)) on frame 1.
     if (hasLife) e.hp = e.maxHp = life | 0;
+    // Both native allocators execute one complete FUN_0040f6c0 core tick
+    // synchronously, including the movement controller, but do not run the
+    // enemy manager's position integrator, regular ANM update,
+    // collision/death pass, or tail timers. A timeline-spawned actor whose
+    // slot has not yet been scanned can therefore run the core twice before
+    // its first integration: once here and once in the manager pass.
+    this.tickEnemyCore(game, e, true);
+    // FUN_0041db60 (child allocator) reapplies an explicit HP after t0;
+    // timeline FUN_0041da10 deliberately keeps a t0 op110 result.
+    if (parent && hasLife) e.hp = life | 0;
+    e.ecl.itemDrop = item;
     if (hasScore) e.score = score | 0;
-    this.runEcl(game, e);
-    if (!hasLife) e.maxHp = Math.max(1, e.hp);
-    else e.maxHp = Math.max(e.maxHp, e.hp);
+    e.maxHp = Math.max(1, e.hp);
     return e;
   }
 
@@ -422,6 +475,7 @@ export class StageRuntime {
       timerCallbackThreshold: -1,
       timerCallbackSub: -1,
       bossTimer: 0,
+      bossTimerPrevious: -999,
       currentAnm: -1,
       anmRunner: null,
       anmSlots: [],
@@ -434,8 +488,10 @@ export class StageRuntime {
       deathAnm1: 0,
       deathAnm2: 0,
       deathAnm3: 0,
+      integratorPreviousPosition: { x: 0, y: 0, z: 0 },
       frameVx: 0,
       frameVy: 0,
+      frameVz: 0,
       anmRotateWithAngle: false,
       bossLifeCount: 0,
       lasers: [],
@@ -446,8 +502,12 @@ export class StageRuntime {
       disableCallStack: false,
       invisible: false,
       spellTimeoutFlag: false,
-      bulletRankSpeedLow: -0.5,
-      bulletRankSpeedHigh: 0.5,
+      // Enemy-manager template defaults, Th07.exe FUN_0041d190
+      // @ 0x41d51f-0x41d52f: the allocator copies -0.15/+0.15 into every
+      // fresh enemy. The wider -0.5/+0.5 pair belongs only to phase-entry
+      // resets (FUN_0041e4a0/phaseTransition), handled separately below.
+      bulletRankSpeedLow: -0.15000000596046448,
+      bulletRankSpeedHigh: 0.15000000596046448,
       bulletRankAmount1Low: 0,
       bulletRankAmount1High: 0,
       bulletRankAmount2Low: 0,
@@ -459,7 +519,16 @@ export class StageRuntime {
       seen: false,
       sweepItemFlag: false,
       offscreenCullExempt: false,
-      damageShield: 0
+      // FUN_0041d6a0 reserves 96 entries at enemy+0x2f78, initially zeroed
+      // by the allocator template. Op138 changes only the four config fields;
+      // it deliberately does not clear an already-running history.
+      trailFlags: 0,
+      trailCount: 0,
+      trailStart: 0,
+      trailStride: 0,
+      trailHistory: Array.from({ length: 96 }, () => ({ x: 0, y: 0, z: 0 })),
+      damageShield: 0,
+      damageShieldFrac: 0
     };
   }
 
@@ -565,7 +634,7 @@ export class StageRuntime {
       // +0x2b30/34/38 = this frame's movement delta (all.c:13120-13122).
       case 10063: return s.frameVx;
       case 10064: return s.frameVy;
-      case 10065: return 0; // frame z delta — engine has no z motion sources
+      case 10065: return s.frameVz;
       // op148 HP-threshold slots (+0x2ebc..+0x2ec8); unarmed reads as 0.
       case 10066: case 10067: case 10068: case 10069: {
         const t = s.lifeThresholds[id - 10066].threshold;
@@ -582,6 +651,36 @@ export class StageRuntime {
     // value. Warn once anyway — it usually means a special worth decoding.
     if (rel >= 0 && rel < 100) warnOnce(`r${id}`, `read of unmapped variable ${id}`);
     return id;
+  }
+
+  // FUN_0040dda0 is the integer-address resolver. It deliberately maps only
+  // integer-backed variables; an id for a float local (for example 10004)
+  // falls through and the exe writes into the instruction argument itself,
+  // not the enemy variable block. Retail Stage-3 Sub8 relies on this exact
+  // mismatch: op10(10004, 0) consumes its sign draw but leaves the emitter's
+  // saved X coordinate intact, and FIRE later uses that value as its ring
+  // angle stride. Treat unsupported typed destinations as no-ops here rather
+  // than corrupting the opposite-typed game variable.
+  private varWriteInt(game: GameHost, e: Enemy, id: number, value: number): void {
+    const s = e.ecl;
+    const integer = Math.trunc(value);
+    switch (id) {
+      case 10000: case 10001: case 10002: case 10003:
+        s.vars[id - 10000] = integer; return;
+      case 10012: case 10013: case 10014: case 10015:
+        s.vars[id - 10000] = integer; return;
+      case 10016: game.difficulty = integer; return;
+      case 10017: game.rank = integer; return;
+      case 10025: s.bossTimer = integer; return;
+      case 10027: e.hp = integer; return;
+      case 10029: case 10030: case 10031: case 10032:
+        s.vars[18 + (id - 10029)] = integer; return;
+      case 10037: case 10038: case 10039: case 10040:
+        this.globalsInt[id - 10037] = integer; return;
+      case 10070: s.itemDrop = integer; return;
+      case 10071: e.score = integer; return;
+      default: return;
+    }
   }
 
   private varWrite(game: GameHost, e: Enemy, id: number, value: number): void {
@@ -633,14 +732,18 @@ export class StageRuntime {
 
   private getInt(game: GameHost, e: Enemy, off: number): number {
     const raw = this.ecl.view.i32(off);
-    // Int reads of float-backed vars round to nearest (exe FUN_00481260).
-    if (raw >= VAR_BASE && raw < VAR_BASE + 100) return Math.round(this.varRead(game, e, raw, false));
+    // Th07.exe (v1.00b) FUN_0040d750 -> FUN_00481260: the latter is MSVC's
+    // x87 `_ftol` helper. Despite Ghidra rendering its initial FISTP as
+    // ROUND(), the correction tail implements a C cast (truncate toward
+    // zero). Stage-3 Sub29 supplies 15.8464 through var10006 to op54 and the
+    // native controller duration is 15, not 16.
+    if (raw >= VAR_BASE && raw < VAR_BASE + 100) return Math.trunc(this.varRead(game, e, raw, false));
     return raw;
   }
 
   private getShort(game: GameHost, e: Enemy, off: number): number {
     const raw = this.ecl.view.i16(off);
-    if (raw >= VAR_BASE && raw < VAR_BASE + 100) return Math.round(this.varRead(game, e, raw, false));
+    if (raw >= VAR_BASE && raw < VAR_BASE + 100) return Math.trunc(this.varRead(game, e, raw, false));
     return raw;
   }
 
@@ -656,129 +759,196 @@ export class StageRuntime {
   // ---- per-frame enemy processing -----------------------------------------
 
   updateEnemy(game: GameHost, e: Enemy): void {
+    // Compatibility/full-manager wrapper used by focused VM tests. The live
+    // StageScene calls the same phases around its native cull/collision/death
+    // work so their ordering remains visible there.
+    do {
+      this.tickEnemyCore(game, e);
+      if (e.dead) return;
+      this.integrateEnemyPosition(e, game.slowRate ?? 1);
+    } while (this.processEnemyCallbacks(game, e));
+    this.updateEnemyAnm(e, game.slowRate ?? 1);
+    this.tickEnemyManagerTail(game, e);
+  }
+
+  // FUN_0040f6c0: the reusable enemy core. Both allocators call this once
+  // synchronously, and the manager calls it again when it reaches the slot.
+  // Position integration, regular ANM ticking, collision/death, bossTimer,
+  // and the damage-shield countdown are deliberately manager-only.
+  tickEnemyCore(game: GameHost, e: Enemy, allocatorCore = false): void {
+    this.anmRng = game.rng;
     const s = e.ecl;
-    const prevX = e.x;
-    const prevY = e.y;
-    // op-142 damage shield counts down once per frame while armed (exe
-    // FUN_00436a06(1) on the +0x4f38 struct, all.c:14440).
-    if (s.damageShield > 0) s.damageShield--;
-    this.checkCallbacks(game, e);
-    // Exe frame preamble (all.c:7055-7104, 7266-7324), in order: drain the
-    // pending interrupt index, run the op122 armed effect, tick the op27
-    // interp slots, then the op144 periodic gosub — all before this frame's
-    // bytecode dispatch.
-    this.runPendingInterrupt(s);
-    if (s.effectArm) this.runBulletEffect(game, e, s.effectArm.id, this.getInt(game, e, s.effectArm.paramOff));
-    this.tickInterpSlots(game, e);
-    const rate = game.slowRate ?? 1;
-    if (s.periodicSub && s.periodicSub.subId >= 0) {
-      s.periodicSub.elapsed += rate;
-      if (s.periodicSub.elapsed >= s.periodicSub.period) {
-        s.periodicSub.elapsed = 0;
-        // Periodic entry (all.c:7081-7102): push the frame, load the sub's
-        // own persistent variable block from the stash, and arm the export
-        // flag so its op42 writes the block back.
-        this.pushFrame(s);
-        s.vars.set(s.periodicSub.savedVars);
-        s.periodicExportArmed = true;
-        this.enterSub(s, s.periodicSub.subId);
-      }
-    }
-    // FUN_0040f6c0 dispatches this frame's ECL before recomputing velocity;
-    // op45 only pauses dispatch/time, never the movement block at 0x41592f.
-    this.runEcl(game, e);
-    this.applyMovement(e, rate);
-    s.frameVx = e.x - prevX;
-    s.frameVy = e.y - prevY;
-    // Live heading, exe enemy+0x2b54 (recon exe-heading.md): move modes 2/3
-    // and op27 position interps recompute atan2 of the frame delta every
-    // frame (FUN_0048166a = real atan2); mode 1 carries its integrated polar
-    // angle. A stationary/mode-0 enemy retains the last heading. op120's
-    // draw rotation, var 10045 and heading-based fire bases all read THIS
-    // field — never the mode-1 angle alone (STG1-002 paper orientation).
-    if (s.moveMode === 1) s.heading = s.angle;
-    else if (s.frameVx !== 0 || s.frameVy !== 0) s.heading = Math.atan2(s.frameVy, s.frameVx);
+    // dispatchEcl owns LAB_0040f6d1's interrupt/periodic preamble. Native
+    // CALL and RETURN both jump back to that label, so the op144 timer may
+    // advance multiple times inside one enemy-core invocation.
+    // Dispatch precedes movement and auto-fire. The clock increments only at
+    // the very tail, after op122/op27 (all.c:7105-7329).
+    const advanceClock = this.dispatchEcl(game, e);
+    if (e.dead) return;
+    // op121 may change DAT_0056baa8 inside dispatch. Native tail helpers read
+    // the global after dispatch, so movement and the ECL split clock use the
+    // newly written rate on that same core tick (FUN_00436acc call sites),
+    // while the periodic pre-dispatch timer above used the entry rate.
+    const tailRate = game.slowRate ?? 1;
+    // Th07.exe (v1.00b): both FUN_0041da10 and FUN_0041db60 call the complete
+    // FUN_0040f6c0 core synchronously. The controller is inside that core;
+    // only FUN_0041d050 position integration is manager-only. Consequently a
+    // newly spawned, not-yet-scanned slot advances the controller here and
+    // again when the manager reaches it later in the same pass.
+    this.updateMovementController(e, tailRate);
     this.updateAutoShoot(game, e);
-    // Boss spell timer is a split counter at the global rate
-    // (exe-ecl-boss.md §3 + spec-slowmo.md §3.2).
-    if (s.isBoss && !game.timeStopped) {
+    this.updateAnmPose(e);
+    // Armed op122 and op27 slots are HP-gated and run after dispatch, so an
+    // instruction armed at t0 takes effect during this same allocation core.
+    if (e.hp > 0) {
+      if (s.effectArm) this.runBulletEffect(game, e, s.effectArm.id, this.getInt(game, e, s.effectArm.paramOff));
+      this.tickInterpSlots(game, e);
+    }
+    if (advanceClock) this.advanceEclClock(s, tailRate);
+  }
+
+  private tickPeriodicSub(game: GameHost, e: Enemy): void {
+    const s = e.ecl;
+    if (!s.periodicSub || s.periodicSub.subId < 0) return;
+    s.periodicSub.elapsed += game.slowRate ?? 1;
+    if (s.periodicSub.elapsed < s.periodicSub.period) return;
+    s.periodicSub.elapsed = 0;
+    // all.c:7081-7102: periodic entry pushes the current 0x218-byte frame,
+    // loads the sub's persistent variable stash, and arms the first RETURN
+    // to export that stash through enemy+0x8f4.
+    this.pushFrame(s);
+    s.vars.set(s.periodicSub.savedVars);
+    s.periodicExportArmed = true;
+    this.enterSub(s, s.periodicSub.subId);
+  }
+
+  private updateMovementController(e: Enemy, rate: number): void {
+    const s = e.ecl;
+    if (s.moveMode === 2 && s.interp) {
+      const m = s.interp;
+      m.left = Math.max(0, m.left - rate);
+      const elapsed = m.duration - m.left;
+      const t = applyEclEase(clamp(elapsed / Math.max(1, m.duration), 0, 1), s.interpKind);
+      const tx = m.start.x + m.delta.x * t;
+      const ty = m.start.y + m.delta.y * t;
+      const tz = m.start.z + m.delta.z * t;
+      let vx = tx - e.x;
+      const vy = ty - e.y;
+      const vz = tz - e.z;
+      // FUN_0040f6c0 flips the computed X delta for mirrored actors; the
+      // manager integrator flips it back when applying it (all.c:7161/13126).
+      if (s.mirrored) vx = -vx;
+      s.axisSpeed = { x: vx, y: vy, z: vz };
+      // FUN_0048166a consumes the controller vector after the internal
+      // mirror flip, before FUN_0041d050 applies the second flip on screen
+      // (all.c:7152-7165). Keep this separate from vars 10063..10065.
+      if (vx !== 0 || vy !== 0) s.heading = Math.atan2(vy, vx);
+      if (m.left <= 0) {
+        // Mode-2 completion snaps inside the core even on an allocation-only
+        // tick, then clears the velocity before the manager integrator.
+        e.x = m.start.x + m.delta.x;
+        e.y = m.start.y + m.delta.y;
+        e.z = m.start.z + m.delta.z;
+        s.axisSpeed = { x: 0, y: 0, z: 0 };
+        s.moveMode = 0;
+        s.interp = null;
+      }
+    } else if (s.moveMode === 3) {
+      s.orbitAngle = normalizeAngle(s.orbitAngle + s.orbitAngularVelocity * rate);
+      s.orbitSpeed += s.orbitAcceleration * rate;
+      s.axisSpeed.x = (Math.cos(s.orbitAngle) * s.orbitSpeed + s.orbitTarget.x) - e.x;
+      s.axisSpeed.y = (Math.sin(s.orbitAngle) * s.orbitSpeed + s.orbitTarget.y) - e.y;
+      if (s.axisSpeed.x !== 0 || s.axisSpeed.y !== 0) {
+        s.heading = Math.atan2(s.axisSpeed.y, s.axisSpeed.x);
+      }
+      if (s.orbitDuration > 0 && (s.orbitLeft -= rate) < 1) s.moveMode = 0;
+    } else if (s.moveMode === 1) {
+      s.angle = normalizeAngle(s.angle + s.angularVelocity * rate);
+      s.speed += s.acceleration * rate;
+      s.axisSpeed = { x: Math.cos(s.angle) * s.speed, y: Math.sin(s.angle) * s.speed, z: 0 };
+      s.heading = s.angle;
+      if (s.orbitDuration > 0 && (s.orbitLeft -= rate) < 1) s.moveMode = 0;
+    }
+  }
+
+  integrateEnemyPosition(e: Enemy, rate = 1): void {
+    const s = e.ecl;
+    // FUN_0041eae0 clamps immediately before and after FUN_0041d050.
+    if (s.movementSuppressedByEffect0) return;
+    this.clampEnemyPosition(e);
+    // FUN_0041d050 snapshots the displacement that ALREADY happened since
+    // the previous manager pass, then latches the pre-integration position.
+    // ECL dispatch therefore reads these values one manager tick later than
+    // the controller velocity used below (all.c:13120-13125).
+    const prev = s.integratorPreviousPosition;
+    s.frameVx = e.x - prev.x;
+    s.frameVy = e.y - prev.y;
+    s.frameVz = e.z - prev.z;
+    prev.x = e.x;
+    prev.y = e.y;
+    prev.z = e.z;
+    e.x += (s.mirrored ? -s.axisSpeed.x : s.axisSpeed.x) * rate;
+    e.y += s.axisSpeed.y * rate;
+    e.z += s.axisSpeed.z * rate;
+    this.clampEnemyPosition(e);
+  }
+
+  private clampEnemyPosition(e: Enemy): void {
+    const s = e.ecl;
+    if (!s.shouldClamp) return;
+    e.x = clamp(e.x, s.lowerMoveLimit.x, s.upperMoveLimit.x);
+    e.y = clamp(e.y, s.lowerMoveLimit.y, s.upperMoveLimit.y);
+  }
+
+  processEnemyCallbacks(game: GameHost, e: Enemy): boolean {
+    return this.checkCallbacks(game, e);
+  }
+
+  updateEnemyAnm(e: Enemy, rate = 1): void {
+    const s = e.ecl;
+    s.anmRunner?.update(rate);
+    for (const slot of s.anmSlots) slot?.runner?.update(rate);
+  }
+
+  tickEnemyManagerTail(game: GameHost, e: Enemy): void {
+    const s = e.ecl;
+    // Enemy+0x2bcc is a per-enemy split counter, despite the historical
+    // bossTimer name. FUN_0041ed50 snapshots it to +0x2bc4 and advances it
+    // for every occupied slot (all.c:14436-14439); body graze uses both.
+    // DAT_0061c25c gates only this tail clock during a true global freeze.
+    if (!game.timeStopped && !game.isDialogueBlocking?.()) {
+      s.bossTimerPrevious = s.bossTimer;
+      const rate = game.slowRate ?? 1;
       s.bossTimerFrac = (s.bossTimerFrac ?? 0) + rate;
       if (s.bossTimerFrac >= 1) {
         s.bossTimer++;
         s.bossTimerFrac -= 1;
       }
     }
-    this.updateAnmPose(e);
-    s.anmRunner?.update(rate);
-    for (const slot of s.anmSlots) slot?.runner?.update(rate);
-  }
-
-  private applyMovement(e: Enemy, rate = 1): void {
-    const s = e.ecl;
-    // Th07.exe FUN_00416d00 @ 0x416d00 sets +0x2e2b bit0 permanently;
-    // the master enemy tick skips FUN_0041d050 while it remains set.
-    if (s.movementSuppressedByEffect0) return;
-    if (s.moveMode === 2 && s.interp) {
-      const m = s.interp;
-      // FUN_00436a06 decrements the remaining-frame counter before the
-      // interpolation fraction is read, so the first movement tick is 1/N.
-      m.left = Math.max(0, m.left - rate);
-      const elapsed = m.duration - m.left;
-      const t = applyEclEase(clamp(elapsed / Math.max(1, m.duration), 0, 1), s.interpKind);
-      e.x = m.start.x + m.delta.x * t;
-      e.y = m.start.y + m.delta.y * t;
-      e.z = m.start.z + m.delta.z * t;
-      if (m.left <= 0) {
-        e.x = m.start.x + m.delta.x;
-        e.y = m.start.y + m.delta.y;
-        e.z = m.start.z + m.delta.z;
-        s.moveMode = 0;
-        s.interp = null;
+    // op142's countdown is manager-tail only, so the allocation core cannot
+    // consume shield time. Th07.exe FUN_0041ed50 @ all.c:14440 calls
+    // FUN_00436a06(1), not a flat decrement: the {current,frac} pair at
+    // +0x4f40/+0x4f3c retreats on the global slowmo split clock. A wall-
+    // clock `--` expired Youmu's 240-tick shield during her rate-1/3 spell
+    // 192 damage too early (Stage 5 native HP 205 vs WT 13 at PRE7732).
+    if (s.damageShield > 0) {
+      const rate = game.slowRate ?? 1;
+      if (rate > 0.99) {
+        s.damageShield--;
+      } else {
+        s.damageShieldFrac += rate;
+        if (s.damageShieldFrac >= 1) {
+          s.damageShield--;
+          s.damageShieldFrac -= 1;
+        }
       }
-    } else if (s.moveMode === 3) {
-      // orbit around a (possibly moving) target: exe FUN_0040f6c0 case bVar8==3
-      // computes a polar offset in a scratch temp, then derives this frame's
-      // velocity as (temp+target)-pos so FUN_0041d050's unconditional integrator
-      // lands exactly on target+polar(angle,speed) — see spec §3 Group B / §5.3.
-      s.orbitAngle = normalizeAngle(s.orbitAngle + s.orbitAngularVelocity * rate);
-      s.orbitSpeed += s.orbitAcceleration * rate;
-      const vx = (Math.cos(s.orbitAngle) * s.orbitSpeed + s.orbitTarget.x) - e.x;
-      const vy = (Math.sin(s.orbitAngle) * s.orbitSpeed + s.orbitTarget.y) - e.y;
-      // Mode 3 leaves velocity.z untouched. Keep all three components because
-      // clearing the mode bits at timeout does not clear the velocity vector.
-      s.axisSpeed.x = vx;
-      s.axisSpeed.y = vy;
-      e.x += (s.mirrored ? -vx : vx) * rate;
-      e.y += vy * rate;
-      e.z += s.axisSpeed.z * rate;
-      if (s.orbitDuration > 0 && (s.orbitLeft -= rate) < 1) s.moveMode = 0;
-    } else if (s.moveMode === 1) {
-      // FUN_0040f6c0 @ 0x415a9e-0x415b0c updates the polar state first,
-      // then writes the velocity consumed by the unconditional integrator.
-      s.angle = normalizeAngle(s.angle + s.angularVelocity * rate);
-      s.speed += s.acceleration * rate;
-      const vx = Math.cos(s.angle) * s.speed;
-      const vy = Math.sin(s.angle) * s.speed;
-      s.axisSpeed = { x: vx, y: vy, z: 0 };
-      e.x += (s.mirrored ? -vx : vx) * rate;
-      e.y += vy * rate;
-      if (s.orbitDuration > 0 && (s.orbitLeft -= rate) < 1) s.moveMode = 0;
-    } else {
-      // Generic integrator (exe FUN_0041d050): pos += vel * rate.
-      e.x += (s.mirrored ? -s.axisSpeed.x : s.axisSpeed.x) * rate;
-      e.y += s.axisSpeed.y * rate;
-      e.z += s.axisSpeed.z * rate;
-    }
-    if (s.shouldClamp) {
-      e.x = clamp(e.x, s.lowerMoveLimit.x, s.upperMoveLimit.x);
-      e.y = clamp(e.y, s.lowerMoveLimit.y, s.upperMoveLimit.y);
     }
   }
 
   // Boss phase callbacks, matching the original engine's behavior: the timer
   // callback target is re-chained to the death callback whenever a callback
   // fires, life callbacks fire on hp < threshold (strict) and clamp hp up.
-  private checkCallbacks(game: GameHost, e: Enemy): void {
+  private checkCallbacks(game: GameHost, e: Enemy): boolean {
     const s = e.ecl;
     // Life callbacks: exe FUN_0041e4a0 scans slots 0..3 in order, fires the
     // FIRST armed slot with hp < threshold, clamps hp UP to it, and also
@@ -791,7 +961,7 @@ export class StageRuntime {
         s.timerCallbackThreshold = -1; // exe: cleared on every life-cb fire
         s.timerCallbackSub = s.deathCallbackSub;
         this.phaseTransition(game, e, t.sub);
-        return;
+        return true;
       }
     }
     if (s.timerCallbackThreshold >= 0 && s.timerCallbackSub >= 0 && s.bossTimer >= s.timerCallbackThreshold) {
@@ -805,6 +975,7 @@ export class StageRuntime {
       s.timerCallbackThreshold = -1;
       s.timerCallbackSub = s.deathCallbackSub;
       s.bossTimer = 0;
+      s.bossTimerPrevious = -999;
       // Timing out voids the spell capture unless the ECL flagged otherwise.
       if (s.spellName && !s.spellTimeoutFlag) game.voidSpellCapture?.();
       // Exe timer-callback path (all.c:13820-13840, gated on the same
@@ -812,8 +983,9 @@ export class StageRuntime {
       // timeouts as well, not just spell cards.
       if (!s.spellTimeoutFlag) game.onBossPhaseTimeout?.();
       this.phaseTransition(game, e, sub);
-      return;
+      return true;
     }
+    return false;
   }
 
   private phaseTransition(game: GameHost, e: Enemy, sub: number): void {
@@ -848,12 +1020,14 @@ export class StageRuntime {
 
   // Th07.exe frame push (op41 all.c:10045-10052, interrupt entry 7058-7065,
   // periodic entry 7081-7088): the saved 0x218-byte block spans the cursor,
-  // all 26 variable dwords, the wait timer, and the op27 interp slots.
+  // all 26 variable dwords, the wait timer, the op27 interp slots, and the
+  // op144 export flag at enemy+0x8f4.
   private pushFrame(s: EclState): void {
     s.stack.push({
       ctx: { ...s.ctx },
       vars: s.vars.slice(),
-      interps: s.interpSlots.map((slot) => (slot ? { ...slot } : null))
+      interps: s.interpSlots.map((slot) => (slot ? { ...slot } : null)),
+      periodicExportArmed: s.periodicExportArmed
     });
   }
 
@@ -879,6 +1053,16 @@ export class StageRuntime {
   // final-frame write still happens before the slot frees.
   private tickInterpSlots(game: GameHost, e: Enemy): void {
     const s = e.ecl;
+    // FUN_0040f6c0 @ all.c:7266-7324 snapshots position before the eight
+    // op27 slots run. Own-X/Y/Z targets are temporary writes: after all
+    // slots produce their values, the executable captures the combined
+    // displacement into +0x2b18/1c/20, rolls position back, and lets the
+    // manager's later FUN_0041d050 integration apply that delta once. The
+    // final delta deliberately remains after the interpolation slot frees.
+    const oldX = e.x;
+    const oldY = e.y;
+    const oldZ = e.z;
+    let positionTargetTouched = false;
     for (let i = 0; i < s.interpSlots.length; i++) {
       const slot = s.interpSlots[i];
       if (!slot) continue;
@@ -896,15 +1080,27 @@ export class StageRuntime {
         value = (slot.f1 - slot.f0) * t + slot.f0;
       }
       this.interpWrite(game, e, slot.target, value);
+      if (slot.target === 10018 || slot.target === 10019 || slot.target === 10020) {
+        positionTargetTouched = true;
+      }
       if (done) s.interpSlots[i] = null;
+    }
+    if (positionTargetTouched) {
+      const dx = e.x - oldX;
+      const dy = e.y - oldY;
+      const dz = e.z - oldZ;
+      if (dx !== 0 || dy !== 0) s.heading = Math.atan2(dy, dx);
+      e.x = oldX;
+      e.y = oldY;
+      e.z = oldZ;
+      s.axisSpeed = { x: dx, y: dy, z: dz };
     }
   }
 
   // op27 writes go through the exe's FLOAT write path (FUN_0040e560),
   // which CAN write own-position (unlike the int path our varWrite
-  // models). Position writes also update the heading like the exe's
-  // delta-capture does (all.c:7304-7324, simplified to a direct write per
-  // the spec's port guidance).
+  // models). Position writes are temporary; tickInterpSlots rolls them back
+  // and transfers their combined displacement to axisSpeed after all slots.
   private interpWrite(game: GameHost, e: Enemy, id: number, value: number): void {
     switch (id) {
       case 10018: e.x = value; return;
@@ -1163,17 +1359,29 @@ export class StageRuntime {
           // Queue wipe + fresh slot-0 install (rep stos @ 0x416f4d then
           // FUN_004260d0). The port folds queue and live registers into the
           // ex* fields; retail bullets here carry no live motion behavior.
+          const speedDelta = lunatic ? 0.005263158120214939 : 0.01666666753590107;
+          const limit = lunatic ? 240 : 60;
+          b.exFlags = 0;
+          b.exSlots = [
+            { opcode: 0x20, cond: 1, arg3: limit, arg4: 0, f0: speedDelta, f1: wobble },
+            null, null, null, null
+          ];
+          b.exFireFlags |= 0x20;
+          b.exBehaviorIndex = 0;
           b.exAccel = null;
           b.exDir = null;
           b.exBounce = null;
-          b.exAngle = {
-            speedDelta: lunatic ? 0.005263158120214939 : 0.01666666753590107,
-            angleDelta: wobble,
-            limit: lunatic ? 240 : 60
-          };
-          b.exFlags = 0x20;
+          b.exAngle = null;
+          b.exRampElapsed = 0;
+          b.exRampFrac = 0;
+          b.exAccelElapsed = 0;
+          b.exAccelFrac = 0;
           b.exAngleElapsed = 0;
           b.exAngleFrac = 0;
+          b.exDirElapsed = 0;
+          b.exDirFrac = 0;
+          b.dirTimes = 0;
+          b.exBounceTimes = 0;
           b.effectState = 1;
         }
         return;
@@ -1304,13 +1512,19 @@ export class StageRuntime {
     const s = e.ecl;
     if (script < 0 || s.currentAnm === script) return;
     s.currentAnm = script;
-    s.anmRunner = this.enemyAnm.hasScript(script) ? new AnmRunner(this.enemyAnm, script) : null;
+    s.anmRunner = this.enemyAnm.hasScript(script)
+      ? new AnmRunner(this.enemyAnm, script, { rng: this.anmRng })
+      : null;
   }
 
   private updateAnmPose(e: Enemy): void {
     const s = e.ecl;
     if (s.anmExLeft < 0) return;
-    const vx = Math.abs(s.frameVx) < 0.0001 ? 0 : s.frameVx;
+    // Pose selection runs inside FUN_0040f6c0 before the manager integrator
+    // and reads +0x2b18 directly. Mirrored actors invert its interpretation
+    // in the branch table (all.c:7210-7229); slowRate is not multiplied here.
+    const screenVx = s.mirrored ? -s.axisSpeed.x : s.axisSpeed.x;
+    const vx = Math.abs(screenVx) < 0.0001 ? 0 : screenVx;
     const pose = vx < 0 ? 1 : vx > 0 ? 2 : 0;
     if (s.anmExFlags === pose) return;
     if (pose === 0) {
@@ -1324,10 +1538,20 @@ export class StageRuntime {
 
   // ---- the interpreter -----------------------------------------------------
 
-  private runEcl(game: GameHost, e: Enemy): void {
+  private dispatchEcl(game: GameHost, e: Enemy): boolean {
     const s = e.ecl;
+    let restartPreamble = true;
     for (let guard = 0; guard < 512; guard++) {
-      this.runPendingInterrupt(s);
+      if (restartPreamble) {
+        // Th07.exe FUN_0040f6c0 @ LAB_0040f6d1 (all.c:7055-7104).
+        // case 0x28 CALL and case 0x29 RETURN both goto this label. Stage 6
+        // Sub44 calls Sub47 from its periodic body, so a firing tick resets
+        // the timer and then advances it three times before the next PRE:
+        // nested CALL, inner RETURN, outer RETURN (native PRE6080 = 3).
+        this.runPendingInterrupt(s);
+        this.tickPeriodicSub(game, e);
+        restartPreamble = false;
+      }
       const ctx = s.ctx;
       // op45 is a per-context WAIT, not an active-lifetime gate. At normal
       // speed the exe decrements both +0x76c and the ECL clock here, then the
@@ -1336,11 +1560,11 @@ export class StageRuntime {
       // caller after an op144 periodic gosub.
       if (ctx.waitTimer > 0) {
         ctx.waitTimer -= game.slowRate ?? 1;
-        return;
+        return false;
       }
       const instrs = this.ecl.sub(ctx.subId);
       const instr = instrs[ctx.index];
-      if (!instr) return;
+      if (!instr) return false;
       if (ctx.time !== instr.time) break;
       if (instr.rankMask & (1 << game.difficulty)) {
         const prevExecuting = this.executingEnemy;
@@ -1349,16 +1573,22 @@ export class StageRuntime {
         this.executingEnemy = prevExecuting;
         if (action === 'delete') {
           e.dead = true;
-          return;
+          return false;
+        }
+        if (action === 'restart') {
+          restartPreamble = true;
+          continue;
         }
         if (action === 'flow') continue;
       }
       ctx.index++;
     }
-    // The ECL clock is a split (int, frac) counter at the global rate
-    // (exe FUN_00436acc @ all.c:7329; spec-slowmo.md §5). Integer semantics
-    // are load-bearing: instruction dispatch compares time with ===.
-    const rate = game.slowRate ?? 1;
+    return true;
+  }
+
+  private advanceEclClock(s: EclState, rate: number): void {
+    // FUN_00436acc at the core tail (all.c:7327-7329). Integer semantics are
+    // load-bearing because instruction dispatch compares time with ===.
     if (rate > 0.99) {
       s.ctx.time++;
     } else {
@@ -1380,7 +1610,7 @@ export class StageRuntime {
     s.ctx.time = newTime;
   }
 
-  private execute(game: GameHost, e: Enemy, instr: EclInstr): 'delete' | 'flow' | null {
+  private execute(game: GameHost, e: Enemy, instr: EclInstr): 'delete' | 'flow' | 'restart' | null {
     const s = e.ecl;
     const ctx = s.ctx;
     const v = this.ecl.view;
@@ -1389,7 +1619,8 @@ export class StageRuntime {
     const gi = (o: number) => this.getInt(game, e, a + o);
     const gf = (o: number) => this.getFloat(game, e, a + o);
     const gs = (o: number) => this.getShort(game, e, a + o);
-    const setVar = (id: number, val: number) => this.varWrite(game, e, id, val);
+    const setIntVar = (id: number, val: number) => this.varWriteInt(game, e, id, val);
+    const setFloatVar = (id: number, val: number) => this.varWrite(game, e, id, val);
 
     switch (op) {
       case 0: return null; // nop
@@ -1401,27 +1632,30 @@ export class StageRuntime {
       case 3: { // loop: decrement var, jump while > 0
         const varId = v.i32(a + 8);
         const left = Math.trunc(this.varRead(game, e, varId)) - 1;
-        setVar(varId, left);
+        setIntVar(varId, left);
         if (left <= 0) return null;
         this.jumpTo(s, v.i32(a + 4), v.i32(a));
         return 'flow';
       }
-      case 4: setVar(v.i32(a), gi(4)); return null;
-      case 5: setVar(Math.trunc(v.f32(a)), gf(4)); return null;
-      case 6: setVar(v.i32(a), game.rng.u32InRange(Math.max(1, gi(4)))); return null;
-      case 7: setVar(v.i32(a), game.rng.u32InRange(Math.max(1, gi(4))) + gi(8)); return null;
-      case 8: setVar(Math.trunc(v.f32(a)), game.rng.range(gf(4))); return null;
-      case 9: setVar(Math.trunc(v.f32(a)), game.rng.range(gf(4)) + gf(8)); return null;
+      case 4: setIntVar(v.i32(a), gi(4)); return null;
+      case 5: setFloatVar(Math.trunc(v.f32(a)), gf(4)); return null;
+      // Th07.exe FUN_0040f6c0 cases 6/7 call FUN_0042ff90 (u32) before
+      // modulo; the float forms below call FUN_0042ffc0 (frand/u32).
+      case 6: setIntVar(v.i32(a), game.rng.u32InRange(Math.max(1, gi(4)))); return null;
+      case 7: setIntVar(v.i32(a), game.rng.u32InRange(Math.max(1, gi(4))) + gi(8)); return null;
+      case 8: setFloatVar(Math.trunc(v.f32(a)), game.rng.range(gf(4))); return null;
+      case 9: setFloatVar(Math.trunc(v.f32(a)), game.rng.range(gf(4)) + gf(8)); return null;
       // Ops 10/11 are the int/float forms of random-sign assignment.
-      // Th07.exe FUN_0040f6c0 @ 0x410bde-0x410ca7 (cases 9/10).
+      // Th07.exe FUN_0040f6c0 @ 0x410bde-0x410ca7 calls FUN_0042ff30
+      // directly: one raw u16 draw, unlike the u32 random-value ops 6-9.
       case 10: {
-        const sign = (game.rng.u32() & 1) === 0 ? -1 : 1;
-        setVar(v.i32(a), sign * gi(4));
+        const sign = (game.rng.u16() & 1) === 0 ? -1 : 1;
+        setIntVar(v.i32(a), sign * gi(4));
         return null;
       }
       case 11: {
-        const sign = (game.rng.u32() & 1) === 0 ? -1 : 1;
-        setVar(Math.trunc(v.f32(a)), sign * gf(4));
+        const sign = (game.rng.u16() & 1) === 0 ? -1 : 1;
+        setFloatVar(Math.trunc(v.f32(a)), sign * gf(4));
         return null;
       }
       case 12: case 13: case 14: case 15: case 16: { // int math
@@ -1429,22 +1663,22 @@ export class StageRuntime {
         const rhs = gi(8);
         const r = op === 12 ? lhs + rhs : op === 13 ? lhs - rhs : op === 14 ? lhs * rhs
           : op === 15 ? (rhs ? lhs / rhs : 0) : (rhs ? lhs % rhs : 0);
-        setVar(v.i32(a), Math.trunc(r));
+        setIntVar(v.i32(a), Math.trunc(r));
         return null;
       }
-      case 17: setVar(v.i32(a), Math.trunc(this.varRead(game, e, v.i32(a))) + 1); return null;
-      case 18: setVar(v.i32(a), Math.trunc(this.varRead(game, e, v.i32(a))) - 1); return null;
+      case 17: setIntVar(v.i32(a), Math.trunc(this.varRead(game, e, v.i32(a))) + 1); return null;
+      case 18: setIntVar(v.i32(a), Math.trunc(this.varRead(game, e, v.i32(a))) - 1); return null;
       case 19: case 20: case 21: case 22: case 23: { // float math
         const lhs = gf(4);
         const rhs = gf(8);
         const r = op === 19 ? lhs + rhs : op === 20 ? lhs - rhs : op === 21 ? lhs * rhs
           : op === 22 ? (rhs ? lhs / rhs : 0) : (rhs ? lhs % rhs : 0);
-        setVar(Math.trunc(v.f32(a)), r);
+        setFloatVar(Math.trunc(v.f32(a)), r);
         return null;
       }
-      case 24: setVar(Math.trunc(v.f32(a)), Math.sin(gf(4))); return null;
-      case 25: setVar(Math.trunc(v.f32(a)), Math.cos(gf(4))); return null;
-      case 26: setVar(Math.trunc(v.f32(a)), Math.atan2(gf(16) - gf(8), gf(12) - gf(4))); return null;
+      case 24: setFloatVar(Math.trunc(v.f32(a)), Math.sin(gf(4))); return null;
+      case 25: setFloatVar(Math.trunc(v.f32(a)), Math.cos(gf(4))); return null;
+      case 26: setFloatVar(Math.trunc(v.f32(a)), Math.atan2(gf(16) - gf(8), gf(12) - gf(4))); return null;
       case 27: { // timed float interp into a special-var target (8 slots,
         // exe enemy+0x770 stride 0x30; spec-op27-effects.md §1). target
         // (arg0) is a literal f32-encoded var-id tag, NEVER var-resolved;
@@ -1486,7 +1720,8 @@ export class StageRuntime {
         } else {
           value = rawVal;
         }
-        this.varWrite(game, e, destId, value);
+        if (op === 43) setIntVar(destId, value);
+        else setFloatVar(destId, value);
         return null;
       }
       case 28: case 29: case 30: case 31: case 32: case 33:
@@ -1504,7 +1739,18 @@ export class StageRuntime {
         }
         return null;
       }
-      case 40: s.angle = gf(0); s.moveMode = 1; return null;
+      case 40: { // normalize one float variable in place
+        // Th07.exe (v1.00b) FUN_0040f6c0 case 0x27 @ all.c:7972:
+        // resolve the operand through FUN_0040df90, wrap it with
+        // FUN_0042fff0(value, 0) into [-pi, pi], then write the result back
+        // through FUN_0040e560. This is a numeric variable operation, not a
+        // movement-mode setter. Stage 6 Sub24 relies on the write-back before
+        // copying angles into Sub25's shoot offsets; omitting it shifts bullet
+        // origins by exactly 2*pi while leaving RNG totals unchanged.
+        const target = Math.trunc(v.f32(a));
+        setFloatVar(target, Math.fround(normalizeAngle(gf(0))));
+        return null;
+      }
       case 41: { // call sub — Th07.exe case 0x28 (all.c:10042-10065)
         if (!s.disableCallStack) {
           this.pushFrame(s);
@@ -1519,7 +1765,7 @@ export class StageRuntime {
           s.vars[22 + i] = this.globalsFloat[i];
         }
         this.enterSub(s, v.i32(a));
-        return 'flow';
+        return 'restart';
       }
       case 42: { // return — restores cursor + vars + interp slots (all.c:10019-10041)
         const ret = s.stack.pop();
@@ -1532,8 +1778,9 @@ export class StageRuntime {
           s.ctx = ret.ctx;
           s.vars.set(ret.vars);
           s.interpSlots = ret.interps;
+          s.periodicExportArmed = ret.periodicExportArmed;
         }
-        return 'flow';
+        return 'restart';
       }
       case 45: // Wait(nFrames): Th07.exe 0x40f8e9-0x40f94f, timer at +0x76c.
         // The normal index advance returns to runEcl's loop-top gate, so a
@@ -1552,10 +1799,55 @@ export class StageRuntime {
       case 48: s.angularVelocity = gf(0); s.moveMode = 1; return null;
       case 49: s.speed = gf(0); s.moveMode = 1; return null;
       case 50: s.acceleration = gf(0); s.moveMode = 1; return null;
-      case 52: { // random float in [min, max) into var
+      case 51: { // random float in [min, max) into var
+        // Th07.exe FUN_0040f6c0 dispatcher case 0x32 @ 0x4136b3-0x413792.
+        // FUN_0042ffc0 divides one u32 by 2^32, then the result is stored
+        // through the float-variable resolver (single-precision write).
         const min = gf(4);
         const max = gf(8);
-        setVar(Math.trunc(v.f32(a)), game.rng.range(max - min) + min);
+        const random = game.rng.u32() / 0x100000000;
+        setFloatVar(Math.trunc(v.f32(a)), Math.fround(random * (max - min) + min));
+        return null;
+      }
+      case 52: { // random movement heading, reflected away from the move bounds
+        // Th07.exe FUN_0040f6c0 dispatcher case 0x33 @ 0x413799-0x41394f.
+        // Despite thecl's `(dest, -pi, pi)` signature, the two range args are
+        // ignored. The exe first chooses a 90-degree horizontal cone pointing
+        // toward the player's side, then reflects it away from the op62 bounds.
+        // The positive-angle right-wall arm intentionally uses the PREVIOUS
+        // movement heading (+0x2b54), an original-game bug at 0x413886-0x413895.
+        const PI = 3.1415927410125732;
+        const NEG_PI = -3.1415927410125732;
+        const HALF_PI = 1.5707963705062866;
+        const NEG_HALF_PI = -1.5707963705062866;
+        const QUARTER_PI = 0.7853981852531433;
+        const THREE_QUARTER_PI = 2.356194496154785;
+        const TAU_F32 = 6.2831854820251465;
+        const random = game.rng.u32() / 0x100000000;
+        let angle: number;
+        if (e.x <= game.player.x) {
+          angle = Math.fround(random * HALF_PI - QUARTER_PI);
+        } else {
+          angle = Math.fround(random * HALF_PI + THREE_QUARTER_PI);
+          if (angle > PI) angle = Math.fround(angle - TAU_F32);
+        }
+
+        const lo = s.lowerMoveLimit;
+        const hi = s.upperMoveLimit;
+        if (e.x < lo.x + 96) {
+          if (angle > HALF_PI) angle = Math.fround(PI - angle);
+          else if (angle < NEG_HALF_PI) angle = Math.fround(NEG_PI - angle);
+        }
+        if (hi.x - 96 < e.x) {
+          if (angle >= 0 && angle < HALF_PI) {
+            angle = Math.fround(PI - s.angle); // exe bug: old heading, not `angle`
+          } else if (angle > NEG_HALF_PI && angle < 0) {
+            angle = Math.fround(NEG_PI - angle);
+          }
+        }
+        if (e.y < lo.y + 48 && angle < 0) angle = Math.fround(-angle);
+        if (hi.y - 48 < e.y && angle > 0) angle = Math.fround(-angle);
+        setFloatVar(Math.trunc(v.f32(a)), angle);
         return null;
       }
       case 54: { // timed move by angle/speed: (duration, mode, angle, speed)
@@ -1566,8 +1858,9 @@ export class StageRuntime {
         if (duration <= 0) {
           s.angle = angle;
           s.speed = speed;
-          s.acceleration = 0;
-          s.angularVelocity = 0;
+          // FUN_0040f6c0's op54 duration<=0 branch writes heading, speed,
+          // mode, and the duration counter only. Existing angular velocity
+          // and acceleration remain live (all.c:8212-8240).
           s.moveMode = 1;
           s.orbitDuration = duration;
           s.orbitLeft = duration;
@@ -1654,6 +1947,11 @@ export class StageRuntime {
       case 63: s.shouldClamp = false; return null;
       case 64: case 65: case 66: case 67: case 68:
       case 69: case 70: case 71: case 72: { // fire bullets, aim modes 0-8
+        // Th07.exe (v1.00b) FIRE cases 0x3f-0x47 gate the complete template
+        // decode and immediate fire on enemy HP > 0 (all.c:8440). A helper
+        // swept to zero earlier in the fixed-slot pass still executes ECL,
+        // but its same-tick FIRE is a no-op and does not resolve random args.
+        if (e.hp <= 0) return null;
         const props = this.readBulletProps(game, e, op - 64, a);
         s.bulletProps = props;
         if (!s.shootDisabled) this.spawnBullets(game, e, props);
@@ -1690,7 +1988,8 @@ export class StageRuntime {
       case 79: { // BULLET_EX: write one op-79 template slot (arg0 = slot index)
         // exe FUN_0040f6c0 case 0x4e: arg0 selects one of 5 per-enemy slots;
         // args map opcode=arg1, cond=arg2, arg3, arg4(maxTimes), f0=arg5,
-        // f1=arg6. Slots persist and all activate at FIRE via the cond gate.
+        // f1=arg6. Slots persist, are copied at FIRE, and then advance through
+        // FUN_004229f0's one-movement-slot-per-manager-tick queue.
         const slot = gi(0);
         if (slot >= 0 && slot < 5) {
           s.bulletExSlots[slot] = { opcode: gi(4), cond: gi(8), arg3: gi(12), arg4: gi(16), f0: gf(20), f1: gf(24) };
@@ -1837,6 +2136,11 @@ export class StageRuntime {
         return null;
       }
       case 93: { // spawn child enemy relative to parent: (sub, x, y, z, life, item, score)
+        // Th07.exe (v1.00b) ECL case 0x5c @ all.c:8973 gates the entire
+        // allocator (including operand resolution) on parent HP > 0. A
+        // helper swept to zero earlier in the fixed-slot pass may still run
+        // its current ECL instructions, but cannot spawn another generation.
+        if (e.hp <= 0) return null;
         // life/item/score are variable-resolved like every other arg (exe
         // case 0x5c, all.c:8972-9027: paramMask bits 0x10/0x20/0x40 route
         // through FUN_0040d750). Stage 5's wrapper->child relay passes the
@@ -1854,6 +2158,8 @@ export class StageRuntime {
         return null;
       }
       case 92: { // Th07.exe case 0x5b: op92 spawns at ABSOLUTE position (op93 = relative)
+        // Same HP gate as op93 (all.c:8919), before any var-resolved args.
+        if (e.hp <= 0) return null;
         // Same variable resolution as op93 (all.c:8918-8981) — dormant in
         // shipped data (no op92 passes var refs here) but exe-correct.
         this.spawnEclEnemy(game, {
@@ -1886,7 +2192,9 @@ export class StageRuntime {
           const script = v.i32(a + 4);
           s.anmSlots[slot] = {
             script,
-            runner: this.enemyAnm.hasScript(script) ? new AnmRunner(this.enemyAnm, script) : null
+            runner: this.enemyAnm.hasScript(script)
+              ? new AnmRunner(this.enemyAnm, script, { rng: this.anmRng })
+              : null
           };
         }
         return null;
@@ -1912,8 +2220,14 @@ export class StageRuntime {
         this.syncBossPresence(game);
         return null;
       }
-      case 100: // boss aura effect: (colorId, x, y, z, distance) — approximated
-        game.spawnEffectParticles(16, e.x + gf(4), e.y + gf(8), 1, 0xffffffff);
+      case 100:
+        // Th07.exe dispatcher case 99 @ 0x413043: this is the six-slot boss
+        // aura allocator, always particle type 13 at the enemy's own current
+        // position. Args 1..3 seed the aura VM and arg4 is its distance;
+        // those are visual state, not a position offset. All stage 1-6 data
+        // uses color index 6, whose live table value is 0xffffe0ff.
+        game.spawnEffectParticles(13, e.x, e.y, 1,
+          v.i32(a) === 6 ? 0xffffe0ff : 0xffffffff, undefined, e.id);
         return null;
       case 101: s.hitbox = { x: gf(0), y: gf(4), z: gf(8) }; return null;
       case 102: s.collisionEnabled = !!v.i32(a); return null;
@@ -1936,13 +2250,19 @@ export class StageRuntime {
       case 108: s.interrupts[v.i32(a + 4)] = v.i32(a); return null;
       case 109: s.pendingInterrupt = v.i32(a); return null;
       case 110: e.hp = e.maxHp = v.i32(a); return null;
-      case 111: s.bossTimer = v.i32(a); return null;
+      case 111:
+        s.bossTimer = v.i32(a);
+        s.bossTimerFrac = 0;
+        s.bossTimerPrevious = -999;
+        return null;
       case 112: s.lifeThresholds[0].threshold = v.i32(a); return null;
       case 113: s.lifeThresholds[0].sub = v.i32(a); return null;
       case 114:
         s.timerCallbackThreshold = v.i32(a);
         // Th07.exe case 0x71: arming a timer threshold also zeroes the timer.
         s.bossTimer = 0;
+        s.bossTimerFrac = 0;
+        s.bossTimerPrevious = -999;
         return null;
       case 115: s.timerCallbackSub = v.i32(a); return null;
       case 116: s.interactable = !!v.i32(a); return null;
@@ -1958,7 +2278,8 @@ export class StageRuntime {
       // op118's 3 floats (local_c[6..8]) are a velocity/direction SEED written
       // to the particle's +0x96/97/98 field (exe FUN_0041b560, all.c:12184),
       // NOT a spawn-position offset — position is the raw enemy xyz. Some effect
-      // types (id22) branch their RNG draw count on the seed's x sign.
+      // types (id22) branch their RNG draw count only for the <= -990
+      // random-angle sentinel (FUN_0041b020 @ 0x41b020), not by x sign.
       case 118: game.spawnEffectParticles(gi(0), e.x, e.y, gi(4), v.u32(a + 8) >>> 0, { x: gf(12), y: gf(16), z: gf(20) }); return null;
       case 119: this.dropPowerItems(game, e, Math.trunc(this.varRead(game, e, v.i32(a)))); return null;
       case 120: s.anmRotateWithAngle = !!v.i32(a); return null;
@@ -2007,6 +2328,8 @@ export class StageRuntime {
       case 133:
         s.timerCallbackSub = s.deathCallbackSub;
         s.bossTimer = 0;
+        s.bossTimerFrac = 0;
+        s.bossTimerPrevious = -999;
         return null;
       case 134:
         // CLEAR_LASER_HANDLES (exe case 0x85, all.c:9518): zeroes only this
@@ -2025,15 +2348,23 @@ export class StageRuntime {
       // Op 137 (exe case 0x88 -> `+0x2e2a` bit7 = arg&1): exempts this
       // enemy from updateEnemies()'s offscreen auto-cull (exe-misc-ecl-ops.md §4).
       case 137: s.offscreenCullExempt = !!(v.i32(a) & 1); return null;
-      // Op 138 (exe case 0x89, thtk format SSSS): NOT laser-related --
-      // writes enemy-local homing/tracking-shot parameter fields
-      // (+0x4f30/32/34/36), a separate RE topic ("homing funcs[1]").
+      // Op 138 (exe case 0x89, thtk format SSSS): position-trail config.
+      // Th07.exe @ all.c:9535-9562 writes arg0 raw to +0x4f30 and resolves
+      // args1-3 through the int resolver into +0x4f32/34/36. FUN_0041ed50
+      // shifts `count` history entries every enemy-manager tick and uses the
+      // oldest one in its off-screen cull contract (0x41f363-0x41f45f).
+      case 138:
+        s.trailFlags = v.i32(a) & 0xff;
+        s.trailCount = clamp(gi(4), 0, 96);
+        s.trailStart = gi(8);
+        s.trailStride = gi(12);
+        return null;
       // Op 139 (exe case 0x8a, thtk format SSSC): writes a GLOBAL per-ID
       // effect/behavior parameter table (DAT_00495c24/c04/c44) -- not
-      // per-enemy, not per-laser. Both stubbed pending their own RE pass;
+      // per-enemy, not per-laser. Still stubbed pending its own RE pass;
       // stage 1 never calls the real laser ops (82-89/134)
       // (exe-enemy-lasers.md §0).
-      case 138: case 139:
+      case 139:
         game.configureAmbience?.(op, [v.i32(a), v.i32(a + 4), v.i32(a + 8), v.i32(a + 12)]);
         return null;
       // Op 140 (exe case 0x8b, thtk format ffff): genuine ambience config --
@@ -2063,24 +2394,32 @@ export class StageRuntime {
       // invented behavior, not a transcription.
       // op 142: N-frame damage shield (exe case 0x8d writes enemy+0x4f40;
       // gate at FUN_0041ed50 all.c:14245: boss dmg/9, non-boss dmg=0).
-      case 142: s.damageShield = v.i32(a); return null;
+      case 142:
+        s.damageShield = v.i32(a);
+        // Exe case 0x8d @ all.c:9628-9638 also clears +0x4f3c and seeds
+        // the unused previous-value word +0x4f38 to -999.
+        s.damageShieldFrac = 0;
+        return null;
       case 143: { // CancelBulletsInRadius (exe case 0x8e = FUN_00423360):
         // deletes bullets within radius of the enemy, each spawning a
         // small cherry item (FUN_00430970 type 6, mode 1).
         const radius = gf(0);
         const bullets = game.enemyBullets;
-        let w = 0;
+        const survivors: EnemyBullet[] = [];
         for (const b of bullets) {
           if (b.dead) continue;
           const dx = b.x - e.x;
           const dy = b.y - e.y;
           if (dx * dx + dy * dy <= radius * radius) {
             game.spawnItem('cherry', b.x, b.y, { state: 1 });
+            if (game.removeEnemyBullet) game.removeEnemyBullet(b);
+            else b.dead = true;
           } else {
-            bullets[w++] = b;
+            survivors.push(b);
           }
         }
-        bullets.length = w;
+        bullets.length = 0;
+        bullets.push(...survivors);
         return null;
       }
       case 144: { // ArmPeriodicSub(period, subId) (exe case 0x8f): every
@@ -2091,8 +2430,12 @@ export class StageRuntime {
           period: Math.max(1, period),
           subId,
           elapsed: 0,
-          // The persistent stash starts zeroed with the enemy struct.
-          savedVars: new Float64Array(26)
+          // Th07.exe (v1.00b) FUN_0040f6c0 case 0x8f @ all.c:9668-9676:
+          // arming op144 copies the CURRENT 26-dword local/parameter block
+          // from enemy+0x6fc into the persistent enemy+0x2ee8 stash. Starting
+          // from zero loses caller-seeded angles (Stage 6 Sub43 -> Sub44) and
+          // turns the whole periodic pattern into a different trajectory.
+          savedVars: s.vars.slice()
         };
         return null;
       }
@@ -2105,7 +2448,8 @@ export class StageRuntime {
       }
       case 146: // CancelAllBullets (exe case 0x91 = FUN_00422ea0(0)):
         // plain state-5 fade, NO items; non-immune lasers reset too.
-        game.enemyBullets.length = 0;
+        if (game.clearEnemyBullets) game.clearEnemyBullets();
+        else game.enemyBullets.length = 0;
         game.cancelLasers?.(false);
         return null;
       case 148: { // Th07.exe FUN_0040f6c0 case 0x93: HP-threshold callback slot
@@ -2123,12 +2467,17 @@ export class StageRuntime {
         // embedded ANM VM (+8), radians (spec-effects-misc.md §16).
         s.anmRotZ = gf(0);
         return null;
-      case 151: { // PolarToXY (exe case 0x96): arg1-var = cos(angle)*mag,
-        // arg0-var = sin(angle)*mag (angle arg2, magnitude arg3).
+      case 151: { // PolarToXY (exe case 0x96): arg0 = cos, arg1 = sin.
+        // Th07.exe (v1.00b) @ 0x4156d9-0x4157b3: FUN_00481500 is fsin
+        // and writes through instr+0x10 (the second destination); then
+        // FUN_004815b0 is fcos and writes through instr+0x0c (the first).
+        // Reversing these coordinates rotates every authored offset across
+        // y=x; Stage 6 Sub30's slot 715 was displaced from birth by
+        // (+22.78,-22.78), enough to miss the native graze 135 ticks later.
         const angle = gf(8);
         const mag = gf(12);
-        this.varWrite(game, e, Math.trunc(v.f32(a + 4)), Math.cos(angle) * mag);
-        this.varWrite(game, e, Math.trunc(v.f32(a)), Math.sin(angle) * mag);
+        this.varWrite(game, e, Math.trunc(v.f32(a + 4)), Math.sin(angle) * mag);
+        this.varWrite(game, e, Math.trunc(v.f32(a)), Math.cos(angle) * mag);
         return null;
       }
       case 153: // secondary shot-collision extent triple (exe +0x2b48/4c/50)
@@ -2306,6 +2655,13 @@ export class StageRuntime {
     origin: { x: number; y: number } | null = null,
     occupiedPoolSlots: Uint8Array | null = null
   ): void {
+    // FUN_00423480 @ 0x42348b gates the WHOLE volley on DAT_0099fa60,
+    // which is the previous FUN_004241c0 manager-entry census. It is not the
+    // current number of occupied slots: bullets culled later in that manager
+    // pass leave holes, but enemy FIRE in the next priority-10 pass still
+    // refuses the volley when the latched count was 1024. The allocator below
+    // independently enforces the physical fixed-pool limit for other cases.
+    if ((game.enemyBulletManagerEntryCount ?? 0) >= ENEMY_BULLET_CAP) return;
     const shootX = origin?.x ?? e.x + e.ecl.shootOffset.x;
     const shootY = origin?.y ?? e.y + e.ecl.shootOffset.y;
     // Test-only observability (PLAN.md Phase 0 / LIFE-001): last frame this
@@ -2342,22 +2698,36 @@ export class StageRuntime {
         const spd = p.aimMode === 7 || p.aimMode === 8 ? game.rng.range(p.speed1 - p.speed2) + p.speed2 : speed;
         if (!rect) rect = this.bulletRect(p.sprite, p.offset);
         const flags = p.flags | 0;
-        // Spawn-in effect: bullets ease in at reduced speed while flashing.
-        const spawnDuration = flags & 2 ? 8 : flags & 4 ? 11 : flags & 8 ? 14 : 0;
+        // Flags select authored etama spawn states 2/3/4. State lifetime is
+        // the copied template ANM's lifetime, not a property of the flag
+        // alone. Th07.exe's int[11][5] table @ 0x48b160 maps templates 0-6
+        // to entry-0 scripts 18/21 (10 ticks), 19/22 (16), 20/23 (32);
+        // templates 7-9 map ALL three spawn states to script 24 (32); and
+        // template 10 maps all three to entry-1 script 2 (24). Direct native
+        // Stage-6 slot 767 confirms template 7 + state 3 remains in spawn for
+        // 32 ticks: treating it as the generic 16-tick state moves it 9.6
+        // velocity vectors too far and creates a false graze at PRE4947.
+        // Th07.exe
+        // FUN_00421e90 @ 0x4226ec-0x42279c also backs the initial position
+        // up by four velocity vectors before the reduced-speed intro begins.
+        const hasSpawnState = (flags & 0xe) !== 0;
+        const spawnDuration = !hasSpawnState ? 0
+          : p.sprite === 10 ? 24
+            : p.sprite >= 7 ? 32
+              : flags & 2 ? 10 : flags & 4 ? 16 : 32;
         const spawnMoveScale = flags & 2 ? 1 / 2 : flags & 4 ? 1 / 2.5 : flags & 8 ? 1 / 3 : 1;
-        const ex = resolveExBehaviors(p.exSlots, flags, angle, spd);
         // Spawn-time rate bake-in (exe FUN_00421e90/FUN_004229f0:
         // FUN_004074e0(angle, speed * DAT_0056baa8); spec-slowmo.md §3.4) —
         // the nominal speed field stays unscaled.
-        game.enemyBullets.push({
+        const bullet: EnemyBullet = {
           id: game.id++,
           poolSlot,
           ownerId: e.id,
           ownerSub: e.ecl.subId,
           spawnFrame: game.frame,
           effectState: 0,
-          x: shootX,
-          y: shootY,
+          x: shootX - (spawnDuration ? Math.cos(angle) * spd * (game.slowRate ?? 1) * 4 : 0),
+          y: shootY - (spawnDuration ? Math.sin(angle) * spd * (game.slowRate ?? 1) * 4 : 0),
           vx: Math.cos(angle) * spd * (game.slowRate ?? 1),
           vy: Math.sin(angle) * spd * (game.slowRate ?? 1),
           speed: spd,
@@ -2370,16 +2740,39 @@ export class StageRuntime {
           grazeW: BULLET_HITBOX_BY_SPRITE[p.sprite] ?? Math.max(3, rect.w * 0.4),
           grazeH: BULLET_HITBOX_BY_SPRITE[p.sprite] ?? Math.max(3, rect.h * 0.4),
           grazed: false,
+          spawnAge: 0,
           spawnDuration,
           spawnMoveScale,
-          exFlags: ex.exFlags,
-          exAccel: ex.exAccel,
-          exAngle: ex.exAngle,
-          exDir: ex.exDir,
-          exBounce: ex.exBounce,
-          graceFrames: ex.graceFrames,
+          exFlags: 0,
+          exSlots: p.exSlots.map((slot) => slot ? { ...slot } : null),
+          exFireFlags: flags,
+          exBehaviorIndex: 0,
+          exRampElapsed: 0,
+          exRampFrac: 0,
+          exAccel: null,
+          exAccelElapsed: 0,
+          exAccelFrac: 0,
+          exAngle: null,
+          exAngleElapsed: 0,
+          exAngleFrac: 0,
+          exDir: null,
+          exDirElapsed: 0,
+          exDirFrac: 0,
+          exBounce: null,
+          dirTimes: 0,
+          exBounceTimes: 0,
+          graceFrames: 0,
           offscreenFrames: 0
-        });
+        };
+        // FUN_00421e90 calls FUN_004229f0 once after copying the queue into
+        // the allocated fixed slot. Spawn-state bullets wait until their ANM
+        // transition before the bullet manager promotes another slot.
+        advanceBulletExBehavior(bullet);
+        if (game.addEnemyBullet) {
+          if (!game.addEnemyBullet(bullet)) return;
+        } else {
+          game.enemyBullets.push(bullet);
+        }
       }
     }
     // Th07.exe FUN_00423480 @ 0x423530-0x423553: template bit 0x200 is
@@ -2388,32 +2781,42 @@ export class StageRuntime {
     if (p.flags & 0x200) game.playSfx(p.sfx);
   }
 
-  // Clears trash mobs; each cleared enemy still runs its death callback (so
-  // item-drop subs execute), matching the original.
-  private clearNonBossEnemy(game: GameHost, enemy: Enemy, sweepItems: boolean): void {
+  // Mark a trash mob for the normal manager death path. FUN_004217c0 runs
+  // inside one enemy slot's ECL dispatch, so later slots still execute their
+  // core once before FUN_0041ed50 observes hp <= 0 and enters the callback.
+  // Eagerly entering the callback here skipped those later-slot instructions
+  // (Stage 1 PRE8061 lost three op9 draws after Letty's op91 sweep).
+  private clearNonBossEnemy(
+    game: GameHost,
+    enemy: Enemy,
+    sweepItems: boolean
+  ): Array<{ x: number; y: number; z: number }> {
     enemy.hp = 0;
     const s = enemy.ecl;
-    if (sweepItems && s.sweepItemFlag) game.spawnItem('cherry', enemy.x, enemy.y, { state: 1 });
-    // The exe's FUN_004217c0 only sets HP=0 (all.c:14883); the actual removal
-    // is each enemy's OWN death switch, gated on the interactable bit
-    // (all.c:14303, 0x2e29 & 1). So a NON-interactable enemy — an invisible
-    // controller/ambient emitter like stage-1's Sub1 id-20 snow generator
-    // (op116(0)+op132+op137) — survives the sweep and keeps running its
-    // script. Removing it here (enemy.dead / death callback) killed the ambient
-    // particle stream the moment Letty's first spell swept the field (~frame
-    // 3857), starving the shared RNG stream of ~6600 frames of draws. Spare it
-    // exactly as the exe does; the normal hp<=0 path (killEnemy's interactable
-    // guard) leaves it live.
-    if (!s.interactable) return;
-    if (s.deathCallbackSub >= 0) {
-      const sub = s.deathCallbackSub;
-      s.deathCallbackSub = -1;
-      s.stack.length = 0;
-      s.periodicExportArmed = false;
-      this.enterSub(s, sub);
-    } else {
-      enemy.dead = true;
+    const drops: Array<{ x: number; y: number; z: number }> = [];
+    if (sweepItems && s.sweepItemFlag) {
+      drops.push({ x: enemy.x, y: enemy.y, z: enemy.z });
+      // Th07.exe (v1.00b) FUN_004217c0 @ 0x421863-0x42196d walks an
+      // op138 actor's stored trail at indices 0,6,12,... < trailCount and
+      // creates another type-6/mode-1 item at every sampled position. The
+      // popup/score ramp advances once per trail item too. Stage 1's three
+      // Sub41 helpers each contribute six such samples at the pre-dialogue
+      // sweep; omitting them left the run 18 Cherry items short and delayed
+      // the final Border by about 545 frames despite an exact RNG stream.
+      if (s.trailFlags !== 0) {
+        const limit = Math.min(96, s.trailCount, s.trailHistory.length);
+        for (let i = 0; i < limit; i += 6) {
+          const point = s.trailHistory[i];
+          drops.push({ x: point.x, y: point.y, z: point.z });
+        }
+      }
+      for (const drop of drops) game.spawnItem('cherry', drop.x, drop.y, { state: 1 });
     }
+    // Th07.exe (v1.00b) FUN_004217c0 @ 0x4217c0, all.c:14883 writes only
+    // enemy+0x2bb8 (HP). The manager death switch at all.c:14303 performs
+    // callback entry/removal later. Non-interactable ambient controllers are
+    // therefore left at hp=0 and remain live, as killEnemy's gate requires.
+    return drops;
   }
 
   // Th07.exe FUN_004217c0 (op94's handler, also called at op91/spell-end
@@ -2432,12 +2835,11 @@ export class StageRuntime {
     let value = 2000;
     for (const enemy of game.enemies) {
       if (enemy === owner || enemy.ecl.isBoss) continue;
-      const drops = sweepItems && enemy.ecl.sweepItemFlag;
-      this.clearNonBossEnemy(game, enemy, sweepItems);
-      if (drops) {
+      const drops = this.clearNonBossEnemy(game, enemy, sweepItems);
+      for (const drop of drops) {
         // FUN_004217c0: escalating popup per swept drop — white while
         // ramping, yellow at the cap (spec-popups.md §4.2).
-        game.spawnScorePopup?.(value, enemy.x, enemy.y, value < 8000 ? 0xffffffff : 0xffffff00);
+        game.spawnScorePopup?.(value, drop.x, drop.y, value < 8000 ? 0xffffffff : 0xffffff00);
         total += value;
         value = Math.min(8000, value + 30);
       }
@@ -2484,6 +2886,7 @@ export class StageRuntime {
   releaseEnemy(game: GameHost, e: Enemy): void {
     const s = e.ecl;
     this.logLifecycle(game, 'release', e);
+    game.releaseEnemyEffects?.(e.id);
     if (s.bossSlot != null && this.bossSlots[s.bossSlot] === e) {
       this.bossSlots[s.bossSlot] = null;
     }
@@ -2525,19 +2928,23 @@ export class StageRuntime {
       s.canTakeDamage = false;
       s.deathMode = 0;
     } else {
-      // Modes 0-2 run the normal item/sweep path. Mode 3 intentionally skips
-      // it and only plays the death presentation before its callback.
-      for (const drop of this.dropTypes(s.itemDrop)) game.spawnItem(drop, e.x, e.y);
+      // FUN_0041ed50's preburst and item constructor are interleaved before
+      // the boss field sweep and before the common death effects. This order
+      // is load-bearing because every effect veto shares the gameplay RNG.
+      this.spawnDeathDropAndPreburst(game, e);
       if (s.isBoss) {
         if (!this.spellActive) {
           let total = game.sweepBulletsToItems();
           total = this.killNonBossEnemies(game, e, total);
           if (total > 0) game.addScore(Math.trunc(total / 10));
-        } else {
-          // Spells normally end via op91. Keep malformed/direct deaths from
-          // leaking their field into the next phase.
-          game.enemyBullets.length = 0;
         }
+        // During an active spell the death switch deliberately leaves the
+        // bullet field alone. Mode-1 bosses retain their slot and enter the
+        // authored death-callback sub; its op91 runs on the following enemy
+        // tick and performs FUN_00423100's scored bullets-to-items sweep.
+        // Clearing here one frame early discarded the entire field before
+        // op91 could convert it (Th07.exe v1.00b all.c:14318-14398, then
+        // FUN_0040f340 @ 0x40f340).
       }
     }
     // Op 105 is an immediate PlaySE. A callback's own op105 plays separately
@@ -2545,7 +2952,14 @@ export class StageRuntime {
     // Exe death SE (disasm @ 0x420379): slot 2 + (counter & 1) — plain
     // kills alternate se_enep00's two volume slots (-1200/-1500 mB).
     game.playSfx(2 + (e.id & 1));
-    game.spawnEnemyDeathEffect?.(e);
+    if (mode === 3 && s.deathAnm1 >= 0) {
+      game.spawnEffectParticles(s.deathAnm1, e.x, e.y, 3, 0xffffffff);
+    }
+    if (s.deathAnm1 >= 0) {
+      game.spawnEffectParticles(s.deathAnm1, e.x, e.y, 1, 0xffffffff);
+      game.spawnEffectParticles(s.deathAnm2 + 4, e.x, e.y, 4, 0xffffffff);
+    }
+    game.spawnEnemyDeathEffect?.(e, mode);
 
     const callback = s.deathCallbackSub;
     s.deathCallbackSub = -1;
@@ -2557,6 +2971,18 @@ export class StageRuntime {
     // (2026-07-11): the dispatch IS reached, the sub does NOT run.
     if (mode === 0) return false;
     if (callback >= 0) {
+      // FUN_0041ed50 death-callback entry, Th07.exe v1.00b
+      // @ 0x4203de-0x420411 (all.c:14373-14379): every retained callback
+      // actor receives the same rank-template reset as a boss phase entry
+      // before its callback ECL runs. This also applies to ordinary mode-1
+      // enemies; Stage-4 Sub17's death callback immediately fires bullets
+      // whose native rank-32 speed is raw+0.5, not the fresh-enemy +0.15.
+      s.bulletRankSpeedLow = -0.5;
+      s.bulletRankSpeedHigh = 0.5;
+      s.bulletRankAmount1Low = 0;
+      s.bulletRankAmount1High = 0;
+      s.bulletRankAmount2Low = 0;
+      s.bulletRankAmount2High = 0;
       s.stack.length = 0;
       s.periodicExportArmed = false;
       this.enterSub(s, callback);
@@ -2576,15 +3002,21 @@ export class StageRuntime {
     }
   }
 
-  private dropTypes(itemDrop: number): ItemType[] {
+  private spawnDeathDropAndPreburst(game: GameHost, e: Enemy): void {
+    const itemDrop = e.ecl.itemDrop;
     if (itemDrop === -1 || itemDrop === 0xffff) {
-      const out: ItemType[] = [];
-      if (this.randomSpawnIndex++ % 3 === 0) out.push(RANDOM_ITEMS[this.randomItemIndex++ % RANDOM_ITEMS.length]);
-      return out;
+      if (this.randomSpawnIndex % 3 === 0) {
+        game.spawnEffectParticles(e.ecl.deathAnm2 + 4, e.x, e.y, 6, 0xffffffff);
+        const type = RANDOM_ITEMS[this.randomItemIndex++ % RANDOM_ITEMS.length];
+        game.spawnItem(type, e.x, e.y);
+      }
+      this.randomSpawnIndex++;
+      return;
     }
-    if (itemDrop === -2 || itemDrop === 0xfffe) return [];
+    if (itemDrop === -2 || itemDrop === 0xfffe) return;
+    game.spawnEffectParticles(e.ecl.deathAnm2 + 4, e.x, e.y, 3, 0xffffffff);
     const type = ITEM_TABLE[itemDrop];
-    return type ? [type] : [];
+    if (type) game.spawnItem(type, e.x, e.y);
   }
 
 }

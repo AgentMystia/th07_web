@@ -5,9 +5,11 @@ import { RPY_BITS } from '../formats/rpy';
 // consume. The recorded word is the exe's per-frame DirectInput mask, so the
 // mapping mirrors KEY_MAP's physical-key overlaps (Z = shoot+confirm,
 // X = bomb+back) — feeding a replay must be indistinguishable from a human
-// pressing those keys. Pressed edges are the rising edges of each bit,
-// matching both the exe (prev-word compare in FUN_0043fe30's consumers) and
-// Input's keydown edge tracking.
+// pressing those gameplay keys. Escape is deliberately absent: native pause
+// reads the live mask DAT_004afe2c while replay words are injected into
+// DAT_004afe30, so a recorded 0x8 must never open the playback pause menu.
+// Pressed edges are the rising edges of each mapped bit, matching both the
+// exe (prev-word compare in FUN_0043fe30's consumers) and Input's tracking.
 const BIT_BUTTONS: Array<[number, Button[]]> = [
   [RPY_BITS.shoot, ['shoot', 'confirm']],
   [RPY_BITS.bomb, ['bomb', 'back']],

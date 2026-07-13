@@ -64,7 +64,10 @@ export interface ShtShot {
 }
 
 export interface ShtLevel {
-  power: number; // inclusive upper power bound for this table
+  // Strict upper power bound for this table. Th07.exe FUN_0043a100
+  // @ 0x43a140-0x43a15f selects only when livePower < threshold, so an
+  // exact threshold value advances to the following table (128 -> 999).
+  power: number;
   shots: ShtShot[];
 }
 
@@ -131,7 +134,7 @@ export class Sht {
   // The shooter table active at a given power (0-128).
   shotsForPower(power: number): ShtShot[] {
     for (const level of this.levels) {
-      if (power <= level.power) return level.shots;
+      if (power < level.power) return level.shots;
     }
     return this.levels.length ? this.levels[this.levels.length - 1].shots : [];
   }

@@ -45,3 +45,11 @@ test('SakuyaB: option shooters carry the unknown func 5', () => {
   assert.ok(options.length > 0);
   for (const s of options) assert.equal(s.funcs[0], 5);
 });
+
+test('power thresholds are strict: exact values select the following table', () => {
+  const sht = load('ply02a');
+  assert.equal(sht.shotsForPower(7), sht.levels[0].shots);
+  assert.equal(sht.shotsForPower(8), sht.levels[1].shots, '8 advances to the 16 threshold table');
+  assert.equal(sht.shotsForPower(127), sht.levels[7].shots);
+  assert.equal(sht.shotsForPower(128), sht.levels[8].shots, '128 advances to the 999 threshold table');
+});

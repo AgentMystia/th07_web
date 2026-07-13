@@ -40,26 +40,41 @@ export interface EnemyBullet {
   grazeW: number;
   grazeH: number;
   grazed: boolean;
+  // Clock of the authored flags-selected spawn ANM state (native bullet
+  // states 2/3/4). The normal-state `age` counter is reset to zero when
+  // this reaches spawnDuration, exactly as FUN_004241c0 does.
+  spawnAge?: number;
   spawnDuration: number;
   spawnMoveScale: number;
-  // Activated ex-behavior flags (exe bullet+0xbf4), built at spawn from the
-  // op-79 slots whose opcode bit is in the fire flags AND which pass the
-  // cond gate (FUN_004229f0). Behaviors clear their own bit when they finish.
+  // Activated ex-behavior flags (exe bullet+0xbf4). FUN_004229f0 promotes
+  // at most one movement slot per normal-state manager tick; construction
+  // performs the first promotion and retains the remaining per-bullet queue.
   exFlags: number;
-  // Per-behavior params resolved once at spawn from the matching op-79 slot.
-  // null => that behavior did not activate (bit absent from exFlags). Each
-  // maps to the exe's dedicated per-behavior parameter block.
+  // Snapshot of the firing enemy's five op-79 slots, the FIRE flags tested
+  // against them, and the next queue index (exe +0xc14/+0xbf6/+0xc10).
+  exSlots: (BulletExSlot | null)[];
+  exFireFlags: number;
+  exBehaviorIndex: number;
+  // Per-behavior params resolved when the matching queue slot is promoted.
+  // Each behavior owns the split clock/counter used by its native routine.
+  exRampElapsed: number;
+  exRampFrac: number;
   exAccel: { mag: number; angle: number; limit: number } | null; // 0x10
+  exAccelElapsed: number;
+  exAccelFrac: number;
   exAngle: { speedDelta: number; angleDelta: number; limit: number } | null; // 0x20
   // Dedicated elapsed counter for the 0x20 angle-change behavior (exe
   // bullet+0xcec int / +0xce8 frac, reset to 0 when the behavior is
   // promoted — FUN_004229f0 @ all.c:15499-15510). Bullet-effect id 1
   // installs 0x20 MID-LIFE, so elapsed cannot be derived from bullet age.
-  exAngleElapsed?: number;
-  exAngleFrac?: number;
+  exAngleElapsed: number;
+  exAngleFrac: number;
   exDir: { angle: number; newSpeed: number; interval: number; maxTimes: number } | null; // 0x40/0x80/0x100
+  exDirElapsed: number;
+  exDirFrac: number;
   exBounce: { speed: number; maxTimes: number } | null; // 0x400/0x800
-  dirTimes?: number;
+  dirTimes: number;
+  exBounceTimes: number;
   dead?: boolean;
 }
 
@@ -135,6 +150,8 @@ export interface ItemEntity {
 
 export interface EffectParticle {
   id: number;
+  poolSlot: number;
+  effectId: number;
   x: number;
   y: number;
   vx: number;
@@ -144,6 +161,14 @@ export interface EffectParticle {
   color: number;
   size: number;
   kind: 'spark' | 'snow' | 'burst';
+  ownerEnemyId?: number;
+  releaseFrames?: number;
+  world?: {
+    x: number; y: number; z: number;
+    vx: number; vy: number; vz: number;
+    ax: number; ay: number; az: number;
+    angle: number; angularVelocity: number;
+  };
 }
 
 // Interface the ECL VM uses to talk to the game — mirrors the TH06 Web seam
@@ -160,6 +185,13 @@ export interface GameHost {
   player: { x: number; y: number };
   enemies: Enemy[];
   enemyBullets: EnemyBullet[];
+  // Th07.exe DAT_0099fa60 / bullet manager +0x37a128. FUN_004241c0
+  // recounts live fixed slots at manager entry, before it updates or culls
+  // them; enemy FIRE runs earlier in the next scheduler pass and therefore
+  // reads the previous manager-entry snapshot rather than the current pool.
+  // Lightweight VM-test hosts may omit it; the allocator still enforces the
+  // physical 1024-slot limit.
+  enemyBulletManagerEntryCount?: number;
   enemyLasers: EnemyLaser[];
   items: ItemEntity[];
   power: number;
@@ -182,10 +214,13 @@ export interface GameHost {
     y: number,
     count: number,
     color: number,
-    seed?: { x: number; y: number; z: number }
+    seed?: { x: number; y: number; z: number },
+    ownerEnemyId?: number
   ): void;
+  releaseEnemyEffects?(ownerEnemyId: number): void;
   playSfx(id: number): void;
   startDialogue?(index: number): void;
+  isDialogueActive?(): boolean;
   isDialogueBlocking?(): boolean;
   consumeDialogueResume?(): boolean;
   startBossSpell?(spellId: number, arg0: number, name: string): void;
@@ -199,7 +234,7 @@ export interface GameHost {
   setBossLifeCount?(count: number): void;
   dropPointItems?(e: Enemy, count: number): void;
   awardSpellValue?(value: number): void;
-  spawnEnemyDeathEffect?(e: Enemy): void;
+  spawnEnemyDeathEffect?(e: Enemy, deathMode?: number): void;
   // FUN_00422ea0(1): every live enemy bullet, plus samples along each
   // non-immune live laser, becomes an auto-collecting small cherry item
   // (type 6 — the constructor-set cancel type at +0x37a160,
@@ -238,6 +273,13 @@ export interface GameHost {
   // floor10(cherry*0.25) penalty) — applies to nonspell timeouts too.
   onBossPhaseTimeout?(): void;
   unpauseStd(label: number): void;
+  // Native fixed-pool registration hooks. StageScene implements these with
+  // slot-faithful storage; lightweight unit-test hosts may omit them and use
+  // the dense-array fallback in StageRuntime.
+  addEnemy?(enemy: Enemy): boolean;
+  addEnemyBullet?(bullet: EnemyBullet): boolean;
+  removeEnemyBullet?(bullet: EnemyBullet): void;
+  clearEnemyBullets?(): void;
 }
 
 export interface EclContext {
@@ -274,6 +316,10 @@ export interface EclFrame {
   ctx: EclContext;
   vars: Float64Array;
   interps: (EclInterpSlot | null)[];
+  // enemy+0x8f4 lies inside the saved 0x218-byte frame. A nested CALL from
+  // an op144 body therefore restores the armed export flag for the outer
+  // RETURN after the inner RETURN has temporarily cleared it.
+  periodicExportArmed: boolean;
 }
 
 export interface EclState {
@@ -380,6 +426,9 @@ export interface EclState {
   timerCallbackThreshold: number;
   timerCallbackSub: number;
   bossTimer: number;
+  // Enemy+0x2bc4: the manager-pass snapshot taken immediately before the
+  // split timer advances. Body-graze cadence compares it with bossTimer.
+  bossTimerPrevious?: number;
   // Fractional accumulator for bossTimer under global slow motion.
   bossTimerFrac?: number;
   currentAnm: number;
@@ -394,8 +443,15 @@ export interface EclState {
   deathAnm1: number;
   deathAnm2: number;
   deathAnm3: number;
+  // FUN_0041d050's previous-position latch (+0x2b24..+0x2b2c). It is
+  // template-zeroed and updated immediately before each manager integration.
+  integratorPreviousPosition: { x: number; y: number; z: number };
+  // Previous manager-pass displacement (+0x2b30..+0x2b38), exposed as ECL
+  // vars 10063..10065. These are distinct from the current controller
+  // velocity (+0x2b18..+0x2b20) used by pose selection and heading.
   frameVx: number;
   frameVy: number;
+  frameVz: number;
   anmRotateWithAngle: boolean;
   // ECL op150 (exe case 0x95): absolute Z rotation written into the enemy's
   // embedded ANM VM (+8), consumed by the sprite draw (radians).
@@ -433,6 +489,16 @@ export interface EclState {
   // enemy from the off-screen auto-cull (exe-misc-ecl-ops.md §4). Default
   // false -- ordinary enemies get culled once seen-then-offscreen.
   offscreenCullExempt: boolean;
+  // Op 138 (exe case 0x89 @ 0x413..): enemy position-trail contract at
+  // +0x4f30/+0x4f32/+0x4f34/+0x4f36. The native object owns 96 history
+  // entries; authored Stage 1-8 data requests at most 64. Besides drawing
+  // the trail, FUN_0041ed50 keeps a seen enemy alive until BOTH its current
+  // sprite rect and the oldest configured history point are off-screen.
+  trailFlags: number;
+  trailCount: number;
+  trailStart: number;
+  trailStride: number;
+  trailHistory: { x: number; y: number; z: number }[];
   // Op 142 (exe case 0x8d @ 0x413.. -> `+0x4f40/+0x4f3c/+0x4f38`): PROBABLE
   // op 142 damage shield, frames remaining (exe enemy+0x4f40, case 0x8d):
   // while > 0, settled damage is /9 for bosses and 0 for non-bosses
@@ -442,6 +508,9 @@ export interface EclState {
   // Every stage-1 spell card arms it at declare (Cirno 60f, Ringing Cold
   // 300f, finals 360/240/240f).
   damageShield: number;
+  // Fractional half of the op142 countdown's native split timer
+  // (enemy+0x4f3c; current integer is +0x4f40).
+  damageShieldFrac: number;
 }
 
 export interface BulletProps {
@@ -461,6 +530,9 @@ export interface BulletProps {
 
 export interface Enemy {
   id: number;
+  // Stable slot in Th07.exe's 480-entry enemy pool. Allocation always scans
+  // from slot 0; the manager updates slots 0..479 in order.
+  poolSlot: number;
   x: number;
   y: number;
   z: number;

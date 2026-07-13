@@ -151,9 +151,11 @@ test('auto-shoot uses the template flags modified by op81', () => {
   const host = makeHost();
   const enemy = runtime.spawnEclEnemy(host, { subId: 0, x: 100, y: 100 });
 
-  runtime.updateEnemy(host, enemy); // template bit set: fires SE 5
+  // The synchronous allocator core already performs the interval-1
+  // auto-shoot after op81, then the first manager core fires it once more.
+  runtime.updateEnemy(host, enemy); // template bit still set: fires SE 5 again
   runtime.updateEnemy(host, enemy); // op81(-1) clears it before this tick
 
-  assert.deepEqual(host.sfx, [5]);
-  assert.deepEqual(host.enemyBullets.map((bullet) => bullet.flags), [0, 0x200, 0]);
+  assert.deepEqual(host.sfx, [5, 5]);
+  assert.deepEqual(host.enemyBullets.map((bullet) => bullet.flags), [0, 0x200, 0x200, 0]);
 });

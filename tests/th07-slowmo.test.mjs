@@ -169,3 +169,19 @@ test('the ECL clock advances fractionally under the rate', () => {
   runtime.updateEnemy(host, e);
   assert.equal(e.ecl.ctx.time - t0, 2);
 });
+
+test('op142 damage shield countdown retreats on the global split clock', () => {
+  const sub = [instruction(0, 142, [i32(3)]), instruction(999, 0, [])];
+  const stage = { ...TH07_DATA.stages[1], ecl: makeEcl([sub]) };
+  const runtime = new StageRuntime(stage, { etama, enemy: noAnm, effect: noAnm });
+  const host = makeHost();
+  host.slowRate = 1 / 3;
+  const e = runtime.spawnEclEnemy(host, { subId: 0, x: 0, y: 0, life: 1, item: -1, score: 0 });
+
+  assert.deepEqual([e.ecl.damageShield, e.ecl.damageShieldFrac], [3, 0]);
+  runtime.tickEnemyManagerTail(host, e);
+  runtime.tickEnemyManagerTail(host, e);
+  assert.equal(e.ecl.damageShield, 3, 'two wall frames do not consume an integer shield tick');
+  runtime.tickEnemyManagerTail(host, e);
+  assert.equal(e.ecl.damageShield, 2, 'third wall frame consumes one tick at rate 1/3');
+});

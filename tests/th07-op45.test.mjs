@@ -131,13 +131,16 @@ test('op144 periodic gosub runs during a parent wait and restores its wait conte
       instruction(0, 4, [i32(10001), i32(77)])
     ],
     [
-      instruction(0, 17, [i32(10005)]),
+      instruction(0, 19, [f32(10005), f32(10005), f32(1)]),
       instruction(0, 42)
     ]
   ]);
   const game = makeHost();
   const enemy = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
-  enemy.ecl.periodicSub = { period: 1, subId: 1, elapsed: 0, savedVars: new Float64Array(26) };
+  // Seed one tick before a period-2 firing. Period 1 would immediately
+  // re-enter again on the periodic RETURN because native RETURN jumps through
+  // the timer preamble; retail periodic periods are larger than that loop.
+  enemy.ecl.periodicSub = { period: 2, subId: 1, elapsed: 1, savedVars: new Float64Array(26) };
 
   assert.equal(enemy.ecl.ctx.waitTimer, 2);
   runtime.updateEnemy(game, enemy);
@@ -153,11 +156,83 @@ test('op144 periodic gosub runs during a parent wait and restores its wait conte
   );
 });
 
+test('op144 snapshots the current variable block when it is armed', () => {
+  const runtime = makeRuntime([
+    [
+      instruction(0, 5, [f32(10004), f32(1.25)]),
+      instruction(0, 144, [i32(100), i32(1)]),
+      instruction(0, 5, [f32(10004), f32(9.5)])
+    ],
+    [instruction(0, 42)]
+  ]);
+  const game = makeHost();
+  const enemy = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
+
+  // Th07.exe FUN_0040f6c0 case 0x8f copies enemy+0x6fc..+0x763 to
+  // enemy+0x2ee8 at the op144 instruction itself. Later caller writes do
+  // not alter the periodic sub's initial state.
+  assert.equal(enemy.ecl.vars[4], 9.5);
+  assert.equal(enemy.ecl.periodicSub.savedVars[4], 1.25);
+});
+
+test('op144 timer re-enters its preamble on nested CALL and both RETURNs', () => {
+  const runtime = makeRuntime([
+    [instruction(0, 45, [i32(30)])],
+    [instruction(0, 41, [i32(2)]), instruction(0, 42)],
+    [instruction(0, 42)]
+  ]);
+  const game = makeHost();
+  const enemy = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
+  enemy.ecl.periodicSub = {
+    period: 9, subId: 1, elapsed: 8, savedVars: new Float64Array(26)
+  };
+
+  runtime.updateEnemy(game, enemy);
+
+  // Th07.exe FUN_0040f6c0: op41 and op42 both goto LAB_0040f6d1.
+  // The firing preamble resets 9 -> 0, then the nested CALL, inner RETURN,
+  // and outer RETURN each advance the split timer before the parent resumes.
+  assert.equal(enemy.ecl.periodicSub.elapsed, 3);
+  assert.equal(enemy.ecl.ctx.subId, 0);
+  assert.equal(enemy.ecl.stack.length, 0);
+});
+
+test('nested CALL restores op144 export ownership to the outer periodic RETURN', () => {
+  const runtime = makeRuntime([
+    [instruction(0, 45, [i32(30)])],
+    [
+      instruction(0, 19, [f32(10004), f32(10004), f32(1)]),
+      instruction(0, 41, [i32(2)]),
+      instruction(0, 19, [f32(10004), f32(10004), f32(10)]),
+      instruction(0, 42)
+    ],
+    [
+      instruction(0, 19, [f32(10004), f32(10004), f32(100)]),
+      instruction(0, 42)
+    ]
+  ]);
+  const game = makeHost();
+  const enemy = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
+  enemy.ecl.periodicSub = {
+    period: 9, subId: 1, elapsed: 8, savedVars: new Float64Array(26)
+  };
+
+  runtime.updateEnemy(game, enemy);
+
+  // The inner RETURN first exports 101, then restores the outer frame's
+  // +0x8f4 flag and vars=1. The outer body continues to 11, and its RETURN
+  // is the final persistent-stash export.
+  assert.equal(enemy.ecl.periodicSub.savedVars[4], 11);
+  assert.equal(enemy.ecl.vars[4], 0);
+  assert.equal(enemy.ecl.periodicExportArmed, false);
+  assert.equal(enemy.ecl.stack.length, 0);
+});
+
 test('death callback initializes a fresh context with no inherited op45 wait', () => {
   const runtime = makeRuntime([
     [instruction(0, 45, [i32(8)])],
     [],
-    [instruction(0, 4, [i32(10006), i32(42)])]
+    [instruction(0, 4, [i32(10000), i32(42)])]
   ]);
   const game = makeHost();
   const enemy = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
@@ -175,5 +250,5 @@ test('death callback initializes a fresh context with no inherited op45 wait', (
   );
 
   runtime.updateEnemy(game, enemy);
-  assert.equal(enemy.ecl.vars[6], 42, 'callback t=0 must not be delayed by the prior phase wait');
+  assert.equal(enemy.ecl.vars[0], 42, 'callback t=0 must not be delayed by the prior phase wait');
 });

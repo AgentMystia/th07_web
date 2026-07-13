@@ -9,8 +9,14 @@
 // update tick through the same InputFrame seam live keyboards use.
 import { execSync } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
+import { threadId } from 'node:worker_threads';
 
-const outDir = 'tests/.build/replay-harness';
+// Every native-comparison agent runs its own Node process. A shared esbuild
+// outfile let one process import another process's half-written bundle,
+// producing intermittent `Unexpected end of input` failures under parallel
+// replay work. Keep one stable bundle per process/worker instead; loadEngine's
+// in-process promise still guarantees it is built only once for that caller.
+const outDir = `tests/.build/replay-harness/${process.pid}-${threadId}`;
 
 let modsPromise = null;
 
@@ -48,10 +54,15 @@ export function makeStubAudio() {
 // the same fields StageScene's own carry block sets, without triggering the
 // mid-run stage transition (frame alignment against the recorded stream is
 // calibrated separately).
-export function applySnapshot(scene, rpy, stageIndex) {
+export function applySnapshot(scene, rpy, stageIndex, opts = {}) {
   const s = rpy.stages[stageIndex];
-  scene.score = stageIndex > 0 ? rpy.stages[stageIndex - 1].scoreAtEnd : 0;
-  scene.hiScore = Math.max(scene.hiScore, rpy.score);
+  const previous = stageIndex > 0 ? rpy.stages[stageIndex - 1] : null;
+  // FUN_00440480 restores a prior score only for a physically adjacent
+  // Stage 1..6 slot. Extra/Phantasm start from zero, and the replay header's
+  // final score is metadata rather than the live HUD hi-score.
+  scene.score = s.stage >= 2 && s.stage <= 6 && previous?.stage === s.stage - 1
+    ? previous.scoreAtEnd
+    : 0;
   scene.graze = s.graze;
   scene.pointItems = s.pointItems;
   scene.playerObj.lives = s.lives;
@@ -62,10 +73,19 @@ export function applySnapshot(scene, rpy, stageIndex) {
   scene.cherry.cherryPlus = s.cherryPlus;
   scene.cherry.spellsCaptured = s.spellsCaptured;
   scene.extendLevel = s.extendLevel;
+  if (scene.extendThreshold !== s.extendThreshold) {
+    throw new Error(
+      `T7RP stage ${s.stage} extend threshold ${s.extendThreshold} ` +
+      `does not match level ${s.extendLevel} (${scene.extendThreshold})`
+    );
+  }
   // Recorded rank (DAT_00625884). The port's rank dynamics are under review;
   // seeding the recorded stage-entry value keeps the entry state faithful.
   scene.rank = s.rankByte;
-  scene.rng.seed = s.rngSeed;
+  if (opts.restoreRng !== false) {
+    scene.rng.seed = s.rngSeed;
+    scene.runtime.initializeRandomCounters(scene.rng);
+  }
 }
 
 // Per-frame state digest (FNV-1a over the divergence-sensitive core state).
@@ -95,8 +115,11 @@ export function digestFrame(scene) {
   return h >>> 0;
 }
 
-// Runs one recorded stage. Returns a report; opts.onFrame(frameIndex, scene)
-// runs after every update tick (trace/digest hook).
+// Runs one recorded stage. Returns a report;
+// opts.onFrame(frameIndex, scene, frameTrace) runs after every update tick
+// (trace/digest hook). frameTrace carries the raw replay input and the RNG
+// state/counter on both sides of that tick, so native PRE-state traces can be
+// compared without an off-by-one correction.
 //
 // End conditions:
 //  - completed: onStageComplete fired (arcade stages 1-5) — carryOut captured;
@@ -112,14 +135,31 @@ export async function runStage(rpy, stageIndex, opts = {}) {
     rpy.difficulty,
     rpy.character,
     stage.stage,
-    null
+    null,
+    stage.rngSeed
   );
   scene.mode = 'arcade';
-  applySnapshot(scene, rpy, stageIndex);
+  applySnapshot(scene, rpy, stageIndex, { restoreRng: false });
 
   // RNG draw counter: every consumer bottoms out in u16(), and the recorder
   // snapshots the LIVE RNG state per stage — so the LCG step count between
   // adjacent stage seeds is the original's total draw budget (mod 65536).
+  // StageScene's manager initialization consumes from the restored replay
+  // seed before the first replay frame. Count those bootstrap draws in the
+  // stage-wide RNG budget, while keeping the per-frame trace counter based at
+  // zero (native PRE traces likewise subtract their frame-0 raw counter).
+  let rngBootstrapDraws = 0;
+  {
+    let seed = stage.rngSeed;
+    while (seed !== scene.rng.seed && rngBootstrapDraws < 65536) {
+      const a = ((seed ^ 0x9630) - 0x6553) & 0xffff;
+      seed = (((a & 0xc000) >> 14) + a * 4) & 0xffff;
+      rngBootstrapDraws++;
+    }
+    if (seed !== scene.rng.seed) {
+      throw new Error(`stage ${stage.stage}: initialized RNG state is not reachable from replay seed`);
+    }
+  }
   let rngDraws = 0;
   {
     const orig = scene.rng.u16.bind(scene.rng);
@@ -138,12 +178,14 @@ export async function runStage(rpy, stageIndex, opts = {}) {
   const rngProfile = opts.profileRng ? new Map() : null;
   if (rngProfile) {
     const origSpawn = scene.spawnEffectParticles.bind(scene);
-    scene.spawnEffectParticles = (effectId, x, y, count, color) => {
+    scene.spawnEffectParticles = (effectId, x, y, count, color, seed, ownerEnemyId) => {
       const before = rngDraws;
-      origSpawn(effectId, x, y, count, color);
-      const rec = rngProfile.get(effectId) ?? { calls: 0, particles: 0, draws: 0 };
+      const beforeParticles = scene.particles.length;
+      origSpawn(effectId, x, y, count, color, seed, ownerEnemyId);
+      const rec = rngProfile.get(effectId) ?? { calls: 0, requested: 0, particles: 0, draws: 0 };
       rec.calls++;
-      rec.particles += Math.max(0, count | 0);
+      rec.requested += Math.max(0, count | 0);
+      rec.particles += Math.max(0, scene.particles.length - beforeParticles);
       rec.draws += rngDraws - before;
       rngProfile.set(effectId, rec);
     };
@@ -165,10 +207,10 @@ export async function runStage(rpy, stageIndex, opts = {}) {
   const bombs = [];
   // Our sim's per-frame event streams, mirroring the replay aux-word oracle
   // (RPY_AUX_BITS): kill frames (enemy-slot-vacate events) and item collects.
-  const killFrames = [];
-  const collectFrames = [];
-  let prevEnemies = new Map();
-  let prevItems = new Map();
+  const killFrames = new Set();
+  const collectFrames = new Set();
+  const playerHitFrames = new Set();
+  const seenHitRecords = new Set(scene.hitLog);
   let prevLives = scene.playerObj.lives;
   let prevBombs = scene.playerObj.bombs;
   const graceFrames = opts.graceFrames ?? 900;
@@ -185,11 +227,10 @@ export async function runStage(rpy, stageIndex, opts = {}) {
   //   (B) 13887 via 14050/14133 — natural ECL exit or off-screen+trail cull,
   //       fired when the slot is finally freed. For a mode-1/2/3 kill this is
   //       a SECOND, later event; for a pure despawn it is the only event.
-  // Array-membership diffing alone (below) sees only removals, so it misses
-  // (A) for modes 1-3 entirely — the enemy-audit RE confirmed this blind spot.
-  // Tap killEnemy() directly for (A); the removal diff supplies (B), skipping
-  // the same-frame mode-0 removal already counted at its call.
-  const killCallFrame = new Map(); // enemy id -> frame killEnemy() fired (A)
+  // Array-membership diffing sees only removals and misses (A) for modes 1-3,
+  // as well as actors allocated and released in one manager pass. Tap both
+  // lifecycle methods instead. Since AUX is a bitfield, the Set intentionally
+  // collapses a same-frame mode-0 kill+release pair to one frame marker.
   const killModeTally = { 0: 0, 1: 0, 2: 0, 3: 0 };
   {
     const origKill = scene.runtime.killEnemy.bind(scene.runtime);
@@ -197,44 +238,65 @@ export async function runStage(rpy, stageIndex, opts = {}) {
       // interactable===false is the exe's death gate (all.c:14303); such a
       // call is a no-op that never reaches the switch, so it fires no aux bit.
       if (e.ecl.interactable) {
-        killFrames.push(f);
-        killCallFrame.set(e.id, f);
+        killFrames.add(f);
         killModeTally[e.ecl.deathMode & 7] = (killModeTally[e.ecl.deathMode & 7] ?? 0) + 1;
       }
       return origKill(g, e);
+    };
+    const origRelease = scene.runtime.releaseEnemy.bind(scene.runtime);
+    scene.runtime.releaseEnemy = (g, e) => {
+      killFrames.add(f);
+      return origRelease(g, e);
+    };
+    // Item removal alone cannot distinguish a pickup from a bottom cull and
+    // misses an item spawned and collected within one update. The authored
+    // pickup routine is the exact AUX-0x40 writer seam.
+    const origCollect = scene.collectItem.bind(scene);
+    scene.collectItem = (item) => {
+      collectFrames.add(f);
+      return origCollect(item);
     };
   }
   for (; f < stage.inputs.length + graceFrames; f++) {
     const word = f < stage.inputs.length ? stage.inputs[f] : 0;
     if (f >= stage.inputs.length) extraFrames++;
+    const preSeed = scene.rng.seed;
+    const preDraws = rngDraws;
+    const preStageFrame = scene.stageFrame;
     // Ghost mode: survive everything. Timeline calibration needs the whole
     // input stream to play out even while patterns still misalign — the
     // permanent invuln suppresses hit outcomes without touching RNG use
     // inside the collision path (graze still runs, like the exe's states 3/4).
     if (opts.ghost) scene.playerObj.invulnFrames = Math.max(scene.playerObj.invulnFrames, 2);
     scene.update(source.frame(word));
+    // T7RP stage records end when gameplay arms the native results screen;
+    // the unrecorded tally/dismiss UI then hands its already-computed carry
+    // to the next stage. Browser arcade flow still waits for dismissal and
+    // fires onStageComplete normally, but replay verification must stop at
+    // this authored gameplay boundary instead of manufacturing empty-input
+    // result-screen ticks.
+    if (!completed && stage.stage < 6 && scene.stageClear) {
+      completed = true;
+      carryOut = scene.carryState();
+    }
+    for (const hit of scene.hitLog) {
+      if (seenHitRecords.has(hit)) continue;
+      seenHitRecords.add(hit);
+      playerHitFrames.add(f);
+    }
     if (scene.playerObj.lives < prevLives) deaths.push({ frame: f, stageFrame: scene.stageFrame });
     if (scene.playerObj.bombs < prevBombs) bombs.push({ frame: f, stageFrame: scene.stageFrame });
     prevLives = scene.playerObj.lives;
     prevBombs = scene.playerObj.bombs;
-    {
-      // (B) enemy-slot free: count every removal EXCEPT the same-frame mode-0
-      // removal whose (A) fire was already recorded at the killEnemy() call.
-      const cur = new Map();
-      for (const e of scene.enemies) cur.set(e.id, e);
-      for (const [id] of prevEnemies) {
-        if (!cur.has(id) && killCallFrame.get(id) !== f) killFrames.push(f);
-      }
-      prevEnemies = cur;
-      const items = new Map();
-      for (const it of scene.items) items.set(it.id, it);
-      for (const [id, it] of prevItems) {
-        // Collected = removed before reaching the bottom cull.
-        if (!items.has(id) && it.y <= 448) collectFrames.push(f);
-      }
-      prevItems = items;
-    }
-    opts.onFrame?.(f, scene);
+    opts.onFrame?.(f, scene, {
+      input: word,
+      preStageFrame,
+      postStageFrame: scene.stageFrame,
+      preSeed,
+      postSeed: scene.rng.seed,
+      preDraws,
+      postDraws: rngDraws
+    });
     if (completed || exited) {
       f++;
       break;
@@ -247,16 +309,19 @@ export async function runStage(rpy, stageIndex, opts = {}) {
     framesRun: f,
     extraFrames,
     completed,
+    inputExhausted: f >= stage.inputs.length,
     exited,
     gameOver: scene.gameOver ?? false,
     carryOut,
     deaths,
     bombs,
     hits: scene.hitLog,
-    killFrames,
+    killFrames: [...killFrames],
     killModeTally,
-    collectFrames,
-    rngDraws,
+    collectFrames: [...collectFrames],
+    playerHitFrames: [...playerHitFrames],
+    rngBootstrapDraws,
+    rngDraws: rngBootstrapDraws + rngDraws,
     rngProfile: rngProfile
       ? [...rngProfile.entries()]
           .map(([effectId, rec]) => ({ effectId, ...rec }))

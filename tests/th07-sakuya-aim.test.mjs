@@ -34,8 +34,12 @@ function enemy(x, y, isBoss = false) {
   };
 }
 
-function aim(scene) {
-  scene.updateSakuyaAimCache();
+function aim(scene, enemies) {
+  // The native cache is accumulated inside FUN_0041ed50's per-enemy loop.
+  // Exercise the same seam in ascending fixed-pool order instead of calling
+  // the removed whole-array cache helper.
+  scene.clearPlayerAimCaches();
+  for (const e of enemies) scene.accumulatePlayerAimCaches(e);
   return scene.sakuyaAim;
 }
 
@@ -44,20 +48,17 @@ test('Sakuya only aims at enemies within ±30° of straight up', () => {
   const above = enemy(200, 120);   // ~ -88°: inside the cone
   const beside = enemy(330, 390);  // ~ -4°: outside
   const diagonal = enemy(330, 260); // ~ -45°: outside (cone edge is -60°)
-  scene.enemies = [beside, diagonal];
-  assert.equal(aim(scene), null, 'nothing inside the cone');
-  scene.enemies = [beside, diagonal, above];
-  assert.deepEqual(aim(scene), { x: 200, y: 120 }, 'only the in-cone enemy qualifies');
+  assert.equal(aim(scene, [beside, diagonal]), null, 'nothing inside the cone');
+  assert.deepEqual(aim(scene, [beside, diagonal, above]), { x: 200, y: 120 },
+    'only the in-cone enemy qualifies');
 });
 
 test('first cone-qualified non-boss in pool order wins, not the nearest', () => {
   const scene = aimScene('sakuyaA');
   const far = enemy(180, 60);   // in cone, far from the player
   const near = enemy(200, 320); // in cone, much closer
-  scene.enemies = [far, near];
-  assert.deepEqual(aim(scene), { x: 180, y: 60 }, 'pool order, not distance');
-  scene.enemies = [near, far];
-  assert.deepEqual(aim(scene), { x: 200, y: 320 }, 'swapping order swaps the pick');
+  assert.deepEqual(aim(scene, [far, near]), { x: 180, y: 60 }, 'pool order, not distance');
+  assert.deepEqual(aim(scene, [near, far]), { x: 200, y: 320 }, 'swapping order swaps the pick');
 });
 
 test('a cone-qualified boss locks the cache with min |dx|', () => {
@@ -65,12 +66,35 @@ test('a cone-qualified boss locks the cache with min |dx|', () => {
   const mob = enemy(192, 300);
   const bossFar = enemy(120, 100, true);  // |dx| = 72
   const bossNear = enemy(230, 100, true); // |dx| = 38
-  scene.enemies = [mob, bossFar, bossNear];
-  assert.deepEqual(aim(scene), { x: 230, y: 100 }, 'boss beats the earlier mob; min |dx| among bosses');
+  assert.deepEqual(aim(scene, [mob, bossFar, bossNear]), { x: 230, y: 100 },
+    'boss beats the earlier mob; min |dx| among bosses');
 });
 
 test('non-Sakuya characters produce no knife-aim snapshot', () => {
   const scene = aimScene('reimuA');
-  scene.enemies = [enemy(192, 100)];
-  assert.equal(aim(scene), null);
+  assert.equal(aim(scene, [enemy(192, 100)]), null);
+});
+
+test('SakuyaA spawn aim preserves the native staged float32 pipeline', () => {
+  const scene = aimScene('sakuyaA');
+  scene.sakuyaAim = { x: 247.86310958862305, y: 204.88897781372071 };
+  const bullet = {
+    x: 325.2265319824219,
+    y: 333.8155212402344,
+    angle: -1.5707963705062866,
+    speed: 12,
+    vx: 0,
+    vy: -12
+  };
+
+  scene.aimBulletAtSpawn(bullet);
+
+  // FUN_00439070 @ 0x4390c6-0x43913f stores dx, dy, atan2, the
+  // angle+pi/2 operand, normalized angle, boosted speed, and final vector
+  // through float32 fields in this order. These are the exact results for
+  // the Stage-2 processing-9297 slot-32 setup on the WT-side target cache.
+  assert.equal(bullet.angle, -2.1112585067749023);
+  assert.equal(bullet.speed, 18);
+  assert.equal(bullet.vx, -9.261582374572754);
+  assert.equal(bullet.vy, -15.434477806091309);
 });

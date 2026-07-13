@@ -14,6 +14,7 @@ import type { Enemy, EnemyBullet } from './types';
 // Bullet cancellation is the same spatial touch, gated on bomb-active.
 
 export interface AttackSlot {
+  poolSlot: number;
   x: number;
   y: number;
   radiusX: number; // FULL widths — halved at the point of test
@@ -42,7 +43,8 @@ const MAX_SLOTS = 112; // exe pool size (0x70)
 const TAU = Math.PI * 2;
 
 export class BombEngine {
-  slots: AttackSlot[] = Array.from({ length: MAX_SLOTS }, () => ({
+  slots: AttackSlot[] = Array.from({ length: MAX_SLOTS }, (_, poolSlot) => ({
+    poolSlot,
     x: 0, y: 0, radiusX: 0, radiusY: 0, damage: 0, hitTally: 0, active: false
   }));
 

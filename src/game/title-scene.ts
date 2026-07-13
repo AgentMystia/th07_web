@@ -4,6 +4,7 @@ import type { InputFrame, Button } from '../core/input';
 import type { GameAssets } from './assets';
 import type { AudioBus } from '../audio/audio';
 import type { CharacterId } from './player';
+import type { Rpy } from '../formats/rpy';
 
 // Title -> difficulty -> character/shot-type menu flow, built entirely from
 // the original title01.anm menu script data (see assets.anms.title01) plus
@@ -31,7 +32,8 @@ const ENTRY = {
   marisa: 4, // sl_pl01.png
   sakuya: 5, // sl_pl02.png
   nameplate: 6, // sl_pltx.png (character name + secondary caption)
-  header: 7 // sl_text.png ("Choose Level" / "Choose Girl" / "Choose Spell Card")
+  header: 7, // sl_text.png ("Choose Level" / "Choose Girl" / "Choose Spell Card")
+  replay: 8 // replay00.png (replay-select title and field labels)
 } as const;
 
 const PORTRAIT_ENTRY = [ENTRY.reimu, ENTRY.marisa, ENTRY.sakuya] as const;
@@ -51,14 +53,15 @@ const DIFFICULTY_NAMES = ['Easy', 'Normal', 'Hard', 'Lunatic'] as const;
 // the extracted title01.png atlas: each item's "colored" sprite spells out
 // its label in stylized Latin text (Start / ExtraStart / Practice Start /
 // Replay / Result / MusicRoom / Option / Quit). Game Start and Extra Start
-// are wired in this reimplementation (no save data/unlocks/replay storage
-// exist yet); the rest are fully navigable and visible like the original,
+// are wired in this reimplementation (Replay opens a browser-local .rpy;
+// score data and the other persistent submenus do not exist yet); the rest
+// are fully navigable and visible like the original,
 // but confirming one just plays the cancel buzz.
 const MAIN_MENU_ITEMS = [
   { name: 'Game Start', enabled: true },
   { name: 'Extra Start', enabled: true },
   { name: 'Practice Start', enabled: true },
-  { name: 'Replay', enabled: false },
+  { name: 'Replay', enabled: true },
   { name: 'Score', enabled: false },
   { name: 'Music Room', enabled: false },
   { name: 'Option', enabled: false },
@@ -162,7 +165,8 @@ class TitleMenu {
     this.items = MAIN_MENU_ITEMS.map((_, i) => new AnmRunner(anm, i, { entryIndex: ENTRY.mainMenu, spriteIndexOffset: base }));
   }
 
-  update(input: InputFrame, audio: AudioBus): 'confirm' | 'confirm-extra' | 'confirm-practice' | null {
+  update(input: InputFrame, audio: AudioBus):
+    'confirm' | 'confirm-extra' | 'confirm-practice' | 'confirm-replay' | null {
     this.logo.update();
     for (const it of this.items) it.update();
     const n = MAIN_MENU_ITEMS.length;
@@ -176,7 +180,13 @@ class TitleMenu {
     if (input.pressed.has('confirm')) {
       if (MAIN_MENU_ITEMS[this.cursor].enabled) {
         audio.sfx('se_ok00', 0.316, 10);
-        return this.cursor === 1 ? 'confirm-extra' : this.cursor === 2 ? 'confirm-practice' : 'confirm';
+        return this.cursor === 1
+          ? 'confirm-extra'
+          : this.cursor === 2
+            ? 'confirm-practice'
+            : this.cursor === 3
+              ? 'confirm-replay'
+              : 'confirm';
       }
       audio.sfx('se_cancel00', 0.316, 11);
     }
@@ -473,7 +483,194 @@ class StageSelectMenu {
   }
 }
 
-export type MenuSceneKind = 'title' | 'difficulty' | 'select' | 'stage';
+// -- Replay stage select ------------------------------------------------------
+
+const REPLAY_DIFFICULTY_NAMES = ['Easy', 'Normal', 'Hard', 'Lunatic', 'Extra', 'Phantasm'] as const;
+
+function replayStageLabel(replay: Rpy, stageNumber: number): string {
+  if (stageNumber === 7) return replay.difficulty >= 5 ? 'Phantasm' : 'Extra';
+  return `Stage ${stageNumber}`;
+}
+
+class ReplaySelectMenu {
+  cursor = 0;
+  private repeat = new KeyRepeater();
+  private header: AnmRunner;
+
+  constructor(
+    private anm: Anm,
+    readonly replay: Rpy | null,
+    readonly fileName: string,
+    readonly error: string | null = null
+  ) {
+    const entry = anm.entries[ENTRY.replay];
+    this.header = new AnmRunner(anm, 0, {
+      entryIndex: ENTRY.replay,
+      spriteIndexOffset: entry.spriteBase
+    });
+    // replay00 script 0 labels 13/14/15/19 all enter through the authored
+    // 30-frame header slide. The executable uses label 15 for the stage-list
+    // branch (FUN_0045207e); preserving the ANM keeps its original artwork.
+    this.header.interrupt(15);
+  }
+
+  update(input: InputFrame, audio: AudioBus): 'confirm' | 'back' | null {
+    this.header.update();
+    const n = this.replay?.stages.length ?? 0;
+    if (n > 0 && this.repeat.poll(input, 'down')) {
+      this.cursor = (this.cursor + 1) % n;
+      audio.sfx('se_select00', 0.141, 12);
+    } else if (n > 0 && this.repeat.poll(input, 'up')) {
+      this.cursor = (this.cursor - 1 + n) % n;
+      audio.sfx('se_select00', 0.141, 12);
+    }
+    if (input.pressed.has('confirm') && n > 0) {
+      audio.sfx('se_ok00', 0.316, 10);
+      return 'confirm';
+    }
+    if (input.pressed.has('back')) {
+      audio.sfx('se_cancel00', 0.316, 11);
+      return 'back';
+    }
+    return null;
+  }
+
+  draw(r: Renderer, frameCounter: number): void {
+    r.drawImage('select00', 0, 0);
+    r.drawAnmFrame(this.header.spriteFrame(), 0, 0);
+    if (!this.replay) {
+      r.text(this.fileName || 'Replay Load Error', SCREEN_W / 2, 190, {
+        size: 16,
+        color: '#f0dce8',
+        align: 'center'
+      });
+      r.text(this.error ?? 'Unable to load replay.', SCREEN_W / 2, 226, {
+        size: 14,
+        color: '#ff9ca8',
+        align: 'center'
+      });
+      hint(r, 'X Back');
+      return;
+    }
+
+    const replay = this.replay;
+    const entry = this.anm.entries[ENTRY.replay];
+    const stageLabel = this.anm.sprites.get(entry.spriteIds[1]);
+    if (stageLabel) r.drawSprite(stageLabel.imageKey, stageLabel.x, stageLabel.y, stageLabel.w, stageLabel.h, 92, 154);
+    const scoreLabel = this.anm.sprites.get(entry.spriteIds[8]);
+    if (scoreLabel) r.drawSprite(scoreLabel.imageKey, scoreLabel.x, scoreLabel.y, scoreLabel.w, scoreLabel.h, 286, 154);
+    const difficultySprite = this.anm.sprites.get(entry.spriteIds[Math.min(6, replay.difficulty + 2)]);
+    if (difficultySprite) {
+      r.drawSprite(
+        difficultySprite.imageKey,
+        difficultySprite.x,
+        difficultySprite.y,
+        difficultySprite.w,
+        difficultySprite.h,
+        364,
+        154
+      );
+    }
+
+    r.text(this.fileName, 320, 126, { size: 12, color: '#d9cce8', align: 'center' });
+    replay.stages.forEach((stage, i) => {
+      const focused = i === this.cursor;
+      const y = 184 + i * 31;
+      r.text(replayStageLabel(replay, stage.stage), 112, y, {
+        size: 16,
+        color: focused ? '#fff6a0' : '#9e91ae',
+        align: 'center'
+      });
+      r.text((stage.scoreAtEnd * 10).toLocaleString('en-US'), 236, y, {
+        size: 14,
+        color: focused ? '#f8e8b0' : '#aaa0b4'
+      });
+      if (focused) drawCursorArrow(r, 50, y - 5, frameCounter);
+    });
+
+    const difficulty = REPLAY_DIFFICULTY_NAMES[replay.difficulty] ?? `Difficulty ${replay.difficulty}`;
+    const lines = [
+      `Name   ${replay.name || '-'}`,
+      `Date   ${replay.date || '-'}`,
+      `Player ${replay.character}`,
+      `Rank   ${difficulty}`,
+      `Final  ${(replay.score * 10).toLocaleString('en-US')}`
+    ];
+    lines.forEach((line, i) => {
+      r.text(line, 430, 190 + i * 31, { size: 14, color: '#f0e8f5', align: 'center' });
+    });
+    hint(r, 'Up/Down Stage    Z Playback    X Back');
+  }
+}
+
+export type ReplayPlaybackMode = 0 | 1 | 2;
+
+class ReplayConfirmMenu {
+  cursor: ReplayPlaybackMode = 0;
+  private repeat = new KeyRepeater();
+  private header: AnmRunner;
+  private panels: AnmRunner[];
+
+  constructor(private anm: Anm, readonly replay: Rpy, readonly stageIndex: number) {
+    const entry = anm.entries[ENTRY.replay];
+    this.header = new AnmRunner(anm, 0, {
+      entryIndex: ENTRY.replay,
+      spriteIndexOffset: entry.spriteBase
+    });
+    this.header.interrupt(19);
+    this.panels = [26, 27, 28].map((id) => {
+      const runner = new AnmRunner(anm, id, {
+        entryIndex: ENTRY.replay,
+        spriteIndexOffset: entry.spriteBase
+      });
+      runner.interrupt(19);
+      return runner;
+    });
+    this.syncHighlight();
+  }
+
+  private syncHighlight(): void {
+    this.panels.forEach((runner, i) => runner.interrupt(i === this.cursor ? 20 : 21));
+  }
+
+  update(input: InputFrame, audio: AudioBus): 'confirm' | 'back' | null {
+    this.header.update();
+    for (const panel of this.panels) panel.update();
+    if (this.repeat.poll(input, 'down')) {
+      this.cursor = ((this.cursor + 1) % 3) as ReplayPlaybackMode;
+      this.syncHighlight();
+      audio.sfx('se_select00', 0.141, 12);
+    } else if (this.repeat.poll(input, 'up')) {
+      this.cursor = ((this.cursor + 2) % 3) as ReplayPlaybackMode;
+      this.syncHighlight();
+      audio.sfx('se_select00', 0.141, 12);
+    }
+    if (input.pressed.has('confirm')) {
+      audio.sfx('se_ok00', 0.316, 10);
+      return 'confirm';
+    }
+    if (input.pressed.has('back')) {
+      audio.sfx('se_cancel00', 0.316, 11);
+      return 'back';
+    }
+    return null;
+  }
+
+  draw(r: Renderer): void {
+    r.drawImage('select00', 0, 0);
+    r.drawAnmFrame(this.header.spriteFrame(), 0, 0);
+    for (const panel of this.panels) r.drawAnmFrame(panel.spriteFrame(), 0, 0);
+    const stage = this.replay.stages[this.stageIndex];
+    r.text(replayStageLabel(this.replay, stage.stage), SCREEN_W / 2, 118, {
+      size: 18,
+      color: '#f6eaf7',
+      align: 'center'
+    });
+    hint(r, 'Up/Down Playback Mode    Z Decide    X Back');
+  }
+}
+
+export type MenuSceneKind = 'title' | 'difficulty' | 'select' | 'stage' | 'replay' | 'replay-confirm';
 
 export interface MenuStartOptions {
   practice?: boolean;
@@ -494,18 +691,28 @@ export class MenuFlow {
   private difficulty: DifficultyMenu | null = null;
   private select: PlayerSelectMenu | null = null;
   private stageSelect: StageSelectMenu | null = null;
+  private replaySelect: ReplaySelectMenu | null = null;
+  private replayConfirm: ReplayConfirmMenu | null = null;
   private chosenDifficulty = 1;
   private practiceMode = false;
   private chosenStage = 1;
   private transitionOut = 0;
   private pendingCharacter: CharacterId | null = null;
+  private pendingReplayStageIndex: number | null = null;
+  private pendingReplayMode: ReplayPlaybackMode = 0;
   private frame = 0;
 
   constructor(
     private assets: GameAssets,
     private audio: AudioBus,
     private onStart: (difficulty: number, character: CharacterId, opts?: MenuStartOptions) => void,
-    initialTitleCursor = 0
+    initialTitleCursor = 0,
+    private onStartReplay?: (
+      replay: Rpy,
+      stageIndex: number,
+      fileName: string,
+      mode: ReplayPlaybackMode
+    ) => void
   ) {
     this.title = new TitleMenu(this.anm);
     // Th07.exe FUN_00452e91 (all.c:40457-40459): returning from a practice
@@ -517,16 +724,49 @@ export class MenuFlow {
     return this.assets.anms.title01;
   }
 
+  // The browser host owns file I/O. Once it has parsed a local T7RP, this
+  // method enters the authored replay selector without making the menu layer
+  // depend on File/Blob APIs (and remains directly testable in Node bundles).
+  showReplay(replay: Rpy, fileName: string, initialStageIndex = 0): void {
+    this.phase = 'replay';
+    this.replaySelect = new ReplaySelectMenu(this.anm, replay, fileName);
+    this.replaySelect.cursor = Math.max(0, Math.min(replay.stages.length - 1, initialStageIndex));
+    this.transitionOut = 0;
+    this.pendingReplayStageIndex = null;
+  }
+
+  showReplayError(fileName: string, message: string): void {
+    this.phase = 'replay';
+    this.replaySelect = new ReplaySelectMenu(this.anm, null, fileName, message);
+    this.transitionOut = 0;
+    this.pendingReplayStageIndex = null;
+  }
+
+  // File inputs must be opened synchronously from the physical key event;
+  // main.ts queries this before requestAnimationFrame consumes the edge.
+  replayFileHotkeyActive(): boolean {
+    return this.phase === 'title' && this.title.cursor === 3 && this.transitionOut === 0;
+  }
+
   update(input: InputFrame): void {
     this.frame++;
     if (this.transitionOut > 0) {
       this.transitionOut--;
-      if (this.transitionOut === 0 && this.pendingCharacter) {
-        this.onStart(
-          this.chosenDifficulty,
-          this.pendingCharacter,
-          this.practiceMode ? { practice: true, stage: this.chosenStage } : undefined
-        );
+      if (this.transitionOut === 0) {
+        if (this.pendingReplayStageIndex != null && this.replaySelect?.replay && this.onStartReplay) {
+          this.onStartReplay(
+            this.replaySelect.replay,
+            this.pendingReplayStageIndex,
+            this.replaySelect.fileName,
+            this.pendingReplayMode
+          );
+        } else if (this.pendingCharacter) {
+          this.onStart(
+            this.chosenDifficulty,
+            this.pendingCharacter,
+            this.practiceMode ? { practice: true, stage: this.chosenStage } : undefined
+          );
+        }
       }
       return; // freeze the underlying screen while fading to the stage
     }
@@ -541,6 +781,8 @@ export class MenuFlow {
           this.phase = 'difficulty';
           this.difficulty = new DifficultyMenu(this.anm, result === 'confirm-extra');
         }
+        // `confirm-replay` intentionally stays on title until the browser's
+        // native file picker resolves; main.ts calls showReplay/showReplayError.
         break;
       }
       case 'difficulty': {
@@ -588,6 +830,35 @@ export class MenuFlow {
         }
         break;
       }
+      case 'replay': {
+        const result = this.replaySelect!.update(input, this.audio);
+        if (result === 'confirm' && this.replaySelect!.replay) {
+          this.pendingReplayStageIndex = this.replaySelect!.cursor;
+          this.phase = 'replay-confirm';
+          this.replayConfirm = new ReplayConfirmMenu(
+            this.anm,
+            this.replaySelect!.replay,
+            this.pendingReplayStageIndex
+          );
+        } else if (result === 'back') {
+          this.phase = 'title';
+          this.replaySelect = null;
+          this.title = new TitleMenu(this.anm);
+          this.title.cursor = 3;
+        }
+        break;
+      }
+      case 'replay-confirm': {
+        const result = this.replayConfirm!.update(input, this.audio);
+        if (result === 'confirm') {
+          this.pendingReplayMode = this.replayConfirm!.cursor;
+          this.transitionOut = STAGE_TRANSITION_FRAMES;
+        } else if (result === 'back') {
+          this.phase = 'replay';
+          this.replayConfirm = null;
+        }
+        break;
+      }
     }
   }
 
@@ -604,6 +875,12 @@ export class MenuFlow {
         break;
       case 'stage':
         this.stageSelect!.draw(r);
+        break;
+      case 'replay':
+        this.replaySelect!.draw(r, this.frame);
+        break;
+      case 'replay-confirm':
+        this.replayConfirm!.draw(r);
         break;
     }
     if (this.transitionOut > 0) {
@@ -647,6 +924,30 @@ export class MenuFlow {
           cursor: this.stageSelect!.cursor,
           stage: this.stageSelect!.cursor + 1,
           practice: true,
+          transitioning
+        };
+      case 'replay': {
+        const menu = this.replaySelect!;
+        const stage = menu.replay?.stages[menu.cursor];
+        return {
+          scene: 'replay',
+          cursor: menu.cursor,
+          fileName: menu.fileName,
+          replayName: menu.replay?.name ?? null,
+          difficulty: menu.replay?.difficulty ?? null,
+          character: menu.replay?.character ?? null,
+          stage: stage?.stage ?? null,
+          frames: stage?.inputs.length ?? null,
+          error: menu.error,
+          transitioning
+        };
+      }
+      case 'replay-confirm':
+        return {
+          scene: 'replay-confirm',
+          cursor: this.replayConfirm!.cursor,
+          stage: this.replaySelect!.replay?.stages[this.pendingReplayStageIndex ?? 0]?.stage ?? null,
+          playbackMode: this.replayConfirm!.cursor,
           transitioning
         };
     }

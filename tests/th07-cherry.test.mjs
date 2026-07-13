@@ -24,7 +24,7 @@ test('border triggers at 50000 cherry+ and survives with bonus (§4)', () => {
   // them reach the 50000 cherryPlus trigger deterministically.
   for (let i = 0; i < CHERRY_PLUS_MAX / 10; i++) fodderHit(c, 28);
   assert.equal(c.borderActive, true);
-  assert.equal(c.cherryPlus, 0);
+  assert.equal(c.cherryPlus, CHERRY_PLUS_MAX);
   assert.equal(c.cherry, 50000);
   let bonus = 0;
   for (let i = 0; i < BORDER_DURATION; i++) bonus += c.tick();
@@ -57,8 +57,28 @@ test('border request defers and retries while player state is blocked', () => {
   assert.equal(c.borderActive, true);
   assert.equal(c.borderPending, false);
   assert.equal(c.borderTimer, BORDER_DURATION);
-  assert.equal(c.cherryPlus, 0);
+  assert.equal(c.cherryPlus, CHERRY_PLUS_MAX);
   assert.deepEqual(events, ['start']);
+});
+
+test('message mini-VM can force-survive a deferred border request immediately', () => {
+  const events = [];
+  const c = new CherrySystem({
+    borderStartAction: () => 'defer',
+    onBorderEnd: (result, value) => events.push([result, value])
+  });
+  c.debugAddCherry(CHERRY_PLUS_MAX);
+  assert.equal(c.borderPending, true);
+  assert.equal(c.borderActive, false);
+
+  const bonus = c.forceBorderSurvival();
+
+  assert.equal(bonus, 60000);
+  assert.equal(c.borderEngaged, false);
+  assert.equal(c.cherryPlus, 0);
+  assert.equal(c.cherryMax, 210000);
+  assert.equal(c.cherry, 60000);
+  assert.deepEqual(events, [['survived', 60000]]);
 });
 
 test('pending border can cancel into deathbomb rescue without starting', () => {
@@ -113,14 +133,24 @@ test('shot-hit cherry gain follows the boss/difficulty divisor table (§3a)', ()
   assert.equal(c3.cherry, 70);
 });
 
-test('shot-hit zero-gain floors to 10 on an odd boss timer, else stays 0', () => {
+test('shot-hit low damage and focus gates follow player+0x240b', () => {
   const c = new CherrySystem();
-  // Normal, fodder, divisor 28: 1 damage -> floor(1/28)*10 = 0.
+  // Unfocused low damage floors to 10, even on a non-boss enemy.
   c.onShotHit(1, false, 1, 0, false);
-  assert.equal(c.cherry, 0);
+  assert.equal(c.cherry, 10);
+
+  // Focused non-boss hits skip the complete Cherry branch.
   const c2 = new CherrySystem();
-  c2.onShotHit(1, false, 1, 0, true); // bossTimerOdd floors 0 -> 10
-  assert.equal(c2.cherry, 10);
+  c2.onShotHit(1000, false, 1, 0, false, true);
+  assert.equal(c2.cherry, 0);
+
+  // Focused bosses use the non-boss divisor and only apply the minimum on
+  // odd boss-timer frames.
+  const c3 = new CherrySystem();
+  c3.onShotHit(1, true, 1, 0, false, true);
+  assert.equal(c3.cherry, 0);
+  c3.onShotHit(1, true, 1, 0, true, true);
+  assert.equal(c3.cherry, 10);
 });
 
 // exe-cherry-border.md §3b case table: 6=+20, 7=1000+100*counter, 8=+100
@@ -188,7 +218,7 @@ test('death uses the selected SHT cherry-loss ratio and character-specific cap (
   assert.equal(c.cherry, 50000); // 5000 hits x 10
   c.onDeath(0.5, false); // Reimu/Marisa SHT rate; cap=100000, not binding
   assert.equal(c.cherry, 25000); // floor10(round(50000*0.5))
-  assert.equal(c.cherryPlus, 0);
+  assert.equal(c.cherryPlus, CHERRY_PLUS_MAX, 'miss does not overwrite the active border meter');
 
   c.cherry = 50000;
   c.onDeath(0.33000001311302185, true); // exact f32 carried by Sakuya SHTs

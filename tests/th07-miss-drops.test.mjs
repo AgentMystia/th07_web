@@ -107,9 +107,12 @@ test('death drops fly a 60-frame positional tween to the rand target, then fall 
   assert.deepEqual([it.vx, it.vy], [0, 0], 'frame 61: velocity zeroed');
   assert.ok(Math.abs(it.x - ex) < 1e-6 && Math.abs(it.y - ey) < 1e-6, 'frame 61: position holds');
 
-  scene.updateItems(); // first normal-fall frame: gravity from rest
-  assert.ok(Math.abs(it.y - (ey + 0.03)) < 1e-6, `frame 62: falls 0.03 from rest (${it.y})`);
+  scene.updateItems(); // first normal-fall frame: integrate zero, then arm gravity
+  assert.ok(Math.abs(it.y - ey) < 1e-6, `frame 62: zero velocity holds position (${it.y})`);
+  assert.ok(Math.abs(it.vy - 0.03) < 1e-9, 'frame 62: gravity is stored for the next frame');
   assert.equal(it.x, ex, 'frame 62: no horizontal drift after the tween');
+  scene.updateItems();
+  assert.ok(Math.abs(it.y - (ey + 0.03)) < 1e-6, `frame 63: falls 0.03 (${it.y})`);
 });
 
 test('a top-of-field target rises during the tween but falls back after it ends', () => {
