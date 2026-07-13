@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 
 // Replay-golden regression lock (Replay Golden workflow, M5).
 //
-// Replays the first frames of the committed fixture replay through the real
+// Replays the full first stage of the committed fixture through the real
 // headless StageScene and compares sparse per-frame state digests against
 // tests/golden/stage1.digest.json. Any simulation-behavior change — intended
 // or not — flips the stream at the exact frame it first manifests.
@@ -19,7 +19,7 @@ const { loadEngine, runStage, digestFrame } = await import('../scripts/lib/repla
 
 const REPLAY = 'tests/replays/th7_udFe25.rpy';
 const GOLDEN = 'tests/golden/stage1.digest.json';
-const FRAMES = 3000; // opener + first waves; ~60ms wall
+const FRAMES = 10477; // full recorded Stage 1; ~600ms wall
 const STRIDE = 50;
 
 test('stage-1 replay digest matches the committed golden', async () => {

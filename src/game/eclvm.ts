@@ -1513,7 +1513,14 @@ export class StageRuntime {
     if (script < 0 || s.currentAnm === script) return;
     s.currentAnm = script;
     s.anmRunner = this.enemyAnm.hasScript(script)
-      ? new AnmRunner(this.enemyAnm, script, { rng: this.anmRng })
+      ? new AnmRunner(this.enemyAnm, script, {
+          rng: this.anmRng,
+          // Th07.exe FUN_004486e0 @ 0x4486e0 resets the embedded ANM VM but
+          // leaves enemy+0x1e4's current sprite pointer intact. Stage-1
+          // Sub35 script 11's fourth random branch sets no sprite and must
+          // retain script 0's 32x32 rect so FUN_0042bdc7 can cull it.
+          inheritSpriteFrom: s.anmRunner ?? undefined
+        })
       : null;
   }
 

@@ -25,7 +25,7 @@ test('SakuyaA option glide uses the exe quadratic-X / linear-Y curves', () => {
   assert.deepEqual(player.orbOffset(2), { x: 12, y: -16 });
 });
 
-test('mid-glide reversal preserves the native asymmetric split-counter order', () => {
+test('mid-glide reversal advances old and new native split counters', () => {
   const player = Object.create(Player.prototype);
   player.character = 'sakuyaA';
   player.focusTransition = null;
@@ -44,13 +44,19 @@ test('mid-glide reversal preserves the native asymmetric split-counter order', (
   assert.equal(player.focusGlideFrame, 4);
   assert.deepEqual(player.orbOffset(1), { x: -20, y: -16 });
 
-  // The reverse direction enters state 4 before its single advance. This
-  // direction was already correct: focused timer 4 becomes unfocused 5.
+  // Native th7_ud8141 processing 8631: a focus-in counter at 5 reverses by
+  // advancing old 5->6, complementing to 2, then advancing new 2->3.
+  // Two ordinary state-4 ticks later the shot origin is exactly timer 5.
   player.focusHeld = true;
-  player.focusGlideFrame = 4;
+  player.focusGlideFrame = 5;
+  player.updateFocusGlide(false, 1);
+  assert.equal(player.focusGlideFrame, 3);
+  assert.equal(player.focusTransition, 'out');
+  assert.deepEqual(player.orbOffset(1), { x: -10.25, y: -20 });
+
+  player.updateFocusGlide(false, 1);
   player.updateFocusGlide(false, 1);
   assert.equal(player.focusGlideFrame, 5);
-  assert.equal(player.focusTransition, 'out');
   assert.deepEqual(player.orbOffset(1), { x: -14.25, y: -12 });
 });
 
@@ -67,7 +73,7 @@ test('focus reversal discards the old split fraction and advances the new state 
   player.focusHeld = true;
   player.focusGlideFrame = 4.75;
   player.updateFocusGlide(false, 0.5);
-  assert.equal(player.focusGlideFrame, 4.5, 'complement integer 4, discard .75, new fraction 0.5');
+  assert.equal(player.focusGlideFrame, 3.5, 'old state crosses to 5, complement 3, new fraction 0.5');
 });
 
 test('player center clamps to the executable field insets', () => {

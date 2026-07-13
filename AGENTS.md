@@ -328,7 +328,7 @@ processing frame N-1.
 
 | stage | native PRE evidence | current exact boundary | remaining gap |
 |---|---:|---:|---|
-| 1 | 0..10475 | all captured PRE rows exact; full-stage RNG residue and stage completion exact | behavior is not finished: kills 690 vs original 684 and score 2159704 vs 2446935 |
+| 1 | 0..10475 | all captured PRE rows exact; full-stage RNG residue and stage completion exact | behavior is not finished: kills 689 vs original 684 and score 2159705 vs 2446935 |
 | 2 | 0..12000 | through 10929 | first mismatch PRE 10930 |
 | 3 | 0..12000 | through 7449 | first mismatch PRE 7450 |
 | 4 | 0..19000 | through 15288 | first mismatch PRE 15289 |
@@ -347,6 +347,17 @@ but Lunatic convergence does **not** prove Easy/Normal/Hard convergence.
 Lower ranks select different ECL instructions, formulas, bullet counts, and
 pool-pressure paths; each difficulty still requires its own native replay
 PRE trace and end-state/event verification.
+
+An independent SakuyaA Lunatic LNNN replay (`th7_ud8141.rpy`, local-only)
+now matches native Stage 1 at every captured PRE row 0..10798: input, RNG
+seed, and cumulative raw draw count are exact through the native stage exit;
+the replay has zero unexpected hits, exact RNG residue, and exact collect
+events. Kill/score behavior remains non-exact (707 vs 695 kills; 1818860 vs
+2124762 score), so this is a survival/RNG convergence checkpoint rather than
+full behavior completion. Three shared roots produced the fix: enemy SET_ANM
+retains the wrapper's current sprite pointer, ECL op132 invisibility gates
+off-screen culling, and both directions of the 8-frame option-glide reversal
+advance the old split counter before complementing/advancing the new state.
 
 **Browser Replay preview status:** implemented and browser-verified. The title
 Replay entry opens a browser-local `.rpy` picker (no upload), then uses the

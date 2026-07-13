@@ -3067,13 +3067,19 @@ export class StageScene implements GameHost {
   }
 
   private updateEnemyCull(e: Enemy): void {
-    // FUN_0041ed50 uses the current live ANM sprite dimensions through
-    // FUN_0042bdc7 before advancing that ANM VM. Actors without a drawable
-    // frame never arm the seen-then-offscreen latch.
-    const frame = e.ecl.anmRunner?.spriteFrame();
-    if (!frame) return;
-    const halfW = frame.w / 2;
-    const halfH = frame.h / 2;
+    // ECL op132 writes enemy+0x2e29 bit 3. FUN_0041ed50 @ 0x41f30d
+    // short-circuits the entire seen/off-screen cull while that bit is set;
+    // invisible controller enemies such as Stage-1 Sub43 must therefore
+    // retain their fixed slots even after their paths leave the playfield.
+    if (e.ecl.invisible) return;
+    // FUN_0041ed50 reads the ANM wrapper's current sprite pointer at +0x1e4,
+    // not its render-visible result. Alpha-zero/hidden/waiting scripts still
+    // participate in FUN_0042bdc7 culling as long as a sprite was selected;
+    // only a genuinely null pointer skips the seen/offscreen latch.
+    const size = e.ecl.anmRunner?.spriteSize();
+    if (!size) return;
+    const halfW = size.w / 2;
+    const halfH = size.h / 2;
     const onscreenAt = (x: number, y: number): boolean =>
       x + halfW >= 0 && x - halfW <= 384 &&
       y + halfH >= 0 && y - halfH <= 448;

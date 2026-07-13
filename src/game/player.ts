@@ -337,17 +337,16 @@ export class Player {
     this.focusTransition = null;
     let advancedOnReverse = false;
     if (focused !== this.focusHeld) {
-      const enteringFocus = focused;
       this.focusHeld = focused;
       this.focusTransition = focused ? 'in' : 'out';
       if (this.focusGlideFrame < GLIDE_FRAMES) {
-        // FUN_0043be00's switch cases are deliberately asymmetric. Reversing
-        // state 4 (unfocus -> focus) first advances the OLD split counter,
-        // complements its integer, clears the fraction, then advances state
-        // 2. Reversing state 2 (focus -> unfocus) complements first and only
-        // advances the new state. At rate 1 this makes 5 -> 3 in the former
-        // direction but 4 -> 5 in the latter (native traces f2600/f2395).
-        const oldWhole = Math.floor(this.focusGlideFrame + (enteringFocus ? rate : 0));
+        // FUN_0043be00 states 2 and 4 use the same reversal sequence: advance
+        // the OLD split counter, complement its integer around 8, clear the
+        // old fraction, then advance the NEW state once in the same callback
+        // (all.c:28338-28372). Native th7_ud8141 processing 8631 pins this:
+        // a 5-tick focus-in reversed at input 8615 yields focus-out ticks
+        // 3,4,5, so the option-fired slot 50 starts at (xHalf=14.25,y=-12).
+        const oldWhole = Math.floor(this.focusGlideFrame + rate);
         this.focusGlideFrame = Math.min(GLIDE_FRAMES, GLIDE_FRAMES - oldWhole + rate);
         advancedOnReverse = true;
       } else {

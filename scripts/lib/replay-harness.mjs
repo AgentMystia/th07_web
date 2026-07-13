@@ -112,6 +112,22 @@ export function digestFrame(scene) {
   mix(scene.score >>> 0);
   mix(scene.graze);
   mix(scene.cherry.cherry >>> 0);
+  // Fixed-slot identity/position is gameplay state even before it changes an
+  // aggregate count or RNG draw. Catch allocator/cull drift at its source.
+  for (const enemy of scene.enemies) {
+    mix(enemy.poolSlot);
+    mix(enemy.ecl.subId);
+    mix(Math.round(enemy.x * 8));
+    mix(Math.round(enemy.y * 8));
+  }
+  // Player-shot positions carry the live option-glide clock, so lock the
+  // 96-slot pool before a bad spawn origin becomes a later collision drift.
+  for (const shot of scene.playerBullets) {
+    mix(shot.poolSlot);
+    mix(shot.state === 'fired' ? 1 : 2);
+    mix(Math.round(shot.x * 8));
+    mix(Math.round(shot.y * 8));
+  }
   return h >>> 0;
 }
 

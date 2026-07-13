@@ -5,8 +5,9 @@ import { mkdirSync } from 'node:fs';
 
 const outDir = 'tests/.build/ecl-fidelity';
 mkdirSync(outDir, { recursive: true });
-execSync(`npx esbuild src/game/eclvm.ts src/data/th07-data.ts --bundle --format=esm --outdir=${outDir} --out-extension:.js=.mjs --log-level=silent`);
+execSync(`npx esbuild src/game/eclvm.ts src/formats/anm.ts src/data/th07-data.ts --bundle --format=esm --outdir=${outDir} --out-extension:.js=.mjs --log-level=silent`);
 const { StageRuntime } = await import('../tests/.build/ecl-fidelity/game/eclvm.mjs');
+const { Anm } = await import('../tests/.build/ecl-fidelity/formats/anm.mjs');
 const { TH07_DATA } = await import('../tests/.build/ecl-fidelity/data/th07-data.mjs');
 
 const i32 = (value) => ({ type: 'i32', value });
@@ -108,6 +109,33 @@ function makeRuntime(subs) {
 function close(actual, expected, message) {
   assert.ok(Math.abs(actual - expected) < 1e-6, `${message}: expected ${expected}, got ${actual}`);
 }
+
+test('enemy SET_ANM preserves the native current-sprite pointer across script reset', () => {
+  const enemyAnm = new Anm(TH07_DATA.anm.stg1enm, 'stg1enm');
+  const noAnm = { hasScript: () => false };
+  const runtime = new StageRuntime(
+    { ...TH07_DATA.stages[1], ecl: makeEcl([[]]) },
+    { etama: noAnm, enemy: enemyAnm, effect: noAnm }
+  );
+  const game = makeHost();
+  const enemy = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
+  runtime.anmRng = {
+    u32InRange: () => 3,
+    range: () => 0
+  };
+
+  runtime.setCurrentAnm(enemy, 0);
+  assert.deepEqual(
+    { w: enemy.ecl.anmRunner.spriteFrame().w, h: enemy.ecl.anmRunner.spriteFrame().h },
+    { w: 32, h: 32 }
+  );
+  runtime.setCurrentAnm(enemy, 11);
+  const inherited = enemy.ecl.anmRunner.spriteFrame();
+  assert.ok(inherited, 'script 11 random branch 3 leaves ins_3 untouched and retains script 0 sprite');
+  assert.deepEqual({ x: inherited.x, y: inherited.y, w: inherited.w, h: inherited.h },
+    { x: 0, y: 0, w: 32, h: 32 });
+  assert.equal(inherited.alpha, 0, 'the new script still applies its own time-0 alpha state');
+});
 
 test('ops 10 and 11 apply random sign through their int and float paths', () => {
   const runtime = makeRuntime([[

@@ -230,6 +230,10 @@ export interface AnmRunnerOptions {
   // Anm.entries (0-based, file order). Omit for the plain flat lookup used
   // by every other (single-entry, or non-colliding) caller.
   entryIndex?: number;
+  // FUN_004486e0 reinitializes an embedded ANM VM without clearing the
+  // wrapper's current sprite pointer. Enemy ECL SET_ANM relies on that when
+  // the new script's branch deliberately does not execute ins_3.
+  inheritSpriteFrom?: AnmRunner;
 }
 
 export class AnmRunner {
@@ -287,6 +291,10 @@ export class AnmRunner {
     this.ip = ref.start;
     this.spriteIndexOffset = options.spriteIndexOffset ?? 0;
     this.rng = options.rng;
+    if (options.inheritSpriteFrom?.rect) {
+      this.rect = options.inheritSpriteFrom.rect;
+      this.visible = true;
+    }
     if (options.color != null) {
       this.alpha = (options.color >>> 24) & 0xff;
       this.colorRgb = options.color & 0xffffff;
@@ -677,5 +685,12 @@ export class AnmRunner {
       flipX: false,
       flipY: false
     };
+  }
+
+  // Native entity culling reads the ANM wrapper's current sprite pointer
+  // even when rendering is hidden, alpha-zero, waiting, or removed. Keep
+  // this separate from spriteFrame(), whose null result is a draw decision.
+  spriteSize(): { w: number; h: number } | null {
+    return this.rect ? { w: this.rect.w, h: this.rect.h } : null;
   }
 }
