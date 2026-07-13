@@ -317,138 +317,75 @@ vector cancellation**; real replays contain such chords. Rank
 every rank formula), 32 from stage 2 on; no per-frame increment exists in
 the exe (machine-code scan) — constant within a stage.
 
-### Native replay alignment checkpoint (2026-07-13 preview)
+### Native replay convergence checkpoint (2026-07-13)
 
-This is an evidence boundary, not a declaration that replay alignment is
-finished. It applies only to the committed `th7_udFe25.rpy` fixture
-(SakuyaA, Lunatic). A PRE row compares the original and web engine at the
-beginning of a replay frame: stage, input word, RNG seed, and cumulative raw
-RNG draw counter. Therefore a first mismatch at PRE frame N was caused while
-processing frame N-1.
+Stage 1-6 now converge for two independent SakuyaA Lunatic replays. This is
+an original-behavior checkpoint, not a golden-only assertion: both were run
+without ghosting through the production replay harness, and PASS requires an
+authored stage completion, exact next-stage/end fields, exact per-frame AUX
+kill/collect/player-contact streams, and the original RNG draw residue. A PRE
+row is still defined at the beginning of a replay frame; a mismatch at PRE N
+was caused while processing N-1.
 
-| stage | native PRE evidence | current exact boundary | remaining gap |
-|---|---:|---:|---|
-| 1 | 0..10475 | all captured PRE rows exact; full-stage RNG residue and stage completion exact | behavior is not finished: kills 689 vs original 684 and score 2159705 vs 2446935 |
-| 2 | 0..12000 | every captured PRE row exact | acquire and compare the untraced 12001..13705 tail |
-| 3 | 0..12000 | every captured PRE row exact | acquire and compare the untraced 12001..15678 tail |
-| 4 | 0..19000 | every captured PRE row exact | acquire and compare the untraced 19001..24445 tail |
-| 5 | 0..12000 | through 10990 | first mismatch PRE 10991 (transient; first sustained range starts 11197) |
-| 6 | 0..26433 | through 17343 | first mismatch PRE 17344 (transient; first sustained range starts 24423) |
+Committed fixture `tests/replays/th7_udFe25.rpy`:
 
-The current worktree contains broadly shared engine corrections, including
-fixed-slot allocation/iteration (480 enemies, 96 player shots, 112 attack
-slots, 1024 enemy bullets, and the fixed effect pool), per-enemy immediate
-player-shot collision/death ordering, spawn-frame shot timing, ECL variable
-typing/call/return/periodic-sub clocks, progressive bullet EX behavior
-promotion, replay RNG bootstrap/counting, native float staging, split clocks,
-rank/cherry/dialogue scheduling, and stronger replay event/RNG verification.
-These roots are engine-wide and are expected to improve every difficulty,
-but Lunatic convergence does **not** prove Easy/Normal/Hard convergence.
-Lower ranks select different ECL instructions, formulas, bullet counts, and
-pool-pressure paths; each difficulty still requires its own native replay
-PRE trace and end-state/event verification.
+| stage | frames run/available | kills | collects | player contacts | RNG |
+|---|---:|---:|---:|---:|---|
+| 1 | 10476/10477 | 684 exact | 382 exact | 0 exact | 163385, residue exact |
+| 2 | 13705/13706 | 396 exact | 494 exact | 0 exact | 203224, residue exact |
+| 3 | 15678/15679 | 410 exact | 635 exact | 0 exact | 258253, residue exact |
+| 4 | 24445/24446 | 1050 exact | 1056 exact | 0 exact | 279512, residue exact |
+| 5 | 19377/19378 | 412 exact | 545 exact | 1 exact | 379003, residue exact |
+| 6 | 26434/26436 | 279 exact | 1095 exact | 0 exact | final-stage seed unavailable |
 
-Stage 2's former PRE10930 split was the op52 right-wall branch's original
-bug: Th07.exe reads the previous live movement heading at enemy+0x2b54,
-whereas the port read its separate mode-1 polar angle. That displaced the
-boss enough to create an early SakuyaA knife collision/id5 draw. Reading
-`heading` (and publishing op54's duration-zero heading immediately) makes all
-12001 captured native PRE rows through frame 12000 exact. The untraced tail is
-still required before declaring the whole stage converged.
+Stage 5's one contact is present in the original AUX stream and is not a
+false death. Stage 6 has one recorder-metadata anomaly: the RPY stores score
+116283035, while Th07.exe v1.00b's live field and the web engine both retain
+116283036 (native PRE25779..26433, `DAT_0061c258+4`). `replay:verify`
+reports this as an explicit advisory rather than treating the stale metadata
+word as behavior truth.
 
-Stage 3's former PRE7450/8393 splits were both shared engine roots. Bullet
-effect id6 (`FUN_00417440`) constructs three real enemy-bullet rings with
-zero RNG rather than generic particles. Then `FUN_004173d0` revealed that
-effect id5 writes the tracked boss's current +0x2b0c/10/14 position into the
-helper's +0x2b8c/90/94 orbit center; copying the boss's own `orbitTarget`
-left the helper ring offset by (-4.04,+12.29), making fixed bullet slot 990
-graze four frames early. Correcting both makes every captured PRE row through
-12000 exact. Ops54/55 also publish their current mode-2 origin into the same
-shared +0x2b8c/90/94 fields, per FUN_0040e850/FUN_0040ea90.
+Independent local LNNN replay `th7_ud8141.rpy` also passes all six stages:
+kills are 695/390/351/919/397/279, collects are
+408/490/493/491/372/1144, all six player-contact streams are zero, and every
+available RNG residue is exact. The file is local evidence and must not be
+committed.
 
-Stage 4 advanced from PRE15289 through the entire captured frame-19000 window
-through three independent native corrections. Op47 writes Cartesian vx/vy/vz
-directly; it is not
-an angle/speed operation. Laser grow->hold and hold->shrink transitions test
-collision in both the ending and entering state in one manager pass before
-the common phase-counter tail. Finally, FUN_0041a600/FUN_0041a8d0 stage ids
-26/27 world-particle Z as `frand*100-50`; the old `-frand-50` collapsed the
-particles into a one-unit slab and exposed 24 false free effect slots. At
-processing frame 17526 the corrected 400-slot pressure accepts exactly 58
-id17 particles, rejects all three later id5 requests, consumes the native 348
-raw draws, and removes the former PRE17527 split.
+The convergence came from shared engine roots, not replay-specific draw
+tuning: fixed-capacity slot allocation and manager order; immediate
+enemy-outer shot collision/death processing; native ECL variable typing and
+call/return/periodic clocks; progressive bullet-EX promotion; raw FIRE
+endpoints and float32 constructor staging; float32 enemy writes, mode-2/
+mode-3 interpolation, op87 anchors, laser transitions and player-shot AABBs;
+Border/invulnerability/slowmo split clocks; item/cancel/Cherry/clear-bonus
+ordering; MSG op9/op11 settlement; and exact effect-pool pressure. The last
+independent Stage-4 split was a mode-2 float64 residue at x=191.9997406 that
+broke an original strict SakuyaA target tie; native f32 staging leaves both
+targets at x=192 and retains the first fixed slot. Effects 7 and 8 also
+perform the executable's template-5 ANM reset after a laser deflection.
 
-Stage 5 spell 75, 獄神剣「業風神閃斬」, has its missing slash barrage fixed.
-Bullet effects 12/21 are not generic visual-particle bursts: FUN_00418260 /
-FUN_00418bc0 build FIRE templates and call the real enemy-bullet constructor
-FUN_00423480. On Lunatic, each cut 大玉 emits 25 (id12) or 15 (id21) real,
-collidable small bullets; every child consumes nine raw RNG draws and carries
-the authored 100-tick opcode-0x20 acceleration. Browser spell-75 probing now
-shows 42 large bullets becoming 717 same-frame surviving children with no
-page errors. This fixes the pattern itself but does not move Stage 5's earlier
-PRE boundary by itself.
+These corrections are engine-wide, but two Lunatic replays do **not** prove
+Easy/Normal/Hard convergence. Lower ranks select different ECL instructions,
+formulas, bullet counts, and pool-pressure paths. Each difficulty still needs
+its own native replay PRE trace plus full event/end-state verification.
 
-Stage 5's former PRE8198 split was an op138 fixed-slot lifetime error.
-FUN_0041d190 initializes all 96 template history X fields at enemy+0x2f78 to
--999.0; Y/Z remain zero, and the validity gate is X>=-990. Zero-filling those
-entries made an unwritten trail tail look on-screen, retaining enemy slot 2
-past PRE8168 and displacing the next actor to slot 7. That changed SakuyaA's
-target/player-shot slots and removed one native id5 at processing 8197.
-Restoring the sentinel moves the first mismatch to transient PRE10991-10992;
-another transient occurs at 10997-10998, and the first sustained range starts
-at PRE11197. That sustained split is the spell-75 slash at processing 11196:
-the web constructs 730 children and native consumes exactly 45 more raw draws,
-equivalent to five more children at the proven nine-draw cost. The child
-constructor/order is exact; continue by tracing which additional large parent
-bullet survives or lies inside the native cut band. Both native handlers gate
-on sprite descriptor HEIGHT (+0x2c)>48, not max(width,height); this semantic is
-already corrected but all parents at the current boundary are 64x64, so it
-does not explain the remaining five-child difference.
+### Next-session fidelity workflow
 
-Stage 6's former PRE8167 split was stale FIRE/op79 state crossing a retained
-boss callback. HP thresholds, timeouts, and retained death callbacks all copy
-the 0x35-dword `DAT_009a26bc` template over enemy+0x2bd4 and clear +0x2ca8
-(FUN_0041e4a0/FUN_0041e6b0/FUN_0041ed50). Resetting bulletProps, all five
-op79 slots, op81 sound state, and auto-fire interval makes PRE0..12000 exact;
-the split counter at +0x2cac..+0x2cb4 is outside the copied block and remains
-live. Native capture now reaches PRE26433. Exactness continues through 17343;
-PRE17344 is a one-frame +4 id5 caused by player-shot slot 6 reaching a collision
-boundary about one frame early (roughly 1e-3 velocity / 1e-2 position drift),
-then resynchronizes at 17345. PRE17345..24422 are exact. The first sustained
-mismatch begins at PRE24423: processing 24422 is native +12 versus web +4,
-and the web sees one id8 graze. Trace whether native performs three separate
-grazes or one count-3 branch; do not infer the cause from the end-stage
-aggregate.
-
-### Next-session replay convergence startup
-
-1. Preserve unrelated worktree state (`FIX-REPORT.md`, `issues/`, `output/`,
-   local replays/traces). Run `git status`, `npm run check`, then confirm the
-   checkpoint table with no-ghost PRE comparison before changing gameplay.
-2. Resume from the earliest unresolved events: Stage 5 processing 10990/10996
-   (transient id5 differences) then 11196 (sustained); Stage 6 processing
-   17343 (transient) then 24422 (sustained). In parallel, acquire the untraced
-   Stage 2/3/4 tails.
-3. At each boundary trace native and web fixed enemy/player-shot/effect/bullet
-   slots plus per-draw caller labels. Fix the deterministic state/order root;
-   never add a compensating draw or tune a particle count to match residue.
-4. Add a focused exe-proven regression, re-run every already-captured stage
-   window immediately, and only then advance to the next mismatch. Ghost may
-   inspect later phases but never establishes a PRE acceptance boundary.
-5. Regenerate replay golden only after the original behavior change is proven.
-   Before the next checkpoint commit run §4/§5's full test, clean boot,
-   browser replay, Stage-5 spell-75 probe, and pixel-report loop.
-
-An independent SakuyaA Lunatic LNNN replay (`th7_ud8141.rpy`, local-only)
-now matches native Stage 1 at every captured PRE row 0..10798: input, RNG
-seed, and cumulative raw draw count are exact through the native stage exit;
-the replay has zero unexpected hits, exact RNG residue, and exact collect
-events. Kill/score behavior remains non-exact (707 vs 695 kills; 1818860 vs
-2124762 score), so this is a survival/RNG convergence checkpoint rather than
-full behavior completion. Three shared roots produced the fix: enemy SET_ANM
-retains the wrapper's current sprite pointer, ECL op132 invisibility gates
-off-screen culling, and both directions of the 8-frame option-glide reversal
-advance the old split counter before complementing/advancing the new state.
+1. Preserve unrelated worktree state and all local evidence. Never commit
+   `reference/`, native traces, screenshots, local replays, `tmp/`, `issues/`,
+   or `output/`.
+2. Re-establish this checkpoint with `npm run replay:verify`, then run the
+   replay under investigation without ghosting. Ghost is diagnostic only.
+3. At the earliest PRE mismatch, trace native and web fixed enemy,
+   player-shot, attack, effect, laser, and enemy-bullet slots plus the exact
+   caller/event order. Fix the deterministic upstream root; never compensate
+   with an invented RNG draw, count, position epsilon, or replay special case.
+4. Add an exe/data-proven focused regression, immediately rerun every already
+   converged replay, and regenerate a replay golden only after the original
+   behavior change is demonstrated independently.
+5. Before a checkpoint commit, run §4/§5 in full: check, build, tests,
+   `replay:verify`, clean boot, browser replay, standard Stage-1 snapshots,
+   and pixel reports. See `HANDOFF.md` for the concise command list.
 
 **Browser Replay preview status:** implemented and browser-verified. The title
 Replay entry opens a browser-local `.rpy` picker (no upload), then uses the
@@ -463,9 +400,11 @@ the native leading-byte offset and discrete cadence buckets; skippable-dialogue
 and boss-only fast-forward repeat the manager chain to their native modulo
 boundaries. Files and decompressed bodies are capped at 16 MiB. Verify the
 real browser path with `npm run replay:browser -- <file.rpy> [stage] [frames] [shot.png] [mode]`;
-Stage 1 frame 300 and Stage 5's frame-4820 Youmu dialogue
-were observed through this path without page errors, and all three modes plus
-pause cursor ownership were exercised.
+Stage 1 frame 300 and Stage 5 frame 4881 (Youmu portrait plus
+`あなた、人間ね`) were observed through this path without page errors, and
+all three modes plus pause cursor ownership were exercised. CI runs
+`npm run replay:verify` before the Pages build, so Stage 1-6 convergence is a
+deployment gate rather than a manual-only checkpoint.
 
 ## 7. Approximations registry (known, flagged, improvable)
 
@@ -554,75 +493,23 @@ comparisons against real play).
 - Supernatural Border ring remains procedural (no ANM source recovered);
   it now closes fully at expiry and the playfield carries the exe's
   30/480/30 tint envelope (FUN_0043e2e0 state 4).
-- Decorative ambient particles (ECL op117/118 → `spawnEffectParticles`): the
-  VISUAL is approximate but the per-particle **RNG draw count is exe-exact**
-  for the types stage 1 uses, because all effects share the one gameplay RNG
-  stream (state 0x495e00) so a wrong draw count desyncs bullet/fire timing.
-  Costs are the `DAT_00494fb0` spawnVetoFn (binary-read; paired perFrameGateFn
-  draws 0): effectId 17→2, 20→22, 22→2-or-4 (4 only for the ≤−990
-  random-angle sentinel; ordinary signed launch-x uses 2 — FUN_0041b020's
-  threshold is the f64 −990.0 at 0x48ec28, not the low-dword float 0.0).
-  `EFFECT_DRAW_COST`
-  in stage-scene.ts. The full effect-family veto costs (binary, effect table @
-  file 0x933b0): ids 0/1/2 NULL=0; id3=FUN_00419700=4; id4/5/6=FUN_004194d0=4.
-  **Draw-model DERIVED + VERIFIED; death-model wiring remains blocked on exact
-  event order** (2026-07-13):
-  - **Enemy death** (`spawnEnemyDeathEffect`, legacy id3×12=72). Exe FUN_0041ed50
-    per-enemy death switch (all.c 14324-14370) BRANCHES ON `0x2e10` = **itemDrop**
-    (ECL var 10070, NOT a death-script — this corrects the earlier note):
-    itemDrop==−1 (random; 160 of 208 st1 deaths) → 1-in-3 GLOBAL-counter id4×6 +
-    id0×1 + id4×4 = 16 ⅔ / 40 ⅓; itemDrop≥0 (specific; 47) → id4×3 + id0×1 + id4×4
-    = **28** (= iter-4's "28", which was right for these); itemDrop==−2 (none; 1) →
-    16. id0=0, id4=4 draws; items NOT rand-scattered (`FUN_00430970` mode-2
-    unreachable from death). Fire is exact already: op67 aimMode-3 deterministic
-    (0 draws); op74 draws u32InRange ONCE at arm (2), autofire re-arm to 0.
-    ⚠ EXHAUSTIVELY TESTED (this session, all WITH the restructure): every death
-    model — 16, 28, the correct itemDrop-branched one — gives kill-match ~102, ALL
-    worse than the legacy id3×12's 131. Death draws can't be fixed in isolation:
-    the item→power→DPS→kill-timing ripple means the UPSTREAM stream must be exact
-    first. Do not re-attempt the death model without the full-exact stream.
-  - **id5 impact spark**: exe spawns it in the player-shot-vs-enemy collision
-    `FUN_0043a980` (all.c:14176) — one id5/id3 (both 4 draws) per bullet's first
-    enemy hit + every 4th hit (global `&3` counter, id3 if slot<96 else id5). Our
-    first-hit spark (stage-scene 2067) matches per-bullet; laser/missile cadences
-    (%8, %6) are Sakuya-irrelevant.
-  - **Collision/order restructure LANDED.** `FUN_0043a980` runs inside the enemy
-    manager, per enemy in slot order: fire → player-shot/attack collision with
-    immediate damage (id5) → death (id0/id4). Commit 0be941c moved the port to
-    that enemy-outer, same-frame-death shape; the current worktree also uses
-    sparse fixed-slot allocation/ascending iteration for enemies, player shots,
-    attack slots, bullets, and effects. Freshly fired player shots skip their
-    spawn-frame move (3a1d0bf), matching the native player-subsystem order.
-    These deterministic changes produced durable alignment gains. Do not undo
-    them because an aggregate kill or death metric temporarily looks worse.
-    The remaining Stage 4/5 first divergences are now isolated much later
-    and mostly involve individual id5/id8 event differences; trace the exact
-    native fixed slot/caller at those frames before changing any draw model.
-  - ★ THE PRODUCTIVE LEVER = PRINCIPLED DETERMINISTIC ORDERING FIXES (not RNG-draw
-    tweaks). Two landed this session: 0be941c (same-frame death) and 3a1d0bf
-    (freshly-fired bullets skip their spawn-frame move — exe fires AFTER
-    integrating existing bullets, both before the enemy-mgr collision, so a new
-    bullet is at spawn pos when first collided). The latter moved st1 first
-    kill-divergence 622→718 and first-death 1786→1946. To find more: the exe
-    sequences per-frame subsystems via priority-ordered manager lists
-    (FUN_0042e290 registers, FUN_0042e800 runs `&DAT_012f41f0`; enemy mgr
-    FUN_0041ed50 = priority 10) — trace that full order and match ours
-    (updatePlayerBullets→updateEnemies→updateBullets→updateLasers→
-    checkPlayerCollision→updateItems). Player MOVEMENT order is NOT an issue
-    (recorded input applies once to the same end position).
-  - CAUTION: the ghost full-stage budget (163,385) is CONFOUNDED — a post-boss
-    dialogue freezes our sim ~3400f, starving snow the exe also freezes. Judge
-    pre-1800 by the non-ghost first-death frame, not the aggregate. Decompose
-    pre-1800 draws with a spawnEffectParticles hook (see tmp/nonsnow-1800.mjs
-    pattern): @1800 = snow 33704 (faithful) + death 1640 + id5 + gameplay 140.
-  - **Current scope:** the shared manager-order/fixed-slot work is implemented,
-    not pending. Continue from the native PRE boundaries in the checkpoint
-    table above. Stage 1 has exact full-stage RNG residue but still-wrong kill
-    and score streams; Stage 2/3/6 are exact only through their captured PRE
-    windows; Stage 4/5 split on a small number of fixed-slot effect/collision
-    events. The next work is focused native event/slot tracing at those
-    boundaries and tail capture, not another wholesale collision rewrite and
-    not an RNG-budget adjustment.
+- Decorative ambient particles (ECL op117/118 → `spawnEffectParticles`) keep
+  approximate raster presentation, but their allocation, fixed 400-slot
+  pressure, release clocks, and RNG consumption are executable-derived for
+  every Stage-1..6 family exercised by the converged replays. Representative
+  veto costs from `DAT_00494fb0`: effect 17→2 raw draws, 20→22, and 22→2 or
+  4 (the four-draw branch is only the ≤−990 sentinel). World families 26/27
+  use `frand*100-50` Z spread and share FUN_0041a050 release semantics.
+- Enemy death/drop effects are no longer an aggregate approximation. The
+  enemy manager performs fire → player-shot/attack collision → immediate
+  damage → death in fixed slot order. FUN_0041ed50's itemDrop branch, global
+  1-in-3 random-drop counter, preburst, item construction, boss sweep, common
+  effects, and id5 impact cadence run in their executable order. Preserve this
+  shape; changing a draw total in isolation will desynchronize item→power→DPS
+  and later fixed slots even if an aggregate residue happens to match.
+- Ghost runs remain diagnostic-only. Dialogue, death consequences and manager
+  lifetime can change how long ambient generators run, so only a no-ghost
+  original replay establishes acceptance. `replay:verify` enforces this.
 
 ## 8. Pitfall catalog (check these FIRST when something looks wrong)
 
