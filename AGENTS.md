@@ -240,8 +240,13 @@ float: base+rng01()*range from 10033/10034); 10055 is a raw rng draw;
 10060 is a random angle in [−π, π). op92/93 children inherit a copy of
 the parent's whole block (FUN_0041db60). Rank masks gate spawns by
 difficulty — verify changes on Lunatic (`difficulty=3`), which exercises
-paths lower ranks never touch. Spell names (op 90) are XOR-0xAA-obscured
-Shift-JIS, terminated by a 0xAA byte.
+paths lower ranks never touch. FIRE copies the enemy's five op79 entries into
+each bullet; `FUN_004229f0` promotes at most one movement behavior per normal
+bullet-manager tick (construction promotes the first, spawn states pause the
+queue, their transition tick resumes it). Unselected and opcode-0x2000 grace
+entries may be skipped in the same pass without consuming that one-slot
+budget. Spell names (op 90) are XOR-0xAA-obscured Shift-JIS, terminated by a
+0xAA byte.
 
 **MSG** (`src/game/dialogue.ts`): ops 0 end, 1 portrait enter, 2 face,
 3 text line, 4 wait, 5 portrait state, 6 ECL resume ticket, 7 BGM, 8 boss
@@ -312,18 +317,60 @@ vector cancellation**; real replays contain such chords. Rank
 every rank formula), 32 from stage 2 on; no per-frame increment exists in
 the exe (machine-code scan) — constant within a stage.
 
+### Native replay alignment checkpoint (2026-07-13 preview)
+
+This is an evidence boundary, not a declaration that replay alignment is
+finished. It applies only to the committed `th7_udFe25.rpy` fixture
+(SakuyaA, Lunatic). A PRE row compares the original and web engine at the
+beginning of a replay frame: stage, input word, RNG seed, and cumulative raw
+RNG draw counter. Therefore a first mismatch at PRE frame N was caused while
+processing frame N-1.
+
+| stage | native PRE evidence | current exact boundary | remaining gap |
+|---|---:|---:|---|
+| 1 | 0..10475 | all captured PRE rows exact; full-stage RNG residue and stage completion exact | behavior is not finished: kills 690 vs original 684 and score 2159704 vs 2446935 |
+| 2 | 0..12000 | through 10929 | first mismatch PRE 10930 |
+| 3 | 0..12000 | through 7449 | first mismatch PRE 7450 |
+| 4 | 0..19000 | through 15288 | first mismatch PRE 15289 |
+| 5 | 0..12000 | through 8197 | first mismatch PRE 8198 |
+| 6 | 0..7574 | every captured row exact | acquire and compare the untraced remainder of the 26436-frame stage |
+
+The current worktree contains broadly shared engine corrections, including
+fixed-slot allocation/iteration (480 enemies, 96 player shots, 112 attack
+slots, 1024 enemy bullets, and the fixed effect pool), per-enemy immediate
+player-shot collision/death ordering, spawn-frame shot timing, ECL variable
+typing/call/return/periodic-sub clocks, progressive bullet EX behavior
+promotion, replay RNG bootstrap/counting, native float staging, split clocks,
+rank/cherry/dialogue scheduling, and stronger replay event/RNG verification.
+These roots are engine-wide and are expected to improve every difficulty,
+but Lunatic convergence does **not** prove Easy/Normal/Hard convergence.
+Lower ranks select different ECL instructions, formulas, bullet counts, and
+pool-pressure paths; each difficulty still requires its own native replay
+PRE trace and end-state/event verification.
+
+**Browser Replay preview status:** implemented and browser-verified. The title
+Replay entry opens a browser-local `.rpy` picker (no upload), then uses the
+authored `replay00.png` layer for replay metadata, present-stage selection,
+and the original three-mode confirmation (normal, recorded-slowdown, and
+boss-only). Playback uses the production `Rpy`/`ReplayInputSource`, restores
+the native stage snapshot after seed/bootstrap initialization, continues only
+through physically adjacent stage slots, and maps the shared seventh slot to
+Extra or Phantasm as the difficulty requires. Live ESC owns the two-row replay
+pause menu and never consumes a recorded frame. Slowdown trailers preserve
+the native leading-byte offset and discrete cadence buckets; skippable-dialogue
+and boss-only fast-forward repeat the manager chain to their native modulo
+boundaries. Files and decompressed bodies are capped at 16 MiB. Verify the
+real browser path with `npm run replay:browser -- <file.rpy> [stage] [frames] [shot.png] [mode]`;
+Stage 1 frame 300 and Stage 5's frame-4820 Youmu dialogue
+were observed through this path without page errors, and all three modes plus
+pause cursor ownership were exercised.
+
 ## 7. Approximations registry (known, flagged, improvable)
 
 Each also has an inline comment at its code site. Do not silently "fix"
 gameplay to taste — improve these only with better evidence (Ghidra, frame
 comparisons against real play).
 
-- Rank progression across stages: recorded evidence pins 16 at run start and
-  32 from stage 2 onward, constant within a stage; the port models the step
-  as +16 per stage clear capped at 32 (`carryState()`), but jump-to-32 on the
-  first clear fits the same data. Replay verification is immune (per-stage
-  recorded byte is used); only multi-stage live play could differ, and only
-  if the true rule is neither.
 - Frame tiling positions (exact-fit math, engine placement not literal).
 - HUD star icon x positions; spell-timer and fps exact placement.
 - Cherry+ banner interrupt→state mapping (dim=charging, bright=border).
@@ -344,8 +391,6 @@ comparisons against real play).
 - Floating score/Cherry popups implemented (spec-popups.md): two ring pools,
   distance-from-player alpha pulse, full color/value rules incl. the
   phase-end escalating sweeps and the red cherry-gain popups.
-- EX bullet behaviors activate all-at-once at spawn; the exe arms one op-79
-  slot per frame (≤N-frame phase error, N = #armed slots).
 - Spell-bonus decay rounding: exe writes `floor10(ftol(<register-arg float
   expr>))` per frame (0x41f8a8 region); the port computes
   `floor10(base − decayPerSec·elapsed/60)`. Sub-10-point drift only.
@@ -399,10 +444,14 @@ comparisons against real play).
   for the types stage 1 uses, because all effects share the one gameplay RNG
   stream (state 0x495e00) so a wrong draw count desyncs bullet/fire timing.
   Costs are the `DAT_00494fb0` spawnVetoFn (binary-read; paired perFrameGateFn
-  draws 0): effectId 17→2, 20→22, 22→2-or-4 (4 if launch vx≤0). `EFFECT_DRAW_COST`
+  draws 0): effectId 17→2, 20→22, 22→2-or-4 (4 only for the ≤−990
+  random-angle sentinel; ordinary signed launch-x uses 2 — FUN_0041b020's
+  threshold is the f64 −990.0 at 0x48ec28, not the low-dword float 0.0).
+  `EFFECT_DRAW_COST`
   in stage-scene.ts. The full effect-family veto costs (binary, effect table @
   file 0x933b0): ids 0/1/2 NULL=0; id3=FUN_00419700=4; id4/5/6=FUN_004194d0=4.
-  **Draw-model DERIVED + VERIFIED, wiring BLOCKED on draw order** (2026-07-12):
+  **Draw-model DERIVED + VERIFIED; death-model wiring remains blocked on exact
+  event order** (2026-07-13):
   - **Enemy death** (`spawnEnemyDeathEffect`, legacy id3×12=72). Exe FUN_0041ed50
     per-enemy death switch (all.c 14324-14370) BRANCHES ON `0x2e10` = **itemDrop**
     (ECL var 10070, NOT a death-script — this corrects the earlier note):
@@ -422,33 +471,18 @@ comparisons against real play).
     enemy hit + every 4th hit (global `&3` counter, id3 if slot<96 else id5). Our
     first-hit spark (stage-scene 2067) matches per-bullet; laser/missile cadences
     (%8, %6) are Sakuya-irrelevant.
-  - **THE BLOCKER — draw ORDER.** `FUN_0043a980` runs INSIDE the enemy manager,
-    PER ENEMY in slot order: fire → player-shot collision+damage (id5) → death
-    (id0/id4), with IMMEDIATE damage. Our engine runs a SEPARATE
-    `updatePlayerBullets` collision pass with DEFERRED (next-frame) damage, so
-    id5/death/snow draws interleave in a different stream order. Snow (id20) IS
-    exe-faithful (deterministic Sub1 loops, matches to the particle pre-1800).
-    Wiring the death/cost model in ISOLATION only shifts the hypersensitive
-    first-death frame (1938→1762) — no alignment gain. **The collision
-    restructure is now DONE (commit 0be941c): per-enemy enemy-outer collision +
-    IMMEDIATE same-frame damage (updateEnemies / collidePlayerShots), enemies now
-    die the frame of the killing hit → ghost kill-match 88→131.** But wiring the
-    death model ON TOP regressed kill-match 131→101 — the exact death model +
-    id5 every-4th-hit cadence must go in TOGETHER (and for Sakuya the every-4th
-    cadence is empty, so the regression points at the global 1-in-3 death counter
-    or death-draw ordering — investigate before re-wiring). MEASURED: the id0+id4
-    16-draw model gives kill-match 107 < the legacy id3×12's 131 — tweaking
-    death-draw COUNT is noise-chasing (ghost kill-match ripples RNG→item-scatter
-    →power→DPS→kill-timing; nothing aligns until the WHOLE stream is exact). The
-    restructure's win is instead a DETERMINISTIC timing fix (same-frame death) —
-    that is why it is robust. NEXT PRINCIPLED STEP (validated — enemy PROCESSING
-    order matters: reversing updateEnemies drops kill-match 131→106): make enemy
-    (and bullet) iteration SLOT-FAITHFUL. The exe reuses freed slots (first-free
-    ring); our compacted array appends, diverging after out-of-order deaths. Needs
-    a sparse enemy array (holes for freed slots; iterate slots ascending so a
-    same-frame respawn into an already-passed low slot defers to next frame, as
-    the exe does) — a real refactor touching every `this.enemies` iterator, a
-    dedicated effort. UPDATE: implemented it — only +1 (131→132), negligible.
+  - **Collision/order restructure LANDED.** `FUN_0043a980` runs inside the enemy
+    manager, per enemy in slot order: fire → player-shot/attack collision with
+    immediate damage (id5) → death (id0/id4). Commit 0be941c moved the port to
+    that enemy-outer, same-frame-death shape; the current worktree also uses
+    sparse fixed-slot allocation/ascending iteration for enemies, player shots,
+    attack slots, bullets, and effects. Freshly fired player shots skip their
+    spawn-frame move (3a1d0bf), matching the native player-subsystem order.
+    These deterministic changes produced durable alignment gains. Do not undo
+    them because an aggregate kill or death metric temporarily looks worse.
+    The remaining Stage 2/3/4/5 first divergences are now isolated much later
+    and mostly involve individual id5/id8 event differences; trace the exact
+    native fixed slot/caller at those frames before changing any draw model.
   - ★ THE PRODUCTIVE LEVER = PRINCIPLED DETERMINISTIC ORDERING FIXES (not RNG-draw
     tweaks). Two landed this session: 0be941c (same-frame death) and 3a1d0bf
     (freshly-fired bullets skip their spawn-frame move — exe fires AFTER
@@ -466,22 +500,13 @@ comparisons against real play).
     pre-1800 by the non-ghost first-death frame, not the aggregate. Decompose
     pre-1800 draws with a spawnEffectParticles hook (see tmp/nonsnow-1800.mjs
     pattern): @1800 = snow 33704 (faithful) + death 1640 + id5 + gameplay 140.
-  - SCOPE OF THE FIX (all 6 stages share this — `replay-verify` no-arg triage:
-    first false-death st1@1938 st2@1040 st3@1181 st4@1036 st5@1093 st6@938, ALL
-    the same RNG-stream desync). The "restructure" is really a SLOT-FAITHFUL
-    rewrite of the collision + enemy-manager, and it is all-or-nothing (a
-    hypersensitive metric — no partial credit). Exe frame shape to reproduce:
-    player subsystem `FUN_0043eef0` (bullet MOVE `FUN_0043a290`@29061 → fire
-    `FUN_0043a820` → homing `FUN_0043edc0`), THEN enemy manager `FUN_0041ed50`
-    which, PER ENEMY in slot order, does fire(`FUN_0040f6c0`) → player-shot
-    collision+immediate-damage(`FUN_0043a980`@14176, iterating 96 bullet + 112
-    attack SLOTS, spawning id5) → death(id0/id4). Byte-exactness needs our
-    dynamic bullet/enemy arrays to iterate in the exe's FIXED-SLOT order (slot
-    allocation = first-free ring), plus immediate (not deferred) damage. Our
-    `settlePendingDamage`-before-ECL already preserves the fire-sees-prev-frame-
-    HP ordering, so moving it after the per-enemy collision is safe; the change
-    that matters is same-frame death + per-enemy id5 draw order. This is a
-    dedicated multi-session effort — do NOT wire the death/cost model without it.
+  - **Current scope:** the shared manager-order/fixed-slot work is implemented,
+    not pending. Continue from the native PRE boundaries in the checkpoint
+    table above. Stage 1 has exact full-stage RNG residue but still-wrong kill
+    and score streams; Stage 2–5 first split on a small number of effect draws;
+    Stage 6 is exact through every captured PRE row. The next work is focused
+    native event/slot tracing at those boundaries, not another wholesale
+    collision rewrite and not an RNG-budget adjustment.
 
 ## 8. Pitfall catalog (check these FIRST when something looks wrong)
 
@@ -494,7 +519,7 @@ comparisons against real play).
   entry-scoped script/sprite id collision (multi-entry ANM).
 - **Phantom TypeScript null errors in one function** → unreachable code
   above (leftover debug `return`), which kills narrowing.
-- **Shots fire late / wrong cadence** → 60-frame cycle, delay-0 fires on
+- **Shots fire late / wrong cadence** → 30-frame cycle, delay-0 fires on
   press frame, focused/unfocused table switch.
 - **Boss fight background/state weirdness** → the STD clock *loops* via
   op 4; anything keyed to raw stage frame instead of the STD clock drifts.
@@ -513,21 +538,17 @@ comparisons against real play).
   (op94/op91/boss non-spell death) must only set HP=0, not delete;
   non-interactable enemies (op116(0)) are spared by the exe (removal is the
   interactable-gated death switch). Deleting them kills ambient emitters.
-- **A death "fix" moves the first divergence EARLIER** → the stage-1 first-death
-  frame (1938) is a HYPERSENSITIVE, NON-MONOTONIC proxy: it's a *lucky* desync
-  (the old wrong death draws happened to make the killing op74 fairy fire
-  survivably). ANY draw-count change — even an exe-VERIFIED one — reshuffles
-  which fairy's `rand%interval` clips the player, so correct fixes regress it.
-  Do NOT chase this frame with isolated fixes. Alignment is all-or-nothing:
-  every pre-1800 draw must match in COUNT *and* STREAM ORDER simultaneously.
-  Snow is faithful; the remaining stage-1 desync is draw ORDER — the exe does
-  player-shot collision (id5) + death PER-ENEMY inside the enemy loop with
-  immediate damage (§7), which our separate deferred-damage pass reorders.
-- **The ghost full-stage RNG budget disagrees with reality** → it's CONFOUNDED
-  past the boss: a post-boss dialogue freezes our sim ~3400 frames (6856→10259
-  in ghost), starving the snow generator that the exe *also* freezes, so
-  ~26k "missing" draws are a ghost-timing artifact, not fidelity. Measure
-  pre-1800 (non-ghost first-death) instead.
+- **An exe-verified effect cost moves a proven PRE boundary earlier** → do not
+  keep it in isolation merely because its aggregate draw count is plausible.
+  Kill timing changes item/power/DPS and later event order, so false-death and
+  full-stage budgets are hypersensitive, non-monotonic proxies. Identify the
+  exact native caller, fixed slot, and stream position at the current earliest
+  mismatch, then land all causally coupled cadence/order changes together.
+- **A ghost full-stage RNG budget disagrees with a no-ghost PRE trace** → trust
+  the no-ghost PRE trace. Ghosting changes death consequences and post-boss
+  dialogue timing, which changes how long ambient generators run. Acceptance
+  is the original replay without ghosting; use ghost only to inspect otherwise
+  unreachable later state.
 - **Probe reads flat where content belongs** → check the snapshot first:
   if the simulation state is right (entities exist), the defect is in
   rendering (anchor, entry-scoped ids, clip, alpha); if the state is wrong
