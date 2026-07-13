@@ -253,6 +253,21 @@ test('op100 allocates the native id13 aura at the enemy position', () => {
   }]);
 });
 
+test('op47 writes Cartesian velocity and publishes its live heading', () => {
+  const runtime = makeRuntime([[
+    instruction(0, 47, [f32(3), f32(-4), f32(1.25)])
+  ]]);
+  const game = makeHost();
+  const enemy = runtime.spawnEclEnemy(game, { subId: 0, x: 100, y: 200 });
+
+  assert.deepEqual(enemy.ecl.axisSpeed, { x: 3, y: -4, z: 1.25 });
+  close(enemy.ecl.heading, Math.fround(Math.atan2(-4, 3)), 'op47 heading');
+  close(enemy.ecl.angle, enemy.ecl.heading, 'mode-1 alias follows native +0x2b54');
+  assert.equal(enemy.ecl.moveMode, 0);
+  assert.deepEqual([enemy.x, enemy.y, enemy.z], [100, 200, 0],
+    'allocator core does not integrate the Cartesian velocity');
+});
+
 test('op51 is the generic ranged float draw; op52 chooses a player-side movement cone', () => {
   const ranged = makeRuntime([[
     instruction(0, 51, [f32(10004), f32(-2), f32(6)])
@@ -297,6 +312,19 @@ test('op52 reflects at op62 margins and preserves the native right-wall old-head
   const oldHeading = reflected.spawnEclEnemy(oldHeadingGame, { subId: 0, x: 350, y: 200 });
   close(oldHeading.ecl.vars[4], Math.PI - Math.fround(0.3),
     'right-wall positive arm subtracts the previous heading, not the new draw');
+
+  const distinctState = makeRuntime([[
+    instruction(0, 62, [f32(0), f32(0), f32(384), f32(448)]),
+    instruction(1, 52, [f32(10004), f32(-Math.PI), f32(Math.PI)])
+  ]]);
+  const distinctGame = makeHost([0xc0000000]);
+  distinctGame.player.x = 400;
+  const distinct = distinctState.spawnEclEnemy(distinctGame, { subId: 0, x: 350, y: 200 });
+  distinct.ecl.heading = Math.fround(0.3);
+  distinct.ecl.angle = Math.fround(-0.7);
+  distinctState.updateEnemy(distinctGame, distinct);
+  close(distinct.ecl.vars[4], Math.PI - Math.fround(0.3),
+    'the old-heading bug reads +0x2b54, not the separate mode-1 angle field');
 });
 
 test('mode-2 movement runs controller step 1 in the allocator and step 2 on the first manager tick', () => {
@@ -344,6 +372,20 @@ test('op54 uses speed times duration and mirrors the X delta', () => {
   const enemy = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0, mirrored: true });
   runtime.updateEnemy(game, enemy);
   close(enemy.x, -8, 'op55 mirrored delta');
+
+  const sharedFields = makeRuntime([[
+    instruction(0, 55, [i32(30), i32(0), f32(300), f32(200), f32(4)])
+  ]]);
+  const sharedEnemy = sharedFields.spawnEclEnemy(makeHost(), { subId: 0, x: 192, y: 112 });
+  assert.deepEqual(sharedEnemy.ecl.orbitTarget, { x: 192, y: 112, z: 0 },
+    'op55 mode-2 origin is published through native shared +0x2b8c/90/94 fields');
+
+  const sharedAngleFields = makeRuntime([[
+    instruction(0, 54, [i32(30), i32(0), f32(0), f32(2)])
+  ]]);
+  const sharedAngleEnemy = sharedAngleFields.spawnEclEnemy(makeHost(), { subId: 0, x: 96, y: 64 });
+  assert.deepEqual(sharedAngleEnemy.ecl.orbitTarget, { x: 96, y: 64, z: 0 },
+    'op54 mode-2 origin uses the same shared native fields');
 });
 
 test('op54 duration zero preserves live angular velocity and acceleration', () => {
@@ -387,7 +429,7 @@ test('timeline op6 applies mirroring only after its allocator core', () => {
 
 test('vars 10063-10065 expose the previous manager-pass displacement', () => {
   const runtime = makeRuntime([[
-    instruction(0, 47, [f32(0), f32(2), f32(3)]),
+    instruction(0, 47, [f32(2), f32(0), f32(3)]),
     instruction(2, 5, [f32(10004), f32(10063)], 2),
     instruction(2, 5, [f32(10005), f32(10065)], 2)
   ]]);

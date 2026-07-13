@@ -1272,7 +1272,13 @@ export class StageScene implements GameHost {
           // non-zero. Both variants bake slowRate into their velocity once.
           const dx = Math.fround(r() * 160 - 80);
           const dy = Math.fround(r() * 160 - 80);
-          pos = origin(dx, dy, -(r()) - 50);
+          // Both FUN_0041a600 and FUN_0041a8d0 stage world Z as
+          // frand*100-50 (Th07.exe v1.00b @ 0x41a632 / 0x41a8ee). The old
+          // -frand-50 collapsed every particle into a one-unit slab, making
+          // id27 leave the shared 400-slot pool far too early. At Stage-4
+          // PRE17527 that exposed 24 false free slots and admitted eight
+          // extra RNG-visible id17 particles.
+          pos = origin(dx, dy, Math.fround(r() * 100 - 50));
           vx = scaled(-dy / launchX);
           vy = scaled(dx / launchX);
           vz = scaled(effectId === 26 ? r() * 0.1 + 0.09 : -(r() * 0.2) - 0.06);
@@ -3396,6 +3402,7 @@ export class StageScene implements GameHost {
     const lrate = this.slowRate;
     for (const l of this.enemyLasers) {
       if (!l.inUse) continue;
+      let retired = false;
       // exe FUN_004241c0: farDist growth is rate-scaled; the phase clock is
       // a split counter at the same rate (spec-slowmo.md §3.1/§3.2).
       l.farDist += l.speed * lrate;
@@ -3424,24 +3431,41 @@ export class StageScene implements GameHost {
         if (l.phaseFrame >= l.growDuration) {
           l.state = 1;
           l.phaseFrame = 0;
+          l.phaseFrac = 0;
           l.displayWidth = l.width;
-          continue;
         }
-      } else if (l.state === 1) {
+      }
+      // Native grow completion jumps directly into the HOLD label in this
+      // same manager pass: collision is evaluated once with the final grow
+      // geometry and again with phase-0 hold geometry, then the common tail
+      // advances phase to 1. Keep this as a second `if`, not `else if`.
+      if (l.state === 1) {
         l.displayWidth = l.width;
         this.resolveLaserCollision(l);
         if (l.phaseFrame >= l.holdDuration) {
           l.state = 2;
           l.phaseFrame = 0;
-          continue;
+          l.phaseFrac = 0;
+          if (l.shrinkDuration === 0) {
+            l.inUse = false;
+            retired = true;
+          }
         }
-      } else {
+      }
+      // HOLD completion likewise falls through to phase-0 SHRINK collision
+      // before the shared phase tick. This transition-frame double test is
+      // observable through the 12-frame laser-graze RNG cadence.
+      if (!retired && l.state === 2) {
         if ((l.flags & 1) === 0) {
           l.displayWidth = Math.max(0, l.width - (l.phaseFrame * l.width) / Math.max(1, l.shrinkDuration));
         }
         this.resolveLaserCollision(l);
-        if (l.phaseFrame >= l.shrinkDuration) l.inUse = false;
+        if (l.phaseFrame >= l.shrinkDuration) {
+          l.inUse = false;
+          retired = true;
+        }
       }
+      if (retired) continue;
       if (l.nearDist >= 640) l.inUse = false;
       if (lrate > 0.99) {
         l.phaseFrame++;

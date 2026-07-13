@@ -239,14 +239,59 @@ test('op144 periodic subs disarm on phase transitions and death callbacks (the ç
   for (let k = 0; k < 6; k++) runtime.updateEnemy(game, e);
   const beforeTransition = game.enemyBullets.length;
   assert.ok(beforeTransition > 0, 'periodic emitter fires during its own phase');
+  // Native phase entry also restores enemy+0x2bd4..+0x2ca7 from the default
+  // FIRE template and clears +0x2ca8.  Seed fields which are otherwise not
+  // used by this small fixture so the reset boundary remains regression-
+  // locked independently of the periodic-sub assertion.
+  e.ecl.bulletExSlots[2] = { opcode: 0x20, cond: 0, arg3: 90, arg4: 0, f0: 1, f1: 0 };
+  e.ecl.bulletSfx = 7;
+  e.ecl.bulletSfxInterval = 33;
+  e.ecl.shootInterval = 90;
+  e.ecl.shootTimer = 17;
   // Cross the HP threshold: the transition must disarm the periodic.
   e.hp = 40;
   runtime.updateEnemy(game, e);
   assert.equal(e.ecl.ctx.subId, 2, 'entered the threshold sub');
   assert.equal(e.ecl.periodicSub, null, 'periodic slot disarmed on phase entry');
+  assert.equal(e.ecl.bulletProps, null, 'FIRE template restored on phase entry');
+  assert.ok(e.ecl.bulletExSlots.every((slot) => slot === null), 'all op79 template slots restored');
+  assert.equal(e.ecl.bulletSfx, 0, 'op81 sound index restored with the template');
+  assert.equal(e.ecl.bulletSfxInterval, 0, 'op81 sound interval restored with the template');
+  assert.equal(e.ecl.shootInterval, 0, 'auto-fire interval cleared on phase entry');
+  assert.equal(e.ecl.shootTimer, 18,
+    'the current manager tick advances the native split counter, then phase reset preserves it');
   const atTransition = game.enemyBullets.length;
   for (let k = 0; k < 30; k++) runtime.updateEnemy(game, e);
   assert.equal(game.enemyBullets.length, atTransition, 'no foreign bullets leak into the new phase');
+});
+
+test('retained death callbacks restore the FIRE/op79 template before entering the callback sub', () => {
+  // FUN_0041ed50 repeats the same DAT_009a26bc copy used by HP/timeout phase
+  // transitions before a mode-1/2/3 actor enters its retained callback.
+  const runtime = makeRuntime([[], []]);
+  const game = makeHost();
+  const e = runtime.spawnEclEnemy(game, { subId: 0, x: 100, y: 100, life: 100 });
+  e.ecl.deathMode = 1;
+  e.ecl.deathCallbackSub = 1;
+  e.ecl.bulletProps = {
+    sprite: 6, offset: 6, count1: 1, count2: 1, speed1: 1, speed2: 1,
+    angle1: 0, angle2: 0, aimMode: 1, flags: 0, sfx: 7,
+    exSlots: [null, null, null, null, null]
+  };
+  e.ecl.bulletExSlots[3] = { opcode: 0x20, cond: 0, arg3: 90, arg4: 0, f0: 1, f1: 0 };
+  e.ecl.bulletSfx = 7;
+  e.ecl.bulletSfxInterval = 33;
+  e.ecl.shootInterval = 90;
+  e.ecl.shootTimer = 17;
+  e.hp = 0;
+  assert.equal(runtime.killEnemy(game, e), true, 'mode-1 callback retains the actor');
+  assert.equal(e.ecl.ctx.subId, 1, 'entered the death callback sub');
+  assert.equal(e.ecl.bulletProps, null);
+  assert.ok(e.ecl.bulletExSlots.every((slot) => slot === null));
+  assert.equal(e.ecl.bulletSfx, 0);
+  assert.equal(e.ecl.bulletSfxInterval, 0);
+  assert.equal(e.ecl.shootInterval, 0);
+  assert.equal(e.ecl.shootTimer, 17, 'death dispatch itself does not advance the split counter');
 });
 
 test('var 10024 is the aim TOWARD the player (snapshot-then-absolute-fan idiom, VM-001)', () => {

@@ -17,6 +17,27 @@ import type { GameHost, Enemy, EnemyBullet, EclState, EclContext, BulletProps, B
 // ceiling), which starved the densest Lunatic patterns ~384 bullets early.
 const ENEMY_BULLET_CAP = 1024;
 const ENEMY_LASER_CAP = 64;
+const NATIVE_PI_F32 = 3.1415927410125732;
+const NATIVE_TAU_F32 = 6.2831854820251465;
+const NATIVE_HALF_PI_F32 = 1.5707963705062866;
+const NATIVE_QUARTER_PI_F32 = 0.7853981852531433;
+const NATIVE_SIXTH_PI_F32 = 0.5235987901687622;
+const NATIVE_THIRD_PI_F32 = 1.0471975803375244;
+const NATIVE_THREE_HALF_PI_F32 = 4.71238899230957;
+
+// Th07.exe FUN_0042fff0 @ 0x42fff0 stores both operands through float32
+// parameters before adding/wrapping them. The distinction is observable in
+// effect-12/21 child trajectories after hundreds of frames.
+function normalizeNativeAngleF32(angle: number, delta = 0): number {
+  let value = Math.fround(Math.fround(angle) + Math.fround(delta));
+  for (let i = 0; i < 18 && value > NATIVE_PI_F32; i++) {
+    value = Math.fround(value - NATIVE_TAU_F32);
+  }
+  for (let i = 0; i < 18 && value < -NATIVE_PI_F32; i++) {
+    value = Math.fround(value + NATIVE_TAU_F32);
+  }
+  return value;
+}
 
 // Advance one fired bullet's copied op-79 queue exactly as FUN_004229f0
 // @ 0x4229f0. Construction calls it once; FUN_004241c0 calls it on every
@@ -526,7 +547,13 @@ export class StageRuntime {
       trailCount: 0,
       trailStart: 0,
       trailStride: 0,
-      trailHistory: Array.from({ length: 96 }, () => ({ x: 0, y: 0, z: 0 })),
+      // Th07.exe FUN_0041d190 initializes the X dword of all 96 template
+      // history entries to -999.0 (manager+0x2f80, i.e. enemy+0x2f78),
+      // leaving Y/Z zero. The cull/render validity gate is x >= -990. A
+      // zero-filled tail therefore looks like an on-screen point and keeps a
+      // freshly armed op138 actor's fixed slot alive long after its real
+      // head has exited.
+      trailHistory: Array.from({ length: 96 }, () => ({ x: -999, y: 0, z: 0 })),
       damageShield: 0,
       damageShieldFrac: 0
     };
@@ -996,6 +1023,7 @@ export class StageRuntime {
     s.bulletRankAmount1High = 0;
     s.bulletRankAmount2Low = 0;
     s.bulletRankAmount2High = 0;
+    this.resetFireTemplateState(s);
     s.stack.length = 0;
     s.periodicExportArmed = false;
     // The exe disarms the op144 periodic sub (+0x2ee4 = -1) on EVERY phase
@@ -1006,6 +1034,23 @@ export class StageRuntime {
     s.periodicSub = null;
     if (s.isBoss) this.clearNonBossEnemies(game, e);
     this.enterSub(s, sub);
+  }
+
+  private resetFireTemplateState(s: EclState): void {
+    // Native HP/timeout phase transitions and retained death-callback entry
+    // all restore the 0x35-dword FIRE template at enemy+0x2bd4 from
+    // DAT_009a26bc, then clear the auto-fire interval at +0x2ca8 (Th07.exe
+    // v1.00b FUN_0041e4a0 @ 0x41e5ad, FUN_0041e6b0 @ 0x41e8bb, and
+    // FUN_0041ed50 @ 0x4203de). This includes every op79 EX slot and the
+    // op81 sound fields. The split counter at +0x2cac..+0x2cb4 is outside
+    // that block and deliberately survives while the zero interval keeps it
+    // dormant. Retaining the old template leaked a previous Stage-6 phase's
+    // third/fourth EX behaviours into the next phase's bullets.
+    s.bulletProps = null;
+    s.bulletExSlots.fill(null);
+    s.bulletSfx = 0;
+    s.bulletSfxInterval = 0;
+    s.shootInterval = 0;
   }
 
   private enterSub(s: EclState, subId: number): void {
@@ -1195,10 +1240,14 @@ export class StageRuntime {
         }
         return;
       }
-      case 5: { // copy orbit params from the tracked enemy
+      case 5: { // FUN_004173d0: track the selected boss's live position
         const t = this.bossSlots[param];
         if (t) {
-          e.ecl.orbitTarget = { ...t.ecl.orbitTarget };
+          // Destination +0x2b8c/90/94 receives the source enemy's CURRENT
+          // +0x2b0c/10/14 position, not its own orbit target. Stage-3's
+          // Alice helpers arm this every frame so their ring follows the
+          // moving boss while retaining the copied radius/angular rate.
+          e.ecl.orbitTarget = { x: t.x, y: t.y, z: t.z };
           e.ecl.orbitSpeed = t.ecl.orbitSpeed;
           e.ecl.orbitAngularVelocity = t.ecl.orbitAngularVelocity;
         }
@@ -1386,22 +1435,43 @@ export class StageRuntime {
         }
         return;
       }
-      case 2: { // FUN_00416fc0: silently delete every live OFFSET-2 bullet
-        // (the +0xbf8 spriteOffset column, same filter field as id 1 —
-        // recon exe-effects.md Q3) within a param-selected radius of the
-        // calling enemy, popping a small particle at each former position
-        // (§2). param 0 also fires the shake+flash pair.
+      case 2: { // FUN_00416fc0 @ 0x416fc0: convert nearby OFFSET-2 bullets
+        // into a pair of real accelerating bullets, then delete the parent.
+        // FUN_00423480 is the enemy-bullet constructor, not the similarly
+        // named general visual-effect allocator FUN_0041b320.
         const thresholds = [128, 192, 256, 999];
         const thr = thresholds[param] ?? 999;
         if (param === 0) {
           game.startScreenShake?.(32, 12, 0);
           game.startScreenFlash?.(4, 1, 0x80cfcfff);
         }
-        for (const b of game.enemyBullets) {
+        const occupied = this.occupiedBulletPoolSlots(game);
+        for (const b of this.bulletsInPoolOrder(game)) {
           if (b.dead || b.spriteOffset !== 2) continue;
           if (Math.hypot(e.x - b.x, e.y - b.y) >= thr) continue;
-          game.spawnEffectParticles(2, b.x, b.y, 1, 0xffffffff);
-          b.dead = true;
+          // Native order is one frand for the shared acceleration magnitude,
+          // followed by one aimMode-6 frand for each of the two children.
+          const accel = Math.fround(game.rng.f() * Math.fround(0.005) + Math.fround(0.013));
+          this.spawnBullets(game, e, {
+            sprite: 0,
+            offset: 6,
+            count1: 2,
+            count2: 1,
+            speed1: Math.fround(0.7),
+            speed2: 0,
+            angle1: 0,
+            angle2: -NATIVE_PI_F32,
+            flags: 0x12,
+            sfx: -1,
+            exSlots: [
+              { opcode: 0x10, cond: 0, arg3: 0xb4, arg4: 0, f0: accel, f1: NATIVE_HALF_PI_F32 },
+              null, null, null, null
+            ],
+            aimMode: 6
+          }, { x: b.x, y: b.y }, occupied);
+          if (game.removeEnemyBullet) game.removeEnemyBullet(b);
+          else b.dead = true;
+          if (b.poolSlot >= 0 && b.poolSlot < occupied.length) occupied[b.poolSlot] = 0;
         }
         return;
       }
@@ -1419,36 +1489,119 @@ export class StageRuntime {
         }
         return;
       }
-      case 6: { // FUN_00417440: delete every bullet of the one OFFSET the
-        // param selects (0->6, 1->15, 2->2; +0xbf8 spriteOffset, same field
-        // as ids 1/2 — recon exe-effects.md Q4), each replaced by a
-        // three-ring burst oriented opposite its travel (§5).
+      case 6: { // FUN_00417440 @ 0x417440: convert one OFFSET family into
+        // three real enemy-bullet rings, then delete each parent. The old
+        // implementation used generic effect particles, which both removed
+        // the collidable rings and consumed four bogus RNG draws per ring.
         const off = param === 0 ? 6 : param === 1 ? 15 : param === 2 ? 2 : -1;
         if (off < 0) return;
-        for (const b of game.enemyBullets) {
+        const childOffset = param === 0 ? 15 : param === 1 ? 2 : 10;
+        const useGrace = param === 0 || (param === 1 && game.difficulty === 3);
+        const occupied = this.occupiedBulletPoolSlots(game);
+        const graceSlot: BulletExSlot = {
+          opcode: 0x2000, cond: 0, arg3: 0x82, arg4: 0, f0: 0, f1: 0
+        };
+        for (const b of this.bulletsInPoolOrder(game)) {
           if (b.dead || b.spriteOffset !== off) continue;
-          game.spawnEffectParticles(6, b.x, b.y, 3, 0xffffffff);
-          b.dead = true;
+          const angle = normalizeNativeAngleF32(b.angle, NATIVE_PI_F32);
+          const fireRing = (count1: number, speedScale: number, angle2: number, flags: number): void => {
+            this.spawnBullets(game, e, {
+              sprite: 6,
+              offset: childOffset,
+              count1,
+              count2: 1,
+              speed1: Math.fround(b.speed * Math.fround(speedScale)),
+              speed2: 0,
+              angle1: angle,
+              angle2,
+              flags,
+              sfx: -1,
+              exSlots: [{ ...graceSlot }, null, null, null, null],
+              aimMode: 1
+            }, { x: b.x, y: b.y }, occupied);
+          };
+          fireRing(
+            game.difficulty < 3 ? 4 : 2,
+            1.1,
+            game.difficulty < 3 ? NATIVE_SIXTH_PI_F32 : NATIVE_HALF_PI_F32,
+            (useGrace ? 0x2000 : 0) | 2
+          );
+          fireRing(2, 0.7, NATIVE_THIRD_PI_F32, useGrace ? 0x2000 : 0);
+          fireRing(1, 0.85, NATIVE_THIRD_PI_F32, useGrace ? 0x2000 : 0);
+          if (game.removeEnemyBullet) game.removeEnemyBullet(b);
+          else b.dead = true;
+          if (b.poolSlot >= 0 && b.poolSlot < occupied.length) occupied[b.poolSlot] = 0;
         }
         return;
       }
       case 9: // FUN_00417ff0: strong 80-frame screen shake, 8->0 (§6).
         game.startScreenShake?.(80, 8, 0);
         return;
-      case 12: case 21: { // FUN_00418260 / FUN_00418bc0: big bullets
-        // (descriptor size > 48) inside a Y-band around the enemy explode
-        // into sparkles and are DELETED. id12 band: ±64 (<Hard) / ±48;
-        // count 10/18/22/25 by difficulty. id21 band: ±128 (Hard) / ±180;
-        // fixed 15 sparkles. Both fire the same pale-blue 8f flash (§7/§12).
+      case 12: case 21: { // FUN_00418260 @ 0x418260 / FUN_00418bc0 @ 0x418bc0
+        // These are the Stage-5 sword-cut effects. They do NOT create visual
+        // particles: every matching big bullet is replaced by a dense volley
+        // of real, collidable enemy bullets through FUN_00423480, then the
+        // big bullet is deleted. Misclassifying these as effect particles was
+        // why 獄神剣「業風神閃斬」 visibly cut the 大玉 without releasing its
+        // small-bullet barrage, and also skipped thousands of gameplay RNG
+        // draws at each slash.
         game.startScreenFlash?.(8, 1, 0x50cfcfff);
         const hard = game.difficulty >= 2;
         const band = id === 12 ? (hard ? 48 : 64) : (game.difficulty === 2 ? 128 : 180);
         const count = id === 12 ? [10, 18, 22, 25][Math.min(3, game.difficulty)] : 15;
-        for (const b of game.enemyBullets) {
-          if (b.dead || Math.max(b.rect.w, b.rect.h) <= 48) continue;
+        const occupied = this.occupiedBulletPoolSlots(game);
+        const variants = id === 12
+          ? [[0, 2], [3, 2], [7, 1]] as const
+          : [[0, 4], [3, 4], [7, 2]] as const;
+        for (const b of this.bulletsInPoolOrder(game)) {
+          // Both handlers compare the sprite descriptor's +0x2c field,
+          // which is the frame HEIGHT, against 48. Width does not qualify a
+          // wide-but-short bullet (FUN_00418260 @ 0x41834d and
+          // FUN_00418bc0 @ 0x418c6b).
+          if (b.dead || b.rect.h <= 48) continue;
           if (Math.abs(b.y - e.y) >= band) continue;
-          game.spawnEffectParticles(12, b.x, b.y, count, 0xffffffff);
-          b.dead = true;
+          for (let i = 0; i < count; i++) {
+            // Exact per-child RNG order: x frand, y frand, kind u16, angle
+            // frand, EX speed-delta frand = nine raw u16 draws. All five are
+            // consumed before FUN_00423480 attempts fixed-pool allocation, so
+            // a full bullet pool still advances the stream.
+            const x = Math.fround(b.x + (game.rng.f() * 32 - 16));
+            const y = Math.fround(b.y + (game.rng.f() * 32 - 16));
+            const [sprite, offset] = variants[game.rng.u16() % 3];
+            const randomAngle = game.rng.f();
+            const angle = param === 0
+              ? Math.fround(randomAngle * NATIVE_THREE_HALF_PI_F32 - NATIVE_HALF_PI_F32)
+              : normalizeNativeAngleF32(
+                  Math.fround(randomAngle * NATIVE_THREE_HALF_PI_F32),
+                  NATIVE_QUARTER_PI_F32
+                );
+            const speedDelta = Math.fround(game.rng.f() * Math.fround(0.008) + Math.fround(0.01));
+            const flags = 0x20 | (id === 12 && (i & 1) ? 2 : 0);
+            this.spawnBullets(game, e, {
+              sprite,
+              offset,
+              count1: 1,
+              count2: 1,
+              speed1: Math.fround(0.1),
+              speed2: 0,
+              angle1: angle,
+              angle2: 0,
+              flags,
+              sfx: -1,
+              exSlots: [
+                { opcode: 0x20, cond: 0, arg3: 100, arg4: 0, f0: speedDelta, f1: 0 },
+                null, null, null, null
+              ],
+              aimMode: 1
+            }, { x, y }, occupied);
+          }
+          // Native deletion happens only after every child template has
+          // consumed its RNG and attempted allocation. The now-free parent
+          // slot is reusable by children from later big bullets in this same
+          // fixed-slot scan.
+          if (game.removeEnemyBullet) game.removeEnemyBullet(b);
+          else b.dead = true;
+          if (b.poolSlot >= 0 && b.poolSlot < occupied.length) occupied[b.poolSlot] = 0;
         }
         return;
       }
@@ -1796,10 +1949,19 @@ export class StageRuntime {
         s.ctx.waitTimer = gi(0);
         return null;
       case 46: e.x = gf(0); e.y = gf(4); e.z = gf(8); return null;
-      case 47: { // velocity by angle/speed (+ z speed)
-        const angle = gf(0);
-        const speed = gf(4);
-        s.axisSpeed = { x: Math.cos(angle) * speed, y: Math.sin(angle) * speed, z: gf(8) };
+      case 47: { // Cartesian velocity (exe case 0x2e @ all.c:8054-8090)
+        // The three operands write enemy+0x2b18/1c/20 directly. This is not
+        // an angle/speed pair: treating it as polar sent Stage-4 familiars
+        // across the player and created three false body-graze RNG events.
+        const x = gf(0);
+        const y = gf(4);
+        const z = gf(8);
+        s.axisSpeed = { x, y, z };
+        const heading = Math.fround(Math.atan2(y, x));
+        s.heading = heading;
+        // Native mode 0 and mode 1 share +0x2b54. Keep the port's mode-1
+        // alias synchronized for a later op48/49/50 transition.
+        s.angle = heading;
         s.moveMode = 0;
         return null;
       }
@@ -1847,7 +2009,7 @@ export class StageRuntime {
         }
         if (hi.x - 96 < e.x) {
           if (angle >= 0 && angle < HALF_PI) {
-            angle = Math.fround(PI - s.angle); // exe bug: old heading, not `angle`
+            angle = Math.fround(PI - s.heading); // exe bug: old heading, not `angle`
           } else if (angle > NEG_HALF_PI && angle < 0) {
             angle = Math.fround(NEG_PI - angle);
           }
@@ -1863,6 +2025,12 @@ export class StageRuntime {
         const angle = gf(8);
         const speed = gf(12);
         if (duration <= 0) {
+          // Th07.exe case 0x35 @ all.c:8218 writes enemy+0x2b54, the live
+          // heading read by vars/op52, before arming mode 1. Keep the mode-1
+          // polar alias in sync, but do not wait for the controller tail to
+          // publish the heading: later same-timestamp ECL instructions can
+          // read it immediately.
+          s.heading = angle;
           s.angle = angle;
           s.speed = speed;
           // FUN_0040f6c0's op54 duration<=0 branch writes heading, speed,
@@ -1872,6 +2040,12 @@ export class StageRuntime {
           s.orbitDuration = duration;
           s.orbitLeft = duration;
         } else {
+          // FUN_0040e850 stores the mode-2 interpolation origin in
+          // enemy+0x2b8c/90/94. Mode 3 reuses those exact dwords as its
+          // orbit target, and op122 can copy them while mode 2 is active.
+          // Keeping only the higher-level interp.start left the shared
+          // native fields stale (usually 0,0,0).
+          s.orbitTarget = { x: e.x, y: e.y, z: e.z };
           s.interp = {
             start: { x: e.x, y: e.y, z: e.z },
             // FUN_0040e850: encoded speed is per frame, so the complete
@@ -1901,6 +2075,9 @@ export class StageRuntime {
           e.y = ty;
           e.z = tz;
         } else {
+          // FUN_0040ea90 writes the current position, not the destination,
+          // into the shared +0x2b8c/90/94 origin/orbit-target fields.
+          s.orbitTarget = { x: e.x, y: e.y, z: e.z };
           s.interp = {
             start: { x: e.x, y: e.y, z: e.z },
             // FUN_0040ea90 flips the X delta, not the absolute target, for
@@ -2990,6 +3167,7 @@ export class StageRuntime {
       s.bulletRankAmount1High = 0;
       s.bulletRankAmount2Low = 0;
       s.bulletRankAmount2High = 0;
+      this.resetFireTemplateState(s);
       s.stack.length = 0;
       s.periodicExportArmed = false;
       this.enterSub(s, callback);

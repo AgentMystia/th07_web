@@ -178,6 +178,22 @@ test('world ambient families share FUN_0041a050 slot release', () => {
   assert.equal(scene.effectSlots.filter(Boolean).length, 0);
 });
 
+test('world ambient ids 26/27 use the native 100-unit Z spread', () => {
+  for (const effectId of [26, 27]) {
+    const scene = sceneFor(3);
+    const camera = scene.runtime.std.camera();
+    const facing = scene.runtime.std.facing();
+    const values = [0.25, 0.75, 0.5, 0.5, 0.5, 0.5];
+    scene.rng.f = () => values.shift() ?? 0.5;
+
+    scene.spawnEffectParticles(effectId, 0, 0, 1, 0xffffffff, { x: 1, y: 0, z: 0 });
+    const particle = scene.particles.at(-1);
+    assert.ok(particle?.world);
+    assert.equal(particle.world.z, Math.fround(camera.z + facing.z / 2),
+      `id${effectId} frand=0.5 centers Z at camera+facing/2`);
+  }
+});
+
 test('spell declaration does not synthesize a generic RNG-consuming burst', () => {
   const scene = sceneFor(0);
   const draws = countDraws(scene);

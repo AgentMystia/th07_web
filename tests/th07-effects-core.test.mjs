@@ -72,17 +72,25 @@ function makeRuntime(subs = [[]]) {
 
 function makeHost(rngValues = []) {
   let rngIndex = 0;
-  const observations = { rngCalls: 0 };
+  const observations = { rngCalls: 0, rawRngDraws: 0 };
   return {
     observations,
     rng: {
-      range: () => 0,
+      range(value) {
+        return this.f() * value;
+      },
       u32() {
         observations.rngCalls++;
+        observations.rawRngDraws += 2;
         return rngValues[rngIndex++] ?? 0;
       },
+      u16() {
+        observations.rngCalls++;
+        observations.rawRngDraws++;
+        return 0;
+      },
       f() {
-        return this.u32() / 0xffffffff;
+        return this.u32() / 0x100000000;
       },
       u32InRange: () => 0
     },
@@ -274,6 +282,129 @@ test('effects 2 and 6 filter on spriteOffset, not sprite', () => {
   runtime.runBulletEffect(game, caller, 6, 1);
   assert.equal(off15.dead, true, 'offset-15 bullet deleted by param 1');
   assert.equal(sprite15.dead, undefined, 'sprite-15/offset-3 bullet kept');
+});
+
+test('effect 5 copies the tracked boss live position, not its orbit target', () => {
+  const runtime = makeRuntime();
+  const game = makeHost();
+  const boss = runtime.spawnEclEnemy(game, { subId: 0, x: 192, y: 112 });
+  boss.ecl.isBoss = true;
+  boss.ecl.bossSlot = 0;
+  boss.ecl.orbitTarget = { x: 7, y: 9, z: 11 };
+  boss.ecl.orbitSpeed = 48;
+  boss.ecl.orbitAngularVelocity = 0.125;
+  runtime.bossSlots[0] = boss;
+  const helper = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
+
+  runtime.runBulletEffect(game, helper, 5, 0);
+  assert.deepEqual(helper.ecl.orbitTarget, { x: 192, y: 112, z: 0 });
+  assert.equal(helper.ecl.orbitSpeed, 48);
+  assert.equal(helper.ecl.orbitAngularVelocity, 0.125);
+});
+
+test('effect 2 converts one nearby parent into two real accelerating bullets in native RNG order', () => {
+  const runtime = makeRuntime();
+  const game = makeHost();
+  const caller = runtime.spawnEclEnemy(game, { subId: 0, x: 100, y: 100 });
+  const parent = makeBullet(5, { x: 110, y: 100, spriteOffset: 2 });
+  game.enemyBullets.push(parent);
+
+  runtime.runBulletEffect(game, caller, 2, 0);
+  const children = game.enemyBullets.filter((bullet) => bullet !== parent && !bullet.dead);
+  assert.equal(parent.dead, true);
+  assert.equal(children.length, 2);
+  assert.equal(game.observations.rawRngDraws, 6,
+    'one acceleration frand plus two aimMode-6 frands consume six raw draws');
+  assert.ok(children.every((bullet) => bullet.sprite === 0 && bullet.spriteOffset === 6));
+  assert.ok(children.every((bullet) => bullet.flags === 0x12 && bullet.exFlags === 0x10));
+  assert.ok(children.every((bullet) => bullet.exAccel?.limit === 0xb4));
+  assert.ok(children.every((bullet) => Math.abs(bullet.exAccel?.mag - Math.fround(0.013)) < 1e-9));
+  assert.ok(children.every((bullet) => Math.abs(bullet.speed - Math.fround(0.7)) < 1e-9));
+});
+
+test('effect 6 converts each Lunatic offset-6 parent into five real grace-ring bullets with zero RNG', () => {
+  const runtime = makeRuntime();
+  const game = makeHost();
+  game.difficulty = 3;
+  const caller = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
+  const parent = makeBullet(7, { x: 180, y: 120, spriteOffset: 6, speed: 2, angle: 0.25 });
+  const decoy = makeBullet(9, { spriteOffset: 15 });
+  game.enemyBullets.push(decoy, parent);
+
+  runtime.runBulletEffect(game, caller, 6, 0);
+  const children = game.enemyBullets.filter((bullet) => bullet !== parent && bullet !== decoy && !bullet.dead);
+  assert.equal(parent.dead, true);
+  assert.equal(decoy.dead, undefined, 'param 0 selects only offset 6 parents');
+  assert.equal(children.length, 5, 'Lunatic ring counts are 2 + 2 + 1');
+  assert.equal(game.observations.rawRngDraws, 0, 'FUN_00417440 conversion consumes no RNG');
+  assert.ok(children.every((bullet) => bullet.sprite === 6 && bullet.spriteOffset === 15));
+  assert.deepEqual(children.map((bullet) => bullet.flags), [0x2002, 0x2002, 0x2000, 0x2000, 0x2000]);
+  assert.ok(children.every((bullet) => bullet.graceFrames === 0x82));
+  assert.deepEqual(children.map((bullet) => Number(bullet.speed.toFixed(6))), [2.2, 2.2, 1.4, 1.4, 1.7]);
+});
+
+test('effect 12 cuts each Lunatic big bullet into 25 real accelerating bullets', () => {
+  const runtime = makeRuntime();
+  const game = makeHost();
+  game.difficulty = 3;
+  const caller = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 100 });
+  const outsideBand = makeBullet(3, {
+    x: 160, y: 148,
+    sprite: 10,
+    rect: { x: 0, y: 0, w: 64, h: 64, imageKey: 'etama2' }
+  });
+  const wideButShort = makeBullet(5, {
+    x: 140, y: 100,
+    sprite: 10,
+    rect: { x: 0, y: 0, w: 64, h: 32, imageKey: 'etama2' }
+  });
+  const cut = makeBullet(7, {
+    x: 120, y: 100,
+    sprite: 10,
+    rect: { x: 0, y: 0, w: 64, h: 64, imageKey: 'etama2' }
+  });
+  game.enemyBullets.push(cut, wideButShort, outsideBand);
+
+  runtime.runBulletEffect(game, caller, 12, 0);
+  const children = game.enemyBullets.filter((bullet) =>
+    bullet !== cut && bullet !== wideButShort && bullet !== outsideBand && !bullet.dead);
+  assert.equal(cut.dead, true, 'matching big bullet is deleted after child allocation');
+  assert.equal(wideButShort.dead, undefined, 'descriptor width alone does not pass the native +0x2c height gate');
+  assert.equal(outsideBand.dead, undefined, 'strict Lunatic ±48 Y band excludes its boundary');
+  assert.equal(children.length, 25, 'Lunatic id12 emits 25 collidable enemy bullets');
+  assert.equal(game.observations.rawRngDraws, 25 * 9, 'each child consumes nine raw u16 draws');
+  assert.ok(children.every((bullet) => bullet.sprite === 0 && bullet.spriteOffset === 2),
+    'kind u16=0 selects the native id12 sprite/offset pair');
+  assert.deepEqual(children.map((bullet) => bullet.flags),
+    Array.from({ length: 25 }, (_, i) => 0x20 | (i & 1 ? 2 : 0)),
+    'id12 alternates spawn-state bit 2 while retaining EX bit 0x20');
+  assert.ok(children.every((bullet) => bullet.exFlags === 0x20), 'constructor promotes the angle/speed behavior');
+  assert.ok(children.every((bullet) => bullet.exAngle?.limit === 100), 'child EX duration is 100 ticks');
+  assert.ok(children.every((bullet) => Math.abs(bullet.exAngle?.speedDelta - Math.fround(0.01)) < 1e-9));
+  close(children[0].x, 104, 'first non-bloom child random X origin');
+  close(children[0].y, 84, 'first non-bloom child random Y origin');
+  close(children[0].angle, -Math.PI / 2, 'param 0 uses the broad arc starting at -pi/2');
+});
+
+test('effect 21 uses its wider band and all children carry EX without a spawn bloom', () => {
+  const runtime = makeRuntime();
+  const game = makeHost();
+  game.difficulty = 3;
+  const caller = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 100 });
+  const cut = makeBullet(0, {
+    x: 200, y: 279.5,
+    sprite: 10,
+    rect: { x: 0, y: 0, w: 64, h: 64, imageKey: 'etama2' }
+  });
+  game.enemyBullets.push(cut);
+
+  runtime.runBulletEffect(game, caller, 21, 1);
+  const children = game.enemyBullets.filter((bullet) => bullet !== cut && !bullet.dead);
+  assert.equal(children.length, 15);
+  assert.equal(game.observations.rawRngDraws, 15 * 9);
+  assert.ok(children.every((bullet) => bullet.sprite === 0 && bullet.spriteOffset === 4));
+  assert.ok(children.every((bullet) => bullet.flags === 0x20 && bullet.spawnDuration === 0));
+  close(children[0].angle, Math.PI / 4, 'param 1 wraps the narrow arc around pi/4');
 });
 
 test('effect 0 copies tracked motion and permanently suppresses movement after disarm', () => {

@@ -111,6 +111,34 @@ test('laser manager tests the native phase before advancing its split counter', 
   assert.equal(l.phaseFrame, 13);
 });
 
+test('laser phase transitions collide in both old and new states before the common tail tick', () => {
+  const growScene = scene();
+  const growCalls = [];
+  growScene.resolveLaserCollision = (laser) => {
+    growCalls.push({ state: laser.state, phase: laser.phaseFrame, width: laser.displayWidth });
+  };
+  const grow = makeLaser({ state: 0, phaseFrame: 90, growDuration: 90, width: 20 });
+  growScene.enemyLasers.push(grow);
+  growScene.updateLasers();
+  assert.deepEqual(growCalls.map(({ state, phase }) => [state, phase]), [[0, 90], [1, 0]],
+    'grow completion evaluates final-grow then phase-0 hold collision');
+  assert.equal(grow.state, 1);
+  assert.equal(grow.phaseFrame, 1, 'shared tail advances the new hold phase');
+
+  const holdScene = scene();
+  const holdCalls = [];
+  holdScene.resolveLaserCollision = (laser) => {
+    holdCalls.push({ state: laser.state, phase: laser.phaseFrame, width: laser.displayWidth });
+  };
+  const hold = makeLaser({ state: 1, phaseFrame: 60, holdDuration: 60, shrinkDuration: 200, width: 20 });
+  holdScene.enemyLasers.push(hold);
+  holdScene.updateLasers();
+  assert.deepEqual(holdCalls.map(({ state, phase }) => [state, phase]), [[1, 60], [2, 0]],
+    'hold completion evaluates final-hold then phase-0 shrink collision');
+  assert.equal(hold.state, 2);
+  assert.equal(hold.phaseFrame, 1, 'shared tail advances the new shrink phase');
+});
+
 test('angled laser projection uses the native FUN_00430070 orientation', () => {
   const s = scene({ x: 200.763397217, y: 418.516937256, hitboxHalf: 1.1 });
   const l = makeLaser({
