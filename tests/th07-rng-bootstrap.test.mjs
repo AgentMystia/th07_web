@@ -73,14 +73,17 @@ test('power-item HUD refreshes preserve FUN_00401700 RNG costs', () => {
   scene.playerObj.power = 0;
   scene.collectItem(item('power'));
   assert.equal(draws(), 4, 'ordinary power gain calls FUN_00401700 once');
+  assert.equal(scene.score, 1, 'below-cap power pickup credits one live score unit');
 
   scene.playerObj.power = 127;
   scene.collectItem(item('power'));
   assert.equal(draws(), 12, 'crossing full power calls FUN_00401700 twice');
+  assert.equal(scene.score, 2, 'the crossing pickup still credits its one score unit');
 
   scene.playerObj.power = 64;
   scene.collectItem(item('fullPower'));
   assert.equal(draws(), 16, 'full-power item calls FUN_00401700 once');
+  assert.equal(scene.score, 102, 'full-power item adds its separate 100-point award');
 });
 
 test('successful extend awards preserve FUN_00401700 RNG costs', () => {
@@ -207,6 +210,13 @@ test('spell declaration does not synthesize a generic RNG-consuming burst', () =
 
   assert.equal(draws(), 0, 'FUN_0040ee30 allocates its dedicated presentation object without gameplay RNG');
   assert.equal(scene.particles.length, 0, 'spell declaration is not a generic id-3 particle request');
+});
+
+test('nonspell op91 cleanup does not run the spell-end helper sweep', () => {
+  const scene = sceneFor(0);
+  assert.equal(scene.spellcard, null);
+  assert.equal(scene.endBossSpell(), false,
+    'FUN_0040f340 is a no-op while DAT_012f40a8 is zero');
 });
 
 test('active-spell boss death preserves bullets for the following op91 sweep', () => {

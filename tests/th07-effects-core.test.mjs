@@ -265,6 +265,75 @@ test('effect 1 slow-turn: first tick ~0.3+delta, stops exactly at the tick limit
   }
 });
 
+// Stage 5 Sub64 arms effect 13 continuously. Th07.exe FUN_00418650 calls
+// FUN_004260d0 for each newly tagged fixed bullet slot; that opcode-0x20
+// record is gameplay motion, not a cosmetic-only attachment.
+test('effect 13 installs the native parity turn and speed decay on bullets in the sword strip', () => {
+  const runtime = makeRuntime();
+  const game = makeHost();
+  const caller = runtime.spawnEclEnemy(game, { subId: 0, x: 180, y: 300 });
+  const even = makeBullet(878, { x: 180, y: 344, speed: Math.fround(0.91396445), angle: Math.fround(Math.PI) });
+  const odd = makeBullet(879, { x: 181, y: 345, speed: 1.8, angle: 0 });
+  const xBoundary = makeBullet(880, { x: 196, y: 344, speed: 1 });
+  const yBoundary = makeBullet(881, { x: 180, y: 352, speed: 1 });
+  game.enemyBullets.push(yBoundary, odd, xBoundary, even);
+
+  runtime.runBulletEffect(game, caller, 13, 1);
+
+  assert.equal(even.effectState, 1);
+  assert.equal(even.exBehaviorIndex, 0);
+  assert.equal(even.exSlots[0].opcode, 0x20);
+  assert.equal(even.exSlots[0].cond, 0);
+  assert.equal(even.exSlots[0].arg3, 0xa0);
+  close(even.exSlots[0].f0, Math.fround(-Math.fround(even.speed) / 180), 'speed delta is -nominalSpeed/180');
+  close(even.exSlots[0].f1, Math.fround(-Math.PI / 60), 'even fixed slot turns -pi/60');
+  close(odd.exSlots[0].f1, Math.fround(Math.PI / 60), 'odd fixed slot turns +pi/60');
+  assert.equal(xBoundary.effectState, 0, 'strict x band excludes exactly +16');
+  assert.equal(yBoundary.effectState, 0, 'strict y ceiling excludes exactly 352');
+
+  advanceBulletExBehavior(even);
+  assert.equal(even.exFlags & 0x20, 0x20);
+  close(even.exAngle.speedDelta, Math.fround(-Math.fround(even.speed) / 180), 'promoted speed decay');
+  close(even.exAngle.angleDelta, Math.fround(-Math.PI / 60), 'promoted parity turn');
+  assert.equal(even.exAngle.limit, 160);
+});
+
+test('effect 14 queues the native 90-tick player-aimed acceleration behind effect 13', () => {
+  const runtime = makeRuntime();
+  const game = makeHost();
+  const caller = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
+  const tagged = makeBullet(12, { x: 160, y: 320, effectState: 1 });
+  tagged.exFlags = 0x20;
+  tagged.exFireFlags = 0x20;
+  tagged.exBehaviorIndex = 1;
+  tagged.exSlots = [
+    { opcode: 0x20, cond: 0, arg3: 160, arg4: 0, f0: -0.01, f1: -0.02 },
+    { opcode: 0x400, cond: 1, arg3: 2, arg4: 0, f0: 3, f1: 0 },
+    null, null, null
+  ];
+  const untouched = makeBullet(13, { x: 170, y: 330, effectState: 0 });
+  game.enemyBullets.push(untouched, tagged);
+
+  runtime.runBulletEffect(game, caller, 14, 0);
+
+  assert.equal(tagged.effectState, 2);
+  assert.equal(tagged.exBehaviorIndex, 0);
+  assert.equal(tagged.exSlots[0].opcode, 0x10);
+  assert.equal(tagged.exSlots[0].cond, 0);
+  assert.equal(tagged.exSlots[0].arg3, 90);
+  close(tagged.exSlots[0].f0, Math.fround(0.02666666731238365), 'native acceleration magnitude');
+  close(tagged.exSlots[0].f1, Math.fround(Math.atan2(64, 32)), 'angle captured toward current player position');
+  assert.equal(tagged.exSlots[1], null, 'native clears the following queue opcode');
+  assert.equal(tagged.exFlags, 0x20, 'the currently active effect-13 behavior is retained');
+  advanceBulletExBehavior(tagged);
+  assert.equal(tagged.exFlags, 0x20, 'cond 0 waits until the earlier behavior finishes');
+  tagged.exFlags = 0;
+  advanceBulletExBehavior(tagged);
+  assert.equal(tagged.exFlags, 0x10, 'acceleration promotes after the prior behavior clears');
+  assert.equal(tagged.exAccel.limit, 90);
+  assert.equal(untouched.effectState, 0);
+});
+
 test('effects 2 and 6 filter on spriteOffset, not sprite', () => {
   const runtime = makeRuntime();
   const game = makeHost();
@@ -440,25 +509,30 @@ test('effect 7 uses inclusive full-width bounds, timer-selected global slots, an
   const boundaries = [
     makeBullet(5, { x: 110, y: 90 }),
     makeBullet(2, { x: 110, y: 110 }),
-    makeBullet(9, { x: 210, y: 100 })
+    makeBullet(9, { x: 210, y: 100 }),
+    makeBullet(8, { x: 110 - 1e-6, y: 100 })
   ];
   const outside = [
-    makeBullet(1, { x: 110 - 1e-6, y: 100 }),
-    makeBullet(3, { x: 110, y: 110 + 1e-6 }),
-    makeBullet(4, { x: 210 + 1e-6, y: 100 })
+    makeBullet(1, { x: 110 - 1e-4, y: 100 }),
+    makeBullet(3, { x: 110, y: 110 + 1e-4 }),
+    makeBullet(4, { x: 210 + 1e-4, y: 100 })
   ];
   const slotOneBullet = makeBullet(6, { x: 120, y: 200 });
   game.enemyBullets.push(...boundaries.reverse(), ...outside, slotOneBullet);
   caller.ecl.bossTimer = 0;
   runtime.runBulletEffect(game, caller, 7, 0);
-  assert.ok(boundaries.every((bullet) => bullet.effectState === 10), 'all inclusive edges rebound');
+  assert.ok(boundaries.every((bullet) => bullet.effectState === 10),
+    'inclusive edges and sub-ULP inputs that store onto an edge rebound');
   assert.ok(outside.every((bullet) => bullet.effectState === 0), 'strictly outside points are rejected');
   assert.equal(slotOneBullet.effectState, 0, 'timer 0 does not process global laser slot 1');
   caller.ecl.bossTimer = 1;
   runtime.runBulletEffect(game, caller, 7, 0);
   assert.equal(slotOneBullet.effectState, 10, 'timer 1 processes global laser slot 1');
 
-  const reachesZero = makeBullet(0, { x: 120, y: 100, effectState: 1, vx: 1, vy: 0 });
+  const reachesZero = makeBullet(0, {
+    x: 120, y: 100, effectState: 1, vx: 1, vy: 0,
+    sprite: 2, spriteOffset: 4
+  });
   const cooldown = makeBullet(1, { x: 120, y: 100, effectState: 10, vx: 1, vy: 0 });
   const leavesBox = makeBullet(2, { x: 20, y: 20, effectState: 9, vx: 1, vy: 0 });
   const negativeSide = makeBullet(3, { x: 120, y: 100, effectState: 0, vx: 0, vy: -1 });
@@ -469,6 +543,8 @@ test('effect 7 uses inclusive full-width bounds, timer-selected global slots, an
   assert.equal(reachesZero.effectState, 10, '1 -> 0 rebounds in the same callback');
   close(reachesZero.speed, 0.9, 'strict speed decrement');
   close(reachesZero.angle, Math.PI / 2, 'nonnegative side uses +normal');
+  assert.equal(reachesZero.sprite, 5, 'effect 7 copies the native deflection template');
+  assert.deepEqual(reachesZero.rect, runtime.bulletRect(5, 4));
   assert.equal(cooldown.effectState, 9, '10 -> 9 does not rebound');
   close(cooldown.speed, 1, 'cooldown preserves speed');
   assert.equal(leavesBox.effectState, 9, 'countdown freezes outside the box');
@@ -482,16 +558,18 @@ test('effect 8 consumes RNG only after collision and preserves per-laser identit
   easy.difficulty = 0;
   const caller = runtime.spawnEclEnemy(easy, { subId: 0, x: 0, y: 0 });
   easy.enemyLasers.push(makeLaser(0));
-  const valid = makeBullet(0, { x: 120, y: 114, vx: 1, vy: 0 });
-  const outside = makeBullet(1, { x: 120, y: 115 + 1e-6 });
+  const valid = makeBullet(0, { x: 120, y: 115 + 1e-6, vx: 1, vy: 0 });
+  const outside = makeBullet(1, { x: 120, y: 115 + 1e-4 });
   const alreadyUsed = makeBullet(2, { x: 120, y: 100, effectState: -1 });
   const sameLaser = makeBullet(3, { x: 120, y: 100, effectState: 1 });
   easy.enemyBullets.push(outside, alreadyUsed, sameLaser, valid);
   caller.ecl.bossTimer = 0;
   runtime.runBulletEffect(easy, caller, 8, 0);
   assert.equal(easy.observations.rngCalls, 1);
-  close(valid.speed, 0.7, 'Easy rng=0 multiplier');
-  close(valid.angle, Math.PI / 2, 'zero dot chooses +normal');
+  assert.equal(valid.speed, Math.fround(0.699999988079071), 'Easy rng=0 uses the exe f32 base');
+  assert.equal(valid.angle, Math.fround(Math.PI / 2), 'zero dot chooses +normal and stores atan2 as f32');
+  assert.equal(valid.vx, Math.fround(Math.cos(valid.angle) * valid.speed));
+  assert.equal(valid.vy, Math.fround(Math.sin(valid.angle) * valid.speed));
   assert.equal(valid.effectState, -1);
   runtime.runBulletEffect(easy, caller, 8, 0);
   assert.equal(easy.observations.rngCalls, 1, 'negative/same/outside filters consume no RNG');
@@ -501,11 +579,20 @@ test('effect 8 consumes RNG only after collision and preserves per-laser identit
   hard.difficulty = 3;
   const hardCaller = hardRuntime.spawnEclEnemy(hard, { subId: 0, x: 0, y: 0 });
   hard.enemyLasers.push(makeLaser(0));
-  const crossing = makeBullet(0, { x: 120, y: 100, vx: 1, vy: 0 });
+  const crossing = makeBullet(0, {
+    x: 120, y: 100, vx: 1, vy: 0,
+    sprite: 2, spriteOffset: 3
+  });
   hard.enemyBullets.push(crossing);
   hardRuntime.runBulletEffect(hard, hardCaller, 8, 0);
   close(crossing.speed, 1, 'Hard rng=.5 multiplier');
   assert.equal(crossing.effectState, 1);
+  assert.equal(crossing.sprite, 5, 'native deflection copies bullet template 5');
+  assert.equal(crossing.spriteOffset, 3, 'the original FIRE color offset survives the template copy');
+  assert.deepEqual(crossing.rect, hardRuntime.bulletRect(5, 3),
+    'template 5 ANM restarts at the preserved color offset');
+  assert.equal(crossing.grazeW, 4);
+  assert.equal(crossing.grazeH, 4);
   hardRuntime.runBulletEffect(hard, hardCaller, 8, 0);
   assert.equal(hard.observations.rngCalls, 1, 'same global laser is rejected');
 
@@ -513,6 +600,75 @@ test('effect 8 consumes RNG only after collision and preserves per-laser identit
   hardRuntime.runBulletEffect(hard, hardCaller, 8, 0);
   assert.equal(hard.observations.rngCalls, 2, 'overlapping same-modulo laser consumes a second RNG');
   assert.equal(crossing.effectState, 4, 'identity advances to global slot 3 + 1');
+});
+
+test('effect 8 stages rotated normal selection, atan2, and FUN_004074e0 velocity through f32', () => {
+  const runtime = makeRuntime();
+  const raw = 0x12345678;
+  const game = makeHost([raw]);
+  game.difficulty = 3;
+  const caller = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
+  const angle = Math.fround(0.7312345);
+  const sin = Math.fround(Math.sin(angle));
+  const cos = Math.fround(Math.cos(angle));
+  const nx = Math.fround(-sin);
+  const ny = cos;
+  game.enemyLasers.push(makeLaser(0, { angle }));
+  const oldSpeed = Math.fround(1.2345678);
+  const bullet = makeBullet(0, {
+    x: 120, y: 100, speed: oldSpeed,
+    vx: Math.fround(-nx), vy: Math.fround(-ny)
+  });
+  game.enemyBullets.push(bullet);
+
+  runtime.runBulletEffect(game, caller, 8, 0);
+
+  const random = raw / 0x100000000;
+  const expectedSpeed = Math.fround(
+    (random * 0.4000000059604645 + 0.800000011920929) * oldSpeed
+  );
+  const chosenX = Math.fround(-nx);
+  const chosenY = Math.fround(-ny);
+  const expectedAngle = Math.fround(Math.atan2(chosenY, chosenX));
+  assert.equal(bullet.speed, expectedSpeed);
+  assert.equal(bullet.angle, expectedAngle);
+  assert.equal(bullet.vx, Math.fround(Math.cos(expectedAngle) * expectedSpeed));
+  assert.equal(bullet.vy, Math.fround(Math.sin(expectedAngle) * expectedSpeed));
+  assert.equal(bullet.effectState, 1);
+  assert.equal(game.observations.rngCalls, 1);
+});
+
+test('laser deflection resets template-5 spawn ANM clocks without disturbing normal-state clocks', () => {
+  const runtime = makeRuntime();
+  const spawning = makeBullet(0, {
+    sprite: 10,
+    spriteOffset: 4,
+    flags: 4,
+    spawnAge: 5,
+    spawnAgeFrac: 0.25,
+    spawnDuration: 24,
+    age: 17
+  });
+  runtime.resetDeflectedBulletTemplate(spawning);
+  assert.equal(spawning.sprite, 5);
+  assert.deepEqual(spawning.rect, runtime.bulletRect(5, 4));
+  assert.equal(spawning.spawnAge, 0);
+  assert.equal(spawning.spawnAgeFrac, 0);
+  assert.equal(spawning.spawnDuration, 16, 'template 5 state-3 ANM lasts 16 ticks');
+  assert.equal(spawning.age, 17, 'normal bullet age lies outside the copied template block');
+
+  const normal = makeBullet(1, {
+    sprite: 2,
+    spriteOffset: 4,
+    spawnAge: 10,
+    spawnAgeFrac: 0,
+    spawnDuration: 10,
+    age: 23
+  });
+  runtime.resetDeflectedBulletTemplate(normal);
+  assert.equal(normal.spawnAge, 10, 'normal-state bullets do not re-enter a spawn state');
+  assert.equal(normal.spawnDuration, 10);
+  assert.equal(normal.age, 23);
 });
 
 test('global laser allocation uses the lowest free one of 64 slots', () => {
@@ -547,8 +703,8 @@ test('effect 16 emits forty real bullets across eight calls while retaining its 
   assert.ok(emitted.every((bullet) => bullet.sprite === 0 && bullet.spriteOffset === 6));
   assert.ok(emitted.every((bullet) => bullet.flags === 2));
   assert.ok(emitted.every((bullet) =>
-    Math.abs(bullet.x - (50 - bullet.vx * 4)) < 1e-6 &&
-    Math.abs(bullet.y - (60 - bullet.vy * 4)) < 1e-6
+    bullet.x === Math.fround(Math.fround(50) - Math.fround(bullet.vx * 4)) &&
+    bullet.y === Math.fround(Math.fround(60) - Math.fround(bullet.vy * 4))
   ), 'flags-selected spawn states begin four velocity vectors behind the emitter');
   assert.equal(new Set(game.enemyBullets.map((bullet) => bullet.poolSlot)).size, 41, 'bullet slots stay unique');
   assert.deepEqual(emitted.slice(0, 5).map((bullet) => bullet.poolSlot), [1, 2, 3, 4, 5]);

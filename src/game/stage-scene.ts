@@ -50,7 +50,8 @@ const ITEM_SPRITES: Record<ItemType, number> = {
   life: 9,
   cherry: 10, // type 6: grey cancel-item box (FUN_00421a40 writes type 6)
   bigCherry: 11, // type 7: boxed pink petal
-  pointBullet: 12 // type 8: unboxed petal used by the Border-break circle
+  pointBullet: 12, // type 8: unboxed petal used by the Border-break circle
+  case9Cherry: 13 // type 9: pink petal; shares type 7's authored sprite rect
 };
 // Per-type offscreen indicator arrows sit 10 embedded ids after their item
 // (emb14-21, same order) — drawn while an item is still above the top edge.
@@ -79,6 +80,7 @@ const EFFECT_DRAW_COST: Record<number, number> = {
 const ENEMY_POOL_CAP = 0x1e0;
 const PLAYER_BULLET_POOL_CAP = 0x60;
 const ENEMY_BULLET_POOL_CAP = 0x400;
+const ITEM_POOL_CAP = 0x44c;
 const EFFECT_POOL_CAP = 400;
 const NATIVE_PI_F32 = 3.1415927410125732;
 const NATIVE_TAU_F32 = 6.2831854820251465;
@@ -332,6 +334,8 @@ export class StageScene implements GameHost {
   enemyLasers: EnemyLaser[] = [];
   postBombLaserCounter = 0;
   items: ItemEntity[] = [];
+  private itemSlots: (ItemEntity | null)[] = new Array(ITEM_POOL_CAP).fill(null);
+  private itemPoolCursor = 0;
   particles: EffectParticle[] = [];
   private readonly effectSlots: (EffectParticle | null)[] = new Array(EFFECT_POOL_CAP).fill(null);
   private effectPoolCursor = 0;
@@ -350,6 +354,11 @@ export class StageScene implements GameHost {
   private readonly playerBulletSlots: (PlayerBullet | null)[] = new Array(PLAYER_BULLET_POOL_CAP).fill(null);
   graze = 0;
   pointItems = 0;
+  // The run-global counters persist across stages, but FUN_00427269 captures
+  // stage-clear Point/Graze as per-stage deltas. Replay snapshots restore the
+  // cumulative totals, so retain the entry baselines separately.
+  private stageEntryGraze = 0;
+  private stageEntryPointItems = 0;
   // Point-item extend ladder (exe stats +0x2c level / +0x30 threshold,
   // all.c:19744/22099-22125): main game 50/125/200/300/450/800+200n;
   // Extra+Phantasm 200/500/800+500n. Persists across stages in a credit.
@@ -415,6 +424,11 @@ export class StageScene implements GameHost {
   private dialogueResume = false;
   stageFrame = 0;
   stageClear = false;
+  // MSG op9 exposes the results tally and snapshots/credits its values well
+  // before op11 actually leaves the stage. Keep presentation distinct from
+  // the final stage-transition latch so the post-boss MSG can keep ticking.
+  stageResultsActive = false;
+  private stageResultsPending = false;
   private clearTimer = 0;
   clearLoadingRunner: AnmRunner | null = null;
   clearCaptureRunner: AnmRunner | null = null;
@@ -449,6 +463,7 @@ export class StageScene implements GameHost {
     decayPerSec: number;
     grazeBonus: number;
     elapsed: number;
+    elapsedFrac: number;
     declAge: number;
     portraitSprite: number;
   } | null = null;
@@ -524,8 +539,11 @@ export class StageScene implements GameHost {
   // then advances the shared split counter with DAT_0056baa8. Consequently
   // enemy collision runs only on integer-advance frames during slow motion
   // (native Stage 5: rate 1/3, processing 6774/6775 skip, 6776 scans).
-  // State 3 invulnerability and state 4 Border countdown leave +0x16a00 at
-  // the -999 sentinel, so their collision scan remains wall-clock active.
+  // State 3 invulnerability and state 4 Border countdown retreat the same
+  // split pair through FUN_00436a06. At normal speed its fast path leaves
+  // +0x16a00 at the -999 sentinel, so collision remains wall-clock active;
+  // under slow motion the helper publishes current->previous and collision
+  // runs only on integer-retreat frames (Stage 5 processing 11415/11418).
   private playerShotCollisionClockFrac = 0;
   private playerShotCollisionClockSpecial = false;
   private playerShotCollisionClockAdvanced = true;
@@ -551,6 +569,10 @@ export class StageScene implements GameHost {
       age: number;
     } | null;
   }> = [];
+  // Diagnostic seam for replay AUX-0x02: geometric contact before the
+  // invulnerability/deathbomb/Border outcome gate. Production leaves it
+  // unset and gameplay never reads it.
+  onPlayerContact?: (kind: 'bullet' | 'laser' | 'body') => void;
   // Floating number popups: two contiguous ring pools in the exe (720 large,
   // 3 small — the latter serves small cherry pickups). FUN_00401ad0 updates
   // all 723 slots: rise 0.5 px per rate-scaled frame and retire after 60.
@@ -558,6 +580,11 @@ export class StageScene implements GameHost {
   private popupsSmall: ScorePopup[] = Array.from({ length: 3 }, makeScorePopup);
   private popupCursorLarge = 0;
   private popupCursorSmall = 0;
+  // Th07.exe bullet manager +0x37a160 / DAT_0099fa98: initialized to item
+  // type 6, promoted to type 9 after Stage 6-8's pre-boss dialogue setup.
+  // FUN_0042819f performs its initial field clear first and writes 9 only
+  // afterward, so this must be mutable state rather than a stage constant.
+  private cancelItemType: 'cherry' | 'case9Cherry' = 'cherry';
 
   constructor(
     private assets: GameAssets,
@@ -643,7 +670,10 @@ export class StageScene implements GameHost {
             // FUN_0043e620 @ 0x43e620: natural expiry enters state 3 for
             // 40 frames and displays post-award cherry*10, while score gains
             // post-award cherry*1.
-            this.playerObj.invulnFrames = Math.max(this.playerObj.invulnFrames, 40);
+            if (this.playerObj.invulnFrames < 40) {
+              this.playerObj.invulnFrames = 40;
+              this.playerObj.invulnFrac = 0;
+            }
             this.borderMessage = { type: 4, value: bonus * 10, age: 0, timer: 180 };
             this.playSfx(33);
           }
@@ -690,6 +720,15 @@ export class StageScene implements GameHost {
       this.rankAccumulator = carry.rankAccumulator ?? 0;
       this.startStageTransition();
     }
+    this.captureStageEntryTotals();
+  }
+
+  // Called after a replay stage snapshot overwrites the constructor defaults.
+  // Browser playback and the Node verifier share this seam so clear-bonus
+  // deltas use the original stage-entry cumulative counters.
+  captureStageEntryTotals(): void {
+    this.stageEntryGraze = this.graze;
+    this.stageEntryPointItems = this.pointItems;
   }
 
   // -- native fixed-slot pools ---------------------------------------------
@@ -717,6 +756,15 @@ export class StageScene implements GameHost {
     return true;
   }
 
+  discardAllocatedEnemy(enemy: Enemy): void {
+    const slot = enemy.poolSlot;
+    if (slot >= 0 && slot < ENEMY_POOL_CAP && this.enemySlots[slot] === enemy) {
+      this.enemySlots[slot] = null;
+    }
+    const dense = this.enemies.indexOf(enemy);
+    if (dense >= 0) this.enemies.splice(dense, 1);
+  }
+
   addEnemyBullet(bullet: EnemyBullet): boolean {
     const slot = bullet.poolSlot;
     if (slot < 0 || slot >= ENEMY_BULLET_POOL_CAP) return false;
@@ -728,9 +776,17 @@ export class StageScene implements GameHost {
     return true;
   }
 
-  clearEnemyBullets(): void {
+  clearEnemyBullets(resetFixedSlotStorage = false): void {
     this.enemyBullets.length = 0;
     this.enemyBulletSlots?.fill(null);
+    if (resetFixedSlotStorage) {
+      // Th07.exe (v1.00b) FUN_00422ea0 @ 0x422f48: item-producing clear
+      // modes 1..8 `rep stos` the whole 0xd68-byte bullet slot after the
+      // item spawn. This clears the slot-local +0xbfe off-screen counter.
+      // Silent mode 0/10 and FUN_00423100 only enter state 5 and preserve
+      // that field, so callers must request the hard reset explicitly.
+      this.enemyBulletOffscreenCounters?.fill(0);
+    }
   }
 
   removeEnemyBullet(bullet: EnemyBullet): void {
@@ -830,10 +886,41 @@ export class StageScene implements GameHost {
     this.enemyBullets = rebuilt;
   }
 
+  private syncItemSlots(): void {
+    this.itemSlots ??= new Array(ITEM_POOL_CAP).fill(null);
+    if (!Number.isInteger(this.itemPoolCursor)) this.itemPoolCursor = 0;
+    const live = this.items.filter((item) => item && !item.dead);
+    let valid = live.length === this.itemSlots.reduce((n, item) => n + (item ? 1 : 0), 0);
+    if (valid) {
+      for (const item of live) {
+        if (item.poolSlot < 0 || item.poolSlot >= ITEM_POOL_CAP || this.itemSlots[item.poolSlot] !== item) {
+          valid = false;
+          break;
+        }
+      }
+    }
+    if (valid) return;
+    this.itemSlots.fill(null);
+    const rebuilt: ItemEntity[] = [];
+    for (const item of live) {
+      let slot = Number.isInteger(item.poolSlot) ? item.poolSlot : -1;
+      if (slot < 0 || slot >= ITEM_POOL_CAP || this.itemSlots[slot] !== null) {
+        slot = this.itemSlots.indexOf(null);
+      }
+      if (slot < 0) { item.dead = true; continue; }
+      item.poolSlot = slot;
+      this.itemSlots[slot] = item;
+      rebuilt.push(item);
+    }
+    rebuilt.sort((a, b) => a.poolSlot - b.poolSlot);
+    this.items = rebuilt;
+  }
+
   private syncFixedPools(): void {
     this.syncEnemySlots();
     this.syncPlayerBulletSlots();
     this.syncEnemyBulletSlots();
+    this.syncItemSlots();
     this.syncEffectSlots();
   }
 
@@ -946,7 +1033,7 @@ export class StageScene implements GameHost {
 
   // Stage-clear bonus, exe-exact (FUN_00429446's credit block @
   // all.c:18308-18337, display strings @ all.c:17038-17120):
-  //   internal = stage*100000 + graze*50 + pointItems*5000 + cherry
+  //   internal = stage*100000 + stageGraze*50 + stagePointItems*5000 + cherryMax
   //   [+ lives*2,000,000 + bombs*400,000 on route-final clears (stage>5)]
   //   Easy /2, Hard *12/10, Lunatic *15/10, Extra <<1; Normal AND Phantasm
   //   have no arm (x1.0 — the Phantasm screen prints no Rank line at all).
@@ -955,8 +1042,10 @@ export class StageScene implements GameHost {
   // trick); the score field gains the internal total via ten +=/10 ticks.
   private computeClearBonus(): void {
     const finalClear = this.stageNumber >= 6;
+    const stageGraze = this.graze - this.stageEntryGraze;
+    const stagePointItems = this.pointItems - this.stageEntryPointItems;
     let internal =
-      this.stageNumber * 100000 + this.graze * 50 + this.pointItems * 5000 + this.cherry.cherry;
+      this.stageNumber * 100000 + stageGraze * 50 + stagePointItems * 5000 + this.cherry.cherryMax;
     let playerBonus = 0;
     let bombBonus = 0;
     if (finalClear) {
@@ -970,9 +1059,13 @@ export class StageScene implements GameHost {
     if (this.continuesUsed > 0) internal = Math.trunc((internal * 5) / 10);
     this.clearBonus = {
       clear: this.stageNumber * 1000000,
-      point: this.pointItems * 50000,
-      graze: this.graze * 500,
-      cherry: this.cherry.cherry * 10,
+      point: stagePointItems * 50000,
+      graze: stageGraze * 500,
+      // FUN_00427269 stores DAT_00625868 (cherryMax), not DAT_0062586c
+      // (live cherry), into the results block. Stage 1 is the decisive
+      // witness: native clear credit 915750 uses 320000 cherryMax; using its
+      // 128770 live cherry produced only 628900.
+      cherry: this.cherry.cherryMax * 10,
       player: playerBonus * 10,
       bomb: bombBonus * 10,
       mult,
@@ -1179,12 +1272,23 @@ export class StageScene implements GameHost {
   }
 
   spawnItem(type: ItemType, x: number, y: number, options: { state?: number; vx?: number; vy?: number; tweenTarget?: { tx: number; ty: number } } = {}): void {
-    // Th07.exe item pool is a fixed 1100-slot array — FUN_00430970 scans for
-    // a free slot and silently drops the spawn when none is left (the 0x44c
-    // loop bound appears in every item pass, e.g. FUN_00431d10/FUN_00431da0).
-    // Without the cap, a Lunatic boss-phase sweep pushed 1000+ items in one
-    // frame on top of the existing field and the item pass froze the game.
-    if (this.items.length >= 1100) return;
+    // Th07.exe FUN_00430970 @ 0x430970: a rotating next-fit cursor scans the
+    // fixed 1100-slot pool, advancing once for every tested slot and leaving
+    // the cursor immediately after the allocation. The item manager later
+    // updates live slots in ascending physical order, not spawn order.
+    this.itemSlots ??= new Array(ITEM_POOL_CAP).fill(null);
+    if (!Number.isInteger(this.itemPoolCursor)) this.itemPoolCursor = 0;
+    let slot = -1;
+    for (let scanned = 0; scanned < ITEM_POOL_CAP; scanned++) {
+      const candidate = this.itemPoolCursor;
+      this.itemPoolCursor++;
+      if (this.itemPoolCursor >= ITEM_POOL_CAP) this.itemPoolCursor = 0;
+      if (this.itemSlots[candidate] === null) {
+        slot = candidate;
+        break;
+      }
+    }
+    if (slot < 0) return;
     // Th07.exe (v1.00b) item spawn primitive FUN_00430970 @ 0x430970: at full
     // power, power(0)/bigPower(2) drops convert to bigCherry(7) -- so max-power
     // players get value items instead of wasted power.
@@ -1192,18 +1296,32 @@ export class StageScene implements GameHost {
     // Spawn mode 2 (FUN_00430970 all.c:21852-21862): the item lerps from its
     // spawn point to the caller's target over 60 frames (see updateItems).
     const tween = options.tweenTarget
-      ? { sx: x, sy: y, tx: options.tweenTarget.tx, ty: options.tweenTarget.ty, elapsed: 0, frac: 0 }
+      ? {
+          sx: Math.fround(x),
+          sy: Math.fround(y),
+          tx: Math.fround(options.tweenTarget.tx),
+          ty: Math.fround(options.tweenTarget.ty),
+          elapsed: 0,
+          frac: 0
+        }
       : undefined;
-    this.items.push({
+    const item: ItemEntity = {
       id: this.id++,
-      x, y,
-      vx: options.vx ?? 0,
-      vy: options.vy ?? -2.2,
+      poolSlot: slot,
+      // FUN_00430970 stores the item motion block at +0x24c..+0x26c as
+      // float32. Keeping JS doubles shifts collection frames and the
+      // round(y-PoC) score boundary despite otherwise-exact replay events.
+      x: Math.fround(x),
+      y: Math.fround(y),
+      vx: Math.fround(options.vx ?? 0),
+      vy: Math.fround(options.vy ?? -2.2),
       type,
       age: 0,
       state: tween ? 2 : options.state ?? 0,
       ...(tween ? { tween } : {})
-    });
+    };
+    this.itemSlots[slot] = item;
+    this.insertByPoolSlot(this.items, item);
   }
 
   spawnEffectParticles(
@@ -1415,6 +1533,11 @@ export class StageScene implements GameHost {
     // 1 post-boss) — entries 0/1 Reimu, 10/11 Marisa, 20/21 Sakuya. The ECL
     // timeline passes only the phase; the engine adds the character offset.
     const entry = CHARACTERS[this.playerObj.character].family * 10 + index;
+    // FUN_0042819f @ all.c:17734-17752: after the pre-dialogue clear above,
+    // a phase-0 entry (`entry % 10 == 0`) in Stage 6/Extra/Phantasm writes
+    // item type 9 to DAT_0099fa98. Native Stage-6 processing 5944 then passes
+    // type=9 from FUN_00422ea0 to every FUN_00430970 constructor call.
+    if (entry % 10 === 0 && this.stageNumber >= 6) this.cancelItemType = 'case9Cherry';
     this.dialogue = new DialogueRunner(this.runtime.msg, entry, {
       playBgm: (track) => {
         // Th07.exe FUN_00428392 case 7 (@ 0x4288ae): the argument indexes
@@ -1423,8 +1546,41 @@ export class StageScene implements GameHost {
         const name = stageBgmTrack(this.stageNumber, track);
         if (name) this.audio.playBgm(name);
       },
-      fadeBgm: () => this.audio.fadeOutBgm(4)
+      fadeBgm: () => this.audio.fadeOutBgm(4),
+      showStageResults: () => {
+        // FUN_00428392 case 9 runs at MSG priority 13. The clear-bonus
+        // manager is earlier in the scheduler, so it observes the flag and
+        // credits the snapshotted tally on the following frame.
+        if (!this.stageResultsActive) this.stageResultsPending = true;
+      },
+      finishStage: () => {
+        // FUN_00428392 case 0xb has two distinct scheduler exits. Stages 1-5
+        // set manager+0x209bc; FUN_00426656 publishes game state 3 only on
+        // the NEXT priority-13 tick, after one final replay PRE/gameplay pass.
+        // Route-final stages write DAT_0056ba88 immediately and have no extra
+        // PRE row. For 1-5, leaving the dialogue inactive lets timeline op9
+        // fall through on that final tick and the common tail latch the clear.
+        if (this.stageNumber >= 6) this.finishStageResults();
+      }
     });
+  }
+
+  private activateStageResults(): void {
+    if (this.stageResultsActive) return;
+    this.stageResultsPending = false;
+    this.stageResultsActive = true;
+    this.stageClearTimer = 0;
+    this.computeClearBonus();
+    this.startStageClearPresentation();
+  }
+
+  private finishStageResults(): void {
+    // Every authored post-boss flow reaches op9 first. Keep the fallback for
+    // malformed/debug tracks without manufacturing a second bonus credit.
+    if (!this.stageResultsActive) this.activateStageResults();
+    if (this.stageClear) return;
+    this.stageClear = true;
+    this.clearTimer = 1;
   }
 
   isDialogueActive(): boolean {
@@ -1469,6 +1625,7 @@ export class StageScene implements GameHost {
       decayPerSec: Math.trunc(base / (timerSec + 10)),
       grazeBonus: 0,
       elapsed: 0,
+      elapsedFrac: 0,
       declAge: 0,
       portraitSprite
     };
@@ -1484,6 +1641,12 @@ export class StageScene implements GameHost {
   }
 
   endBossSpell(): boolean {
+    // Th07.exe FUN_0040f340 @ 0x40f340 gates the entire phase-end path on
+    // DAT_012f40a8 != 0. Boss death callbacks reuse op91 after nonspells too;
+    // in that case the native function is a no-op and must not sweep helper
+    // enemies a second time. Stage 4 PRE16236 is the fixed-slot witness: the
+    // false sweep duplicated two Sub77 trails into 14 extra cherry items.
+    const hadActiveSpell = this.spellcard !== null;
     if (this.spellcard?.capturing) {
       // Th07.exe FUN_0040f340 @ 0x40f340: award = decayed base + graze
       // additions; the banner shows the full value while the score field
@@ -1504,7 +1667,7 @@ export class StageScene implements GameHost {
     // Exe FUN_0040f340: the scored phase-end field sweep only runs when the
     // spell did not time out (DAT_012f40a8 still 1). Getting HIT during the
     // spell voids the bonus but NOT the sweep.
-    const sweep = !this.phaseTimedOut;
+    const sweep = hadActiveSpell && !this.phaseTimedOut;
     this.phaseTimedOut = false;
     return sweep;
   }
@@ -1553,18 +1716,18 @@ export class StageScene implements GameHost {
   }
 
   // Th07.exe FUN_00422ea0(1) (op80, spell declare, full-power crossing):
-  // every live enemy bullet becomes an auto-collecting small cherry item
-  // (type 6 = the cancel type FUN_00421a40 bakes into +0x37a160; mode 1
-  // sets the item's autocollect byte +0x27f). No score popups on this path.
+  // every live enemy bullet becomes an auto-collecting item using the bullet
+  // manager's live +0x37a160 type (6 initially; Stage 6-8 pre-boss dialogue
+  // changes it to 9). No score popups are created by this conversion.
   cancelBulletsToItems(): void {
     for (const b of this.enemyBullets) {
       if (b.dead) continue;
-      this.spawnItem('cherry', b.x, b.y, { state: 1 });
+      this.spawnItem(this.cancelItemType, b.x, b.y, { state: 1 });
     }
-    this.clearEnemyBullets();
+    this.clearEnemyBullets(true);
     // FUN_00422ea0(1) also converts each non-immune live laser at its
     // origin and every 32 px along [nearDist, farDist).
-    this.cancelLaserField(false, true);
+    this.cancelLaserField(false, true, false);
   }
 
   // Th07.exe FUN_00423100(8000,1) (op91 spell end, boss nonspell death):
@@ -1576,7 +1739,7 @@ export class StageScene implements GameHost {
     let value = 2000;
     for (const b of this.enemyBullets) {
       if (b.dead) continue;
-      this.spawnItem('cherry', b.x, b.y, { state: 1 });
+      this.spawnItem(this.cancelItemType, b.x, b.y, { state: 1 });
       // FUN_00423100 @ all.c:15624: escalating popup per bullet — white
       // while ramping, yellow once the 8000 cap is reached.
       this.spawnScorePopup(value, b.x, b.y, value < 8000 ? 0xffffffff : 0xffffff00);
@@ -1586,7 +1749,7 @@ export class StageScene implements GameHost {
     this.clearEnemyBullets();
     // FUN_00423100 does not apply the bomb-immunity flag to lasers. Their
     // converted items do not contribute to the escalating score total.
-    this.cancelLaserField(true, true);
+    this.cancelLaserField(true, true, true);
     return total;
   }
 
@@ -1600,7 +1763,7 @@ export class StageScene implements GameHost {
     this.cancelLaserField(unconditional, false);
   }
 
-  private cancelLaserField(unconditional: boolean, spawnItems: boolean): void {
+  private cancelLaserField(unconditional: boolean, spawnItems: boolean, includeOrigin = false): void {
     for (const l of this.enemyLasers) {
       if (!l.inUse) continue;
       if ((l.flags & 4) !== 0 && !unconditional) continue;
@@ -1609,13 +1772,17 @@ export class StageScene implements GameHost {
         l.phaseFrame = 0;
         l.width = l.displayWidth;
         if (spawnItems) {
-          this.spawnItem('cherry', l.x, l.y, { state: 1 });
+          // FUN_00423100 emits an explicit origin item before sampling the
+          // beam, but FUN_00422ea0 does not. When nearDist is zero the former
+          // intentionally duplicates the origin; sharing that behavior made
+          // every spell declaration add one spurious item per live laser.
+          if (includeOrigin) this.spawnItem(this.cancelItemType, l.x, l.y, { state: 1 });
           const cos = Math.cos(l.angle);
           const sin = Math.sin(l.angle);
           // Th07.exe (v1.00b) FUN_00422ea0 @ 0x422ea0 and
           // FUN_00423100 @ 0x423100; DAT_0048ead4 = 32.0f.
           for (let d = l.nearDist; d < l.farDist; d += 32) {
-            this.spawnItem('cherry', l.x + cos * d, l.y + sin * d, { state: 1 });
+            this.spawnItem(this.cancelItemType, l.x + cos * d, l.y + sin * d, { state: 1 });
           }
         }
       }
@@ -1709,15 +1876,18 @@ export class StageScene implements GameHost {
       this.openPause();
       return;
     }
+    if (this.stageResultsPending) this.activateStageResults();
     // Declined / exhausted continues: linger on GAME OVER, then leave.
     // Practice has no continues and leaves the same way.
     if (this.gameOver && this.mode !== 'test') {
       if (++this.gameOverTimer > 240) this.exitToTitle();
     }
-    if (this.stageClear) {
+    if (this.stageResultsActive) {
       this.stageClearTimer++;
       this.clearLoadingRunner?.update(this.slowRate);
       this.clearCaptureRunner?.update(this.slowRate);
+    }
+    if (this.stageClear) {
       // Advance on Z once the tally has been visible for a beat, or after
       // the timeout. Stages 1-5 hand the run to the next stage; stage 6 /
       // Extra / Phantasm end the credit back at the title.
@@ -1828,15 +1998,6 @@ export class StageScene implements GameHost {
     if (this.spellBanner > 0) this.spellBanner--;
     if (this.spellcard) {
       this.spellcard.declAge++;
-      // Bonus decay runs only while the capture is still valid (exe gates
-      // the decay on DAT_012f40a4, all.c:7331); floored to tens like the
-      // exe's floor10 write at all.c:7334.
-      const sc = this.spellcard;
-      if (sc.capturing) {
-        sc.elapsed++;
-        const decayed = sc.bonusBase - Math.trunc((sc.decayPerSec * sc.elapsed) / 60);
-        sc.bonus = Math.max(0, decayed - (decayed % 10));
-      }
     }
     if (this.bonusPopup && --this.bonusPopup.timer <= 0) this.bonusPopup = null;
     if (this.borderMessage) {
@@ -1925,11 +2086,9 @@ export class StageScene implements GameHost {
     // one extra snow tick in the recorded stream and delayed the clear bonus
     // beyond the replay boundary.
     if (!this.stageClear && this.runtime.isTimelineComplete() && !this.bossActive && this.enemies.length <= 1) {
-      this.stageClear = true;
-      this.clearTimer = 1;
+      if (!this.stageResultsActive) this.activateStageResults();
+      this.finishStageResults();
       this.audio.fadeOutBgm(4);
-      this.computeClearBonus();
-      this.startStageClearPresentation();
     }
     if (this.score > this.hiScore) this.hiScore = this.score;
   }
@@ -2532,11 +2691,28 @@ export class StageScene implements GameHost {
   }
 
   private tickPlayerShotCollisionClock(specialState: boolean): void {
+    const rate = Math.fround(this.slowRate);
     if (specialState) {
-      // FUN_0043e2e0 states 3/4 decrement +0x16a08 without refreshing
-      // +0x16a00, so the two fields remain unequal on every wall frame.
+      // Both state-3 invulnerability and state-4 Border setup initialize the
+      // timer fraction to zero. FUN_00436a06's <=0.99 slow path then stores
+      // current->previous, subtracts the float32 rate, and retreats the
+      // integer only when the fraction crosses below zero. This makes the
+      // first special-state tick scan, followed by the authored slow cadence.
+      if (!this.playerShotCollisionClockSpecial) this.playerShotCollisionClockFrac = 0;
       this.playerShotCollisionClockSpecial = true;
-      this.playerShotCollisionClockAdvanced = true;
+      if (rate > 0.99) {
+        // Fast path decrements the current integer without overwriting the
+        // -999 previous-value sentinel, so every wall frame scans.
+        this.playerShotCollisionClockAdvanced = true;
+      } else {
+        this.playerShotCollisionClockFrac = Math.fround(this.playerShotCollisionClockFrac - rate);
+        if (this.playerShotCollisionClockFrac < 0) {
+          this.playerShotCollisionClockFrac = Math.fround(this.playerShotCollisionClockFrac + 1);
+          this.playerShotCollisionClockAdvanced = true;
+        } else {
+          this.playerShotCollisionClockAdvanced = false;
+        }
+      }
       return;
     }
     if (this.playerShotCollisionClockSpecial) {
@@ -2545,7 +2721,6 @@ export class StageScene implements GameHost {
       this.playerShotCollisionClockFrac = 0;
       this.playerShotCollisionClockSpecial = false;
     }
-    const rate = Math.fround(this.slowRate);
     if (rate > 0.99) {
       // FUN_00436acc's fast path increments the integer directly and leaves
       // any pre-existing fractional residue untouched.
@@ -2563,14 +2738,27 @@ export class StageScene implements GameHost {
 
   private collidePlayerShotsInBox(e: Enemy, hitbox: { x: number; y: number; z: number }): void {
     const anm = this.playerObj.anm;
+    // Th07.exe (v1.00b) FUN_0043a980 @ 0x43a9e6-0x43aa13 builds the four
+    // ENEMY edges first and fstp-stores each as f32. Bullet edges stay in
+    // x87 until the inclusive comparisons. The algebraically equivalent
+    // center-distance test rounds at different places; one SakuyaA knife
+    // can then move across an edge by a frame and change the aggregated
+    // focused-boss Cherry+ award without changing kill/RNG event streams.
+    const enemyMinX = Math.fround(Math.fround(e.x) - Math.fround(hitbox.x) * 0.5);
+    const enemyMinY = Math.fround(Math.fround(e.y) - Math.fround(hitbox.y) * 0.5);
+    const enemyMaxX = Math.fround(Math.fround(e.x) + Math.fround(hitbox.x) * 0.5);
+    const enemyMaxY = Math.fround(Math.fround(e.y) + Math.fround(hitbox.y) * 0.5);
     for (let slot = 0; slot < PLAYER_BULLET_POOL_CAP; slot++) {
       const b = this.playerBulletSlots[slot];
       if (!b) continue;
       if (b.dead) continue;
       if (b.state !== 'fired' && b.shotType !== 3) continue;
-      const hw = (hitbox.x + b.hitboxW) / 2;
-      const hh = (hitbox.y + b.hitboxH) / 2;
-      if (Math.abs(b.x - e.x) <= hw && Math.abs(b.y - e.y) <= hh) {
+      const bulletMinX = Math.fround(b.x) - Math.fround(b.hitboxW) * 0.5;
+      const bulletMinY = Math.fround(b.y) - Math.fround(b.hitboxH) * 0.5;
+      const bulletMaxX = Math.fround(b.x) + Math.fround(b.hitboxW) * 0.5;
+      const bulletMaxY = Math.fround(b.y) + Math.fround(b.hitboxH) * 0.5;
+      if (bulletMinY <= enemyMaxY && bulletMinX <= enemyMaxX &&
+          enemyMinY <= bulletMaxY && enemyMinX <= bulletMaxX) {
         if (b.shotType === 4 || b.shotType === 5) {
           if ((Math.floor(b.age) & 1) === 0) {
             this.damageEnemy(e, b.damage);
@@ -2829,6 +3017,7 @@ export class StageScene implements GameHost {
       this.onGrazeAward(b.x, b.y);
     }
     if (dx > b.grazeW / 2 + p.hitboxHalf || dy > b.grazeH / 2 + p.hitboxHalf) return;
+    this.onPlayerContact?.('bullet');
     // FUN_0043b200 result 1 consumes the touching bullet while the player is
     // materializing, invulnerable, bombing, or already in the deathbomb state.
     if (p.invulnFrames > 0 || p.bombInvuln > 0 || p.hitState) {
@@ -2884,6 +3073,7 @@ export class StageScene implements GameHost {
     }
     if (Math.abs(x - px) <= hitbox.x / 3 + p.hitboxHalf &&
         Math.abs(y - py) <= hitbox.y / 3 + p.hitboxHalf) {
+      this.onPlayerContact?.('body');
       this.onPlayerHit(null, 'body');
     }
   }
@@ -2916,10 +3106,14 @@ export class StageScene implements GameHost {
     this.adjustRank(6);
     this.graze++;
     this.addScore(200);
-    this.cherry.onGraze(this.focusHeld);
+    // FUN_0043bb30 @ all.c:27969-27978 reads the current Cherry value into
+    // DAT_012f40b0 BEFORE FUN_0042de56/0042de03 apply this graze's Cherry
+    // gains. Reversing that order crosses the /1500 step one graze early;
+    // Yuyuko spell 115 crosses three such steps and was over-awarded by 60.
     if (this.spellcard) {
       this.spellcard.grazeBonus += 2500 + Math.trunc(this.cherry.cherry / 1500) * 20;
     }
+    this.cherry.onGraze(this.focusHeld);
     this.playSfx(30);
   }
 
@@ -2987,7 +3181,10 @@ export class StageScene implements GameHost {
     // is overwritten to state 3 (invuln) — the miss is cancelled outright.
     if (rescueDeathbomb) p.hitState = false;
     this.voidSpellCapture();
-    p.invulnFrames = Math.max(p.invulnFrames, 40);
+    if (p.invulnFrames < 40) {
+      p.invulnFrames = 40;
+      p.invulnFrac = 0;
+    }
     this.borderClearWave = { x: p.x, y: p.y, radius: 32, ticksLeft: 50, createdFrame: this.frame };
     // Th07.exe FUN_0043eb00 @ 0x43ed6c-0x43ed89.
     this.playSfx(7);
@@ -3011,6 +3208,7 @@ export class StageScene implements GameHost {
         this.runtime.tickEnemyCore(this, e);
         if (e.dead) break;
         this.runtime.integrateEnemyPosition(e, this.slowRate);
+        this.tickSpellBonusDecay(e);
         this.updateEnemyTrailHistory(e);
         this.updateEnemyCull(e);
         if (e.dead) break;
@@ -3049,6 +3247,42 @@ export class StageScene implements GameHost {
       }
     }
     this.enemies = this.enemies.filter((e) => !e.dead);
+  }
+
+  private tickSpellBonusDecay(e: Enemy): void {
+    // FUN_0041d050's spell block runs inside the main boss's enemy-manager
+    // pass, after ECL execution/movement and before player-shot collision.
+    // Thus an ECL op91 skips this tick, while a shot-killed card later in the
+    // same pass includes it before endBossSpell banks the bonus.
+    if (!e.ecl.isBoss || e.ecl.bossSlot !== 0) return;
+    const sc = this.spellcard;
+    if (!sc?.capturing) return;
+    // Th07.exe FUN_0041d050 @ all.c:7328-7338: op135's enemy+0x2e2a
+    // bit 6 suppresses the DAT_012f40ac decay write, while the shared spell
+    // clock below keeps advancing. Yuyuko's final 反魂蝶 branch executes
+    // op135(1) immediately after declaring spells 112-115, so their authored
+    // base bonus remains frozen. Decaying spell 115 for its full 4081 ticks
+    // under-awarded the native capture by 264,968 live score units.
+    if (!e.ecl.spellTimeoutFlag) {
+      // Native x87 order @ 0x4168c8-0x41690e is
+      // ftol(base - decayPerSec * (elapsed + frac) / 60), followed by the
+      // floor-to-10. Truncating the decay term before subtracting rounds the
+      // opposite way and over-awards one live score unit on some captures.
+      const decayed = Math.trunc(
+        sc.bonusBase - (sc.decayPerSec * (sc.elapsed + sc.elapsedFrac)) / 60
+      );
+      sc.bonus = Math.max(0, decayed - (decayed % 10));
+    }
+    const rate = Math.fround(this.slowRate);
+    if (rate > 0.99) {
+      sc.elapsed++;
+    } else {
+      sc.elapsedFrac = Math.fround(sc.elapsedFrac + rate);
+      if (sc.elapsedFrac >= 1) {
+        sc.elapsed++;
+        sc.elapsedFrac = Math.fround(sc.elapsedFrac - 1);
+      }
+    }
   }
 
   private updateEnemyTrailHistory(e: Enemy): void {
@@ -3218,18 +3452,38 @@ export class StageScene implements GameHost {
       // graze boundaries by one frame (Stage 5 slot 738 @ PRE7774).
       b.x = Math.fround(b.x + b.vx * b.spawnMoveScale);
       b.y = Math.fround(b.y + b.vy * b.spawnMoveScale);
-      b.spawnAge = spawnAge + rate;
-      if (b.spawnAge < b.spawnDuration) return false;
+      // The authored spawn ANM uses the engine's integer/fraction split
+      // clock, but its copied VM begins at logical frame 1. Native state 2
+      // performs the half-move and tests `(intFrame + 1)` against the
+      // time-24 remove instruction BEFORE advancing the pair (Stage-5 slot
+      // 449 direct trace, processing 11132). This is 24 wall ticks at rate
+      // 1 and 70 wall ticks at rate 1/3, not 72.
+      b.spawnAgeFrac ??= 0;
+      const spawnEnded = spawnAge + 1 >= b.spawnDuration;
+      if (!spawnEnded) {
+        if (rate > 0.99) {
+          b.spawnAge = spawnAge + 1;
+        } else {
+          b.spawnAge = spawnAge;
+          b.spawnAgeFrac += rate;
+          if (b.spawnAgeFrac >= 1) {
+            b.spawnAge++;
+            b.spawnAgeFrac -= 1;
+          }
+        }
+        return false;
+      }
       // Th07.exe FUN_004241c0 @ 0x424843-0x424860: an ending spawn ANM
       // changes state to 1, resets the normal age counter, and falls through
       // to the ordinary behavior/full-velocity move on this same tick.
       b.spawnAge = b.spawnDuration;
+      b.spawnAgeFrac = 0;
       b.age = 0;
     }
     // Constructor promotion happens in FUN_00421e90. Every normal-state
     // manager tick performs exactly one further queue pass BEFORE executing
     // active behavior routines (FUN_004241c0 @ all.c:16120).
-    advanceBulletExBehavior(b);
+    advanceBulletExBehavior(b, rate);
     if (b.exFlags & 1) {
       // speed-ramp (FUN_00423840): velocity = polar(angle, speed + 5·decay)
       // for 17 frames; then just clears the bit. Never writes the speed
@@ -3403,6 +3657,7 @@ export class StageScene implements GameHost {
     for (const l of this.enemyLasers) {
       if (!l.inUse) continue;
       let retired = false;
+      let transitionedFromGrow = false;
       // exe FUN_004241c0: farDist growth is rate-scaled; the phase clock is
       // a split counter at the same rate (spec-slowmo.md §3.1/§3.2).
       l.farDist += l.speed * lrate;
@@ -3433,13 +3688,19 @@ export class StageScene implements GameHost {
           l.phaseFrame = 0;
           l.phaseFrac = 0;
           l.displayWidth = l.width;
+          transitionedFromGrow = true;
         }
+        // Native jumps into HOLD with the state byte/phase already updated,
+        // but FUN_004241c0 keeps the grow branch's stack-local collision box
+        // for this second call (all.c:16221-16274). Recomputing from state=1
+        // expands it to the whole beam and produced two false Stage-6 grazes
+        // at processing 25206.
+        if (transitionedFromGrow) this.resolveLaserCollision(l, 0);
       }
       // Native grow completion jumps directly into the HOLD label in this
-      // same manager pass: collision is evaluated once with the final grow
-      // geometry and again with phase-0 hold geometry, then the common tail
-      // advances phase to 1. Keep this as a second `if`, not `else if`.
-      if (l.state === 1) {
+      // same manager pass. The transition call above owns its stale grow
+      // geometry; ordinary HOLD frames enter here directly.
+      if (l.state === 1 && !transitionedFromGrow) {
         l.displayWidth = l.width;
         this.resolveLaserCollision(l);
         if (l.phaseFrame >= l.holdDuration) {
@@ -3453,8 +3714,8 @@ export class StageScene implements GameHost {
         }
       }
       // HOLD completion likewise falls through to phase-0 SHRINK collision
-      // before the shared phase tick. This transition-frame double test is
-      // observable through the 12-frame laser-graze RNG cadence.
+      // before the shared phase tick. Unlike GROW -> HOLD, the native branch
+      // recomputes the shrinking midpoint box before this call.
       if (!retired && l.state === 2) {
         if ((l.flags & 1) === 0) {
           l.displayWidth = Math.max(0, l.width - (l.phaseFrame * l.width) / Math.max(1, l.shrinkDuration));
@@ -3486,9 +3747,12 @@ export class StageScene implements GameHost {
     }
   }
 
-  private resolveLaserCollision(l: EnemyLaser): void {
-    const result = this.checkLaserCollision(l);
-    if (result === 'hit') this.onPlayerHit(null, 'laser');
+  private resolveLaserCollision(l: EnemyLaser, geometryState = l.state): void {
+    const result = this.checkLaserCollision(l, geometryState);
+    if (result === 'hit') {
+      this.onPlayerContact?.('laser');
+      this.onPlayerHit(null, 'laser');
+    }
     else if (result === 'graze') this.onGrazeAward();
   }
 
@@ -3498,7 +3762,7 @@ export class StageScene implements GameHost {
   // axis extent is state-dependent (§7.4) — full length only during HOLD,
   // a width-sized nub around the midpoint during grow/shrink. Graze pads
   // the box by a flat 48 (DAT_0048eb94).
-  private checkLaserCollision(l: EnemyLaser): 'miss' | 'graze' | 'hit' {
+  private checkLaserCollision(l: EnemyLaser, geometryState = l.state): 'miss' | 'graze' | 'hit' {
     const inGrow = l.state === 0;
     if (inGrow && l.phaseFrame < l.telegraphDelay) return 'miss';
     if (l.state === 2 && l.phaseFrame >= l.shrinkCutoff) return 'miss';
@@ -3515,7 +3779,7 @@ export class StageScene implements GameHost {
     const perp = cos * dy - sin * dx;
     const phw = p.hitboxHalf;
     const midDist = (l.farDist - l.nearDist) / 2 + l.nearDist;
-    const extX = l.state === 1 ? l.farDist - l.nearDist : l.displayWidth / 2;
+    const extX = geometryState === 1 ? l.farDist - l.nearDist : l.displayWidth / 2;
     const extY = l.width / 2;
     const sepX = Math.abs(along - midDist) - (extX / 2 + phw);
     const sepY = Math.abs(perp) - (extY / 2 + phw);
@@ -3540,6 +3804,7 @@ export class StageScene implements GameHost {
     const pocActive = p.alive
       && (p.power >= 128 || this.difficulty > 3)
       && p.y < sht.pocLineY;
+    const rate = Math.fround(this.slowRate);
     for (const it of this.items) {
       it.age++;
       if (it.state === 2 && it.tween) {
@@ -3558,35 +3823,64 @@ export class StageScene implements GameHost {
           }
         } else {
           const t = (tw.elapsed + tw.frac) / 60;
-          it.x = t * tw.tx + (1 - t) * tw.sx;
-          it.y = t * tw.ty + (1 - t) * tw.sy;
+          it.x = Math.fround(t * tw.tx + (1 - t) * tw.sx);
+          it.y = Math.fround(t * tw.ty + (1 - t) * tw.sy);
         }
         // Split-counter advance (exe FUN_00436acc): fractional under slowmo.
-        tw.frac += this.slowRate;
+        tw.frac = Math.fround(tw.frac + rate);
         while (tw.frac >= 1) {
           tw.frac -= 1;
           tw.elapsed++;
         }
       } else {
-        if (this.cherry.borderActive || pocActive) it.state = 1;
-        if (p.alive && it.state === 1) {
-          const angle = Math.atan2(p.y - it.y, p.x - it.x);
-          it.x += Math.cos(angle) * sht.autocollectSpeed * this.slowRate;
-          it.y += Math.sin(angle) * sht.autocollectSpeed * this.slowRate;
+        if (this.cherry.borderActive) {
+          // FUN_00430c10: Border force-collection (DAT_004b5ec5) latches
+          // both the homing byte +0x27f and guaranteed-max byte +0x280.
+          // Ordinary PoC only latches +0x27f.
+          it.state = 1;
+          it.guaranteedMax = true;
+        } else if (pocActive) {
+          it.state = 1;
+        }
+        if (it.state === 1) {
+          if (p.materializeFrame >= 0) {
+            // Player state 1 (respawn materialize) clears the homing latch
+            // and writes only vy=-0.5; the previous vx is intentionally
+            // retained for this integration tick (0x430f73..0x430f8a).
+            it.vy = Math.fround(-0.5);
+            it.state = 0;
+          } else {
+            // FUN_0043f2b0 stages player-item deltas through float32 before
+            // atan2; its x87 result is then explicitly narrowed before
+            // FUN_004074e0 stores the velocity pair at +0x258/+0x25c.
+            const dx = Math.fround(p.x - it.x);
+            const dy = Math.fround(p.y - it.y);
+            const angle = Math.fround(Math.atan2(dy, dx));
+            it.vx = Math.fround(Math.cos(angle) * sht.autocollectSpeed);
+            it.vy = Math.fround(Math.sin(angle) * sht.autocollectSpeed);
+          }
         } else {
           // FUN_00430c10 @ all.c:21978-21991 integrates the current velocity
           // first, then applies gravity for the next frame.
           it.vx = 0;
-          if (it.vy < -2.2) it.vy = -2.2;
-          it.x += it.vx * this.slowRate;
-          it.y += it.vy * this.slowRate;
-          if (it.vy >= 3) it.vy = 3;
-          else it.vy += 0.03 * this.slowRate;
+          if (it.vy < Math.fround(-2.2)) it.vy = Math.fround(-2.2);
         }
+        // All non-tween states share the rate-scaled integration and the
+        // common vertical gravity/cap tail, including state-1 homing.
+        const dx = Math.fround(it.vx * rate);
+        const dy = Math.fround(it.vy * rate);
+        it.x = Math.fround(it.x + dx);
+        it.y = Math.fround(it.y + dy);
+        if (it.vy >= 3) it.vy = 3;
+        else it.vy = Math.fround(it.vy + Math.fround(Math.fround(0.03) * rate));
         // Th07.exe FUN_00430c10 @ 0x431098 compares against
         // DAT_00625850(448) + DAT_0048ead0(16), in playfield coordinates.
         if (it.y > 464) {
           it.dead = true;
+          // FUN_00430c10 clears +0x27d immediately on this branch, so a
+          // later item in the same ascending manager pass may reuse the
+          // physical slot through FUN_00430970.
+          if (this.itemSlots?.[it.poolSlot] === it) this.itemSlots[it.poolSlot] = null;
           // FUN_00430c10 @ 0x4310ae-0x4310ba: every ordinary item that
           // leaves the bottom subtracts three rank points, regardless of
           // item type. Tween-state death drops bypass this cull branch.
@@ -3601,10 +3895,22 @@ export class StageScene implements GameHost {
       const grab = sht.itemRadius / 2 + 12;
       if (p.alive && !it.dead && Math.abs(it.x - p.x) <= grab && Math.abs(it.y - p.y) <= grab) {
         this.collectItem(it);
+        // The native pickup switch keeps the current slot occupied while its
+        // nested item/effect spawns run, then clears +0x27d before advancing
+        // to the next fixed slot. Releasing only after the whole JS pass made
+        // later same-frame spawns skip reusable low slots and drifted the
+        // Stage-4 cursor by hundreds of entries.
+        if (it.dead && this.itemSlots?.[it.poolSlot] === it) this.itemSlots[it.poolSlot] = null;
       }
     }
     let w = 0;
-    for (const it of this.items) if (!it.dead) this.items[w++] = it;
+    for (const it of this.items) {
+      if (!it.dead) {
+        this.items[w++] = it;
+        continue;
+      }
+      if (this.itemSlots?.[it.poolSlot] === it) this.itemSlots[it.poolSlot] = null;
+    }
     this.items.length = w;
   }
 
@@ -3647,6 +3953,10 @@ export class StageScene implements GameHost {
             this.convertLivePowerItems();
             if (!this.spellcard) this.cancelBulletsToItems();
           }
+          // FUN_00430c10 cases 0 and 2 both credit one live score unit for
+          // every below-cap pickup (all.c:22042 / 22149). The visible popup
+          // says 10 because popup values use display×10 units.
+          this.addScore(1);
         } else if (it.type === 'power') {
           this.addScore(12800);
           this.spawnScorePopup(128000, it.x, it.y, 0xffffff00);
@@ -3680,11 +3990,11 @@ export class StageScene implements GameHost {
       }
       case 'point': {
         this.pointItems++;
-        const pts = this.cherry.pointItemScore(it.y, p.sht.pocLineY, it.state === 1);
+        const pts = this.cherry.pointItemScore(it.y, p.sht.pocLineY, it.guaranteedMax);
         this.addScore(pts);
-        // Case 1: the popup shows the pre-divide value — yellow above the
-        // collection line or when auto-collected, white otherwise.
-        const yellow = it.state === 1 || it.y <= p.sht.pocLineY;
+        // Case 1: position or +0x280 selects yellow. The +0x27f homing byte
+        // by itself does not affect value/color.
+        const yellow = !!it.guaranteedMax || it.y < p.sht.pocLineY;
         this.spawnScorePopup(pts * 10, it.x, it.y, yellow ? 0xffffff00 : 0xffffffff);
         // FUN_00430c10 @ 0x43151f-0x43154f: position alone selects the
         // award. Strictly above the PoC line is +10; on/below it is +3.
@@ -3730,6 +4040,18 @@ export class StageScene implements GameHost {
         this.cherry.onSmallCherryItem();
         break;
       }
+      case 'case9Cherry': {
+        // Exe collect case 9: the same graze-scaled score/popup as case 6,
+        // but a flat +100 cherry AND cherryPlus (FUN_00430c10,
+        // all.c:22249-22260). Stage-6 native processing 5950 collects two
+        // of these and advances cherryPlus by 200; treating them as type 6
+        // advanced it by only 40.
+        const v = this.cherry.grazeScaledItemScore(this.graze);
+        this.addScore(v);
+        this.spawnScorePopup(v * 10, it.x, it.y, 0xffffffff, true);
+        this.cherry.onCase9CherryItem();
+        break;
+      }
       case 'bigCherry': {
         // This ItemType is exe item TYPE 7 (the drop-table entry, and what
         // power drops convert to at power>=128, FUN_00430970 all.c:21819) —
@@ -3738,9 +4060,13 @@ export class StageScene implements GameHost {
         // cherry is already saturated. Saturated: white/yellow score popup;
         // otherwise a RED popup showing the cherry gain (spec-popups.md).
         if (this.cherry.cherry >= this.cherry.cherryMax) {
-          const v = this.cherry.largeCherryItemScore(it.y, this.playerObj.sht.pocLineY, it.state === 1);
+          const v = this.cherry.largeCherryItemScore(
+            it.y,
+            this.playerObj.sht.pocLineY,
+            it.guaranteedMax
+          );
           this.addScore(v);
-          const yellow = it.state === 1 || it.y <= p.sht.pocLineY;
+          const yellow = !!it.guaranteedMax || it.y < p.sht.pocLineY;
           this.spawnScorePopup(v * 10, it.x, it.y, yellow ? 0xffffff00 : 0xffffffff);
         } else {
           this.spawnScorePopup(this.cherry.largeCherryItemGain(), it.x, it.y, 0xffff4040);
@@ -4058,14 +4384,14 @@ export class StageScene implements GameHost {
     this.drawFrame(r);
     this.drawSidebar(r);
     this.drawModeTags(r);
-    if (this.stageClear) this.drawStageClearPresentation(r);
+    if (this.stageResultsActive) this.drawStageClearPresentation(r);
     this.drawSpellOverlay(r);
     this.drawDialogue(r);
     this.drawStageTitle(r);
     if (this.borderMessage) this.drawBorderMessage(r);
     if (this.bonusPopup) this.drawSpellBonusPopup(r);
     if (this.bossActive) this.drawBossMarker(r);
-    if (this.stageClear) this.drawStageClear(r);
+    if (this.stageResultsActive) this.drawStageClear(r);
     this.drawStageTransition(r);
     if (this.continueScreen) this.drawContinueScreen(r);
     else if (this.gameOver) r.text('GAME OVER', PLAYFIELD.x + 140, PLAYFIELD.y + 200, { size: 20, color: '#f66' });

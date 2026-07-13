@@ -52,7 +52,7 @@ test('player-shot enemy collision follows the native slowmo split clock', () => 
   assert.equal(scans, 1, 'third tick advances the integer and enables collision');
 });
 
-test('invulnerability/Border timer states keep collision wall-clock active', () => {
+test('invulnerability/Border collision clock retreats at the native slowmo cadence', () => {
   const scene = makeScene();
   const enemy = collisionTarget();
   let scans = 0;
@@ -61,10 +61,19 @@ test('invulnerability/Border timer states keep collision wall-clock active', () 
 
   scene.tickPlayerShotCollisionClock(true);
   scene.collidePlayerShots(enemy);
+  assert.equal(scans, 1, 'the zero-fraction first special-state tick retreats immediately');
+
   scene.tickPlayerShotCollisionClock(true);
   scene.collidePlayerShots(enemy);
-  assert.equal(scans, 2,
-    'states 3/4 retain the -999 previous-value sentinel instead of rate-gating collision');
+  scene.tickPlayerShotCollisionClock(true);
+  scene.collidePlayerShots(enemy);
+  scene.tickPlayerShotCollisionClock(true);
+  scene.collidePlayerShots(enemy);
+  assert.equal(scans, 1, 'the following three quarter-rate ticks retain the same integer');
+
+  scene.tickPlayerShotCollisionClock(true);
+  scene.collidePlayerShots(enemy);
+  assert.equal(scans, 2, 'the fifth wall tick crosses below zero and retreats again');
 
   scene.tickPlayerShotCollisionClock(false);
   scene.collidePlayerShots(enemy);

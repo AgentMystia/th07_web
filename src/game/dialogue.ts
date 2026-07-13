@@ -5,8 +5,8 @@ import type { Anm, AnmSprite } from '../formats/anm';
 // 0 end, 1 portrait enter (side, face), 2 set face (side, face), 3 text line
 // (side, lineIndex, text), 4 wait N frames, 5 portrait state (side,
 // 1 enter / 3 active / 4 inactive), 6 ECL resume ticket, 7 music change,
-// 8 boss intro line, 9/10 stage flow, 11 hide portraits, 12 BGM fadeout,
-// 13 skippability flag.
+// 8 boss intro line, 9 result snapshot, 10 post-transition stop, 11 stage
+// transition, 12 BGM fadeout, 13 skippability, 14 screen fade.
 
 export interface PortraitState {
   visible: boolean;
@@ -36,7 +36,13 @@ export class DialogueRunner {
   constructor(
     msg: Msg,
     index: number,
-    private hooks: { playBgm?(track: number): void; fadeBgm?(): void } = {}
+    private hooks: {
+      playBgm?(track: number): void;
+      fadeBgm?(): void;
+      showStageResults?(): void;
+      finishStage?(): void;
+      fadeScreen?(): void;
+    } = {}
   ) {
     this.instrs = msg.message(index) ?? [];
     if (!this.instrs.length) this.done = true;
@@ -147,9 +153,6 @@ export class DialogueRunner {
           this.bossIntroTimer = 180;
           this.waitAge = 0;
           break;
-        case 11:
-          for (const p of this.portraits) p.visible = false;
-          break;
         case 12:
           this.hooks.fadeBgm?.();
           break;
@@ -157,7 +160,30 @@ export class DialogueRunner {
           this.skippable = (instr.arg ?? 1) !== 0;
           break;
         case 9:
+          // FUN_00428392 case 9 @ 0x428aa0 snapshots the result fields and
+          // arms the priority-before-MSG clear-bonus manager. The bonus is
+          // consequently credited on the NEXT scheduler pass, while the
+          // post-boss MSG continues toward its authored exit opcode.
+          this.hooks.showStageResults?.();
+          break;
         case 10:
+          // Native case 10 is the inert instruction immediately following
+          // the stage-transition opcode. The transition tears this manager
+          // down before it can be observed again; keep a defensive stop for
+          // hosts that defer scene replacement.
+          this.done = true;
+          return;
+        case 11:
+          // FUN_00428392 case 0xb @ all.c:17936-17982 commits the live score
+          // shadow and requests the next game state. It is stage flow, not a
+          // portrait-hide opcode.
+          this.hooks.finishStage?.();
+          this.done = true;
+          return;
+        case 14:
+          // FUN_00428392 case 0xe starts the authored 402-frame screen fade.
+          this.hooks.fadeScreen?.();
+          break;
         default:
           break;
       }

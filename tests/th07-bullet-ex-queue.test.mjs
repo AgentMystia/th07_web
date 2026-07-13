@@ -34,6 +34,64 @@ function fireOne(scene, flags, exSlots, speed = 2, sprite = 0) {
   return scene.enemyBullets[0];
 }
 
+function nativeWrapF32(value) {
+  const pi = Math.fround(Math.PI);
+  const tau = Math.fround(Math.PI * 2);
+  let result = Math.fround(value);
+  while (result > pi) result = Math.fround(result - tau);
+  while (result < -pi) result = Math.fround(result + tau);
+  return result;
+}
+
+test('FUN_00421e90 stages FIRE origin, polar vector, and spawn backup through float32', () => {
+  const scene = sceneForTest();
+  scene.slowRate = 1 / 3;
+  scene.playerObj.x = 347.123456789;
+  scene.playerObj.y = 401.987654321;
+  const enemy = {
+    id: 9100,
+    x: 191.23456789,
+    y: 127.87654321,
+    ecl: { subId: 12, shootOffset: { x: 0.34567891, y: -0.23456789, z: 0 } }
+  };
+  const props = {
+    sprite: 0, offset: 0, count1: 1, count2: 1,
+    speed1: Math.fround(3.451679422576988),
+    speed2: Math.fround(0.812345678),
+    angle1: Math.fround(0.2718281828), angle2: Math.fround(0.125),
+    flags: 0x200, sfx: 0, exSlots: [null, null, null, null, null], aimMode: 0
+  };
+
+  scene.runtime.spawnBullets(scene, enemy, props);
+  const normal = scene.enemyBullets[0];
+  const shootX = Math.fround(enemy.x + enemy.ecl.shootOffset.x);
+  const shootY = Math.fround(enemy.y + enemy.ecl.shootOffset.y);
+  const dx = Math.fround(scene.playerObj.x - shootX);
+  const dy = Math.fround(scene.playerObj.y - shootY);
+  const aim = Math.fround(Math.atan2(dy, dx));
+  const angle = nativeWrapF32(Math.fround(aim + props.angle1));
+  const speed = Math.fround(props.speed1);
+  const scaledSpeed = Math.fround(speed * Math.fround(scene.slowRate));
+  const vx = Math.fround(Math.cos(angle) * scaledSpeed);
+  const vy = Math.fround(Math.sin(angle) * scaledSpeed);
+
+  assert.equal(normal.x, shootX, 'normal-state origin is copied from the f32 FIRE template');
+  assert.equal(normal.y, shootY);
+  assert.equal(normal.angle, angle, 'completed angle is wrapped and stored as f32');
+  assert.equal(normal.speed, speed, 'nominal speed remains the f32 unscaled value');
+  assert.equal(normal.vx, vx, 'FUN_004074e0 stores the cosine product as f32');
+  assert.equal(normal.vy, vy, 'FUN_004074e0 stores the sine product as f32');
+
+  scene.clearEnemyBullets();
+  scene.enemyBulletManagerEntryCount = 0;
+  scene.runtime.spawnBullets(scene, enemy, { ...props, flags: 0x202 });
+  const spawned = scene.enemyBullets[0];
+  assert.equal(spawned.x, Math.fround(shootX - Math.fround(vx * 4)),
+    'spawn-state X backs up four stored velocity vectors with f32 stores');
+  assert.equal(spawned.y, Math.fround(shootY - Math.fround(vy * 4)),
+    'spawn-state Y backs up four stored velocity vectors with f32 stores');
+});
+
 test('op79 promotes one movement slot per native bullet-manager tick', () => {
   const scene = sceneForTest();
   // Stage-1 sub20 shape: speed ramp at construction, angle change on the
@@ -94,6 +152,19 @@ test('spawn lifetime comes from both the selected state and native bullet templa
   assert.equal(largeBall.age, 0, 'transition tick falls through but leaves normal age at zero');
 });
 
+test('spawn ANM lifetime uses a split counter under 1/3 slowmo', () => {
+  const scene = sceneForTest();
+  scene.slowRate = 1 / 3;
+  const largeBall = fireOne(scene, 0x2, [null, null, null, null, null], 3, 10);
+  for (let i = 0; i < 69; i++) scene.updateBullets();
+  assert.equal(largeBall.spawnAge, 23);
+  assert.equal(largeBall.spawnAgeFrac, 0);
+  scene.updateBullets();
+  assert.equal(largeBall.spawnAge, 24, 'the frame-1 VM reaches time 24 on wall tick 70');
+  assert.equal(largeBall.spawnAgeFrac, 0);
+  assert.equal(largeBall.age, 0, 'the transition tick still falls through to normal state');
+});
+
 test('enemy-bullet integration stores float32 position every manager tick', () => {
   const scene = sceneForTest();
   const bullet = fireOne(scene, 0, [null, null, null, null, null]);
@@ -147,4 +218,19 @@ test('op79 cond-zero slot waits until all earlier behavior flags clear', () => {
   assert.equal(bullet.exBehaviorIndex, 2);
   assert.equal(bullet.exFlags, 0x10);
   assert.equal(bullet.exAccelElapsed, 1);
+});
+
+test('op79 acceleration retains the slow rate from its promotion tick', () => {
+  const scene = sceneForTest();
+  scene.slowRate = 0.5;
+  const bullet = fireOne(scene, 0x10, [
+    slot(0x10, 1, 10, 0, 0.06, Math.PI / 2),
+    null, null, null, null
+  ], 0);
+
+  // FUN_004229f0 first stores a rate-baked acceleration vector. The active
+  // FUN_00423910 tick then applies the current rate to that retained vector.
+  assert.equal(bullet.exAccel.mag, Math.fround(Math.fround(0.06) * 0.5));
+  scene.updateBullets();
+  assert.ok(Math.abs(bullet.vy - 0.015) < 1e-8);
 });

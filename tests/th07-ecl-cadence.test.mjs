@@ -307,9 +307,32 @@ test('var 10024 is the aim TOWARD the player (snapshot-then-absolute-fan idiom, 
   const game = makeHost();
   runtime.spawnEclEnemy(game, { subId: 0, x: 100, y: 100 });
   assert.equal(game.enemyBullets.length, 1);
-  const expected = Math.atan2(384 - 100, 192 - 100); // toward the player at (192,384)
-  assert.ok(Math.abs(game.enemyBullets[0].angle - expected) < 1e-9,
+  // FUN_0043f2b0 stores dx/dy and the FPATAN result as f32 before the FIRE
+  // constructor adds/wraps the per-bullet angle.
+  const expected = Math.fround(Math.atan2(Math.fround(384 - 100), Math.fround(192 - 100)));
+  assert.equal(game.enemyBullets[0].angle, expected,
     `fan center aims at the player (${game.enemyBullets[0].angle} vs ${expected})`);
+});
+
+test('random FIRE interpolates raw angle endpoints before final wrapping', () => {
+  // Th07.exe FUN_0040f6c0 -> FUN_00421e90 keeps an endpoint above +pi raw
+  // while interpolating aim mode 8, then wraps the constructed result. The
+  // Stage-3 Sub12 interval 2.734..3.362 must remain the short arc; wrapping
+  // 3.362 to -2.921 first sprays across nearly the whole circle.
+  const angle1 = 3.362481117248535;
+  const angle2 = 2.7341625690460205;
+  const fireRandom = instruction(0, 72, [
+    i32(4 | (2 << 16)), i32(1), i32(1), f32(2.5), f32(0.8),
+    f32(angle1), f32(angle2), i32(0x200)
+  ]);
+  const runtime = makeRuntime([[fireRandom]]);
+  runtime.spellActive = true;
+  const game = makeHost();
+  game.rng.range = (span) => span * 0.5;
+  runtime.spawnEclEnemy(game, { subId: 0, x: 192, y: 128 });
+  assert.equal(game.enemyBullets.length, 1);
+  assert.ok(Math.abs(game.enemyBullets[0].angle - (angle1 + angle2) / 2) < 1e-6,
+    `raw short-arc midpoint expected, got ${game.enemyBullets[0].angle}`);
 });
 
 test('op93 resolves life during t0, before the allocator writes wrapper item/score', () => {
@@ -346,8 +369,8 @@ test('mode-3 orbit updates the live heading (exe +0x2b54) that op120/var10045 re
   for (let i = 0; i < 10; i++) runtime.updateEnemy(game, e);
   const s = e.ecl;
   assert.ok(s.axisSpeed.x !== 0 || s.axisSpeed.y !== 0, 'orbiter is moving');
-  assert.ok(Math.abs(s.heading - Math.atan2(s.axisSpeed.y, s.axisSpeed.x)) < 1e-9,
-    'heading tracks the live controller vector');
+  assert.equal(s.heading, Math.fround(Math.atan2(s.axisSpeed.y, s.axisSpeed.x)),
+    'heading tracks the live controller vector through the native f32 field');
   assert.equal(s.angle, 0, 'the mode-1 polar angle stays untouched by mode 3');
   // The heading persists when the enemy stops (mode cleared, velocity zero).
   const lastHeading = s.heading;
@@ -379,4 +402,25 @@ test('auto-fire is hp-gated: a dead enemy neither fires nor advances its timer',
   assert.equal(game.enemyBullets.length, 0, 'timer was frozen, not banked, while dead');
   runtime.updateEnemy(game, e);
   assert.ok(game.enemyBullets.length > 0, 'first volley lands after the remaining 11 manager ticks');
+});
+
+test('auto-fire uses the native integer/fraction split counter under 1/3 slowmo', () => {
+  // FUN_0040f6c0 stores +0x2cb4 (integer) and +0x2cb0 (fraction)
+  // separately. A single JS double reaches only 4.999999999999999 after
+  // fifteen additions of 1/3 in this reset cadence and fires one wall tick
+  // late; the native split counter reaches integer 5 exactly on tick 15.
+  const sub = [instruction(0, 75, []), fire()];
+  const runtime = makeRuntime([sub]);
+  const game = makeHost();
+  game.slowRate = 1 / 3;
+  const e = runtime.spawnEclEnemy(game, { subId: 0, x: 200, y: 100, life: 100 });
+  e.ecl.shootInterval = 5;
+  e.ecl.shootTimer = 0;
+  e.ecl.shootTimerFrac = 0;
+  for (let i = 0; i < 14; i++) runtime.updateEnemy(game, e);
+  assert.equal(game.enemyBullets.length, 0, 'interval 5 has not elapsed after 14 wall ticks');
+  runtime.updateEnemy(game, e);
+  assert.ok(game.enemyBullets.length > 0, 'interval 5 fires on wall tick 15');
+  assert.equal(e.ecl.shootTimer, 0);
+  assert.equal(e.ecl.shootTimerFrac, 0);
 });

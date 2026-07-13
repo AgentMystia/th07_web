@@ -242,6 +242,107 @@ test('op27 own-position targets roll back into the manager delta and retain the 
     'the final op27 delta remains in +0x2b18/1c after the interpolation slot frees');
 });
 
+test('enemy manager integration writes x/y/z back as native float32 fields', () => {
+  const runtime = makeRuntime([[]]);
+  const enemy = runtime.spawnEclEnemy(makeHost(), { subId: 0, x: 160.52763, y: 77.22953, z: 0.125 });
+  enemy.ecl.axisSpeed = { x: -0.004663817, y: 0.0000012345, z: -0.00000321 };
+
+  let expectedX = enemy.x;
+  let expectedY = enemy.y;
+  let expectedZ = enemy.z;
+  for (let i = 0; i < 32; i++) {
+    expectedX = Math.fround(expectedX + enemy.ecl.axisSpeed.x);
+    expectedY = Math.fround(expectedY + enemy.ecl.axisSpeed.y);
+    expectedZ = Math.fround(expectedZ + enemy.ecl.axisSpeed.z);
+    runtime.integrateEnemyPosition(enemy);
+  }
+
+  assert.equal(enemy.x, expectedX);
+  assert.equal(enemy.y, expectedY);
+  assert.equal(enemy.z, expectedZ);
+  assert.notEqual(enemy.x, 160.52763 + enemy.ecl.axisSpeed.x * 32,
+    'the manager must not retain a double-precision accumulated coordinate');
+});
+
+test('mode-3 orbit controller and op87 laser anchors write native float32 fields', () => {
+  const runtime = makeRuntime([[]]);
+  const game = makeHost();
+  const enemy = runtime.spawnEclEnemy(game, {
+    subId: 0,
+    x: Math.fround(287.22485),
+    y: Math.fround(245.53496)
+  });
+  const state = enemy.ecl;
+  state.moveMode = 3;
+  state.orbitTarget = { x: Math.fround(192.125), y: Math.fround(160.25), z: 0 };
+  state.orbitAngle = Math.fround(-2.92);
+  state.orbitAngularVelocity = Math.fround(0.010471976);
+  state.orbitSpeed = Math.fround(128.25);
+  state.orbitAcceleration = Math.fround(-0.003125);
+
+  const rate = Math.fround(1);
+  const pi = Math.fround(Math.PI);
+  const tau = Math.fround(Math.PI * 2);
+  let expectedAngle = Math.fround(state.orbitAngle
+    + Math.fround(state.orbitAngularVelocity * rate));
+  if (expectedAngle > pi) expectedAngle = Math.fround(expectedAngle - tau);
+  else if (expectedAngle < -pi) expectedAngle = Math.fround(expectedAngle + tau);
+  const expectedSpeed = Math.fround(state.orbitAcceleration * rate + state.orbitSpeed);
+  const orbitX = Math.fround(Math.cos(expectedAngle) * expectedSpeed);
+  const orbitY = Math.fround(Math.sin(expectedAngle) * expectedSpeed);
+  const expectedX = Math.fround(orbitX + state.orbitTarget.x - enemy.x);
+  const expectedY = Math.fround(orbitY + state.orbitTarget.y - enemy.y);
+
+  runtime.tickEnemyCore(game, enemy);
+  assert.equal(state.orbitAngle, expectedAngle);
+  assert.equal(state.orbitSpeed, expectedSpeed);
+  assert.equal(state.axisSpeed.x, expectedX);
+  assert.equal(state.axisSpeed.y, expectedY);
+  assert.equal(state.heading, Math.fround(Math.atan2(expectedY, expectedX)));
+
+  const packedSpriteColor = (2 << 16) | 1;
+  const laserRuntime = makeRuntime([[
+    instruction(0, 82, [
+      i32(packedSpriteColor), f32(0), f32(0), f32(16), f32(224), f32(224), f32(16),
+      i32(120), i32(252000), i32(16), i32(16), i32(16), i32(4)
+    ]),
+    instruction(0, 87, [i32(0), f32(0.1), f32(-0.2), f32(0)])
+  ]]);
+  const laserGame = makeHost();
+  const owner = laserRuntime.spawnEclEnemy(laserGame, {
+    subId: 0,
+    x: Math.fround(287.22485),
+    y: Math.fround(245.53496)
+  });
+  assert.equal(laserGame.enemyLasers[0].x,
+    Math.fround(Math.fround(owner.x) + Math.fround(0.1)));
+  assert.equal(laserGame.enemyLasers[0].y,
+    Math.fround(Math.fround(owner.y) + Math.fround(-0.2)));
+});
+
+test('allocator-core t=0 op1 frees its slot without the manager release path', () => {
+  const runtime = makeRuntime([[
+    instruction(0, 1)
+  ]]);
+  const game = makeHost();
+  let discarded = 0;
+  game.addEnemy = (enemy) => {
+    enemy.poolSlot = 7;
+    game.enemies.push(enemy);
+    return true;
+  };
+  game.discardAllocatedEnemy = (enemy) => {
+    discarded++;
+    game.enemies.splice(game.enemies.indexOf(enemy), 1);
+  };
+
+  const enemy = runtime.spawnEclEnemy(game, { subId: 0, x: 12, y: 34 });
+  assert.equal(enemy.dead, true);
+  assert.equal(discarded, 1,
+    'FUN_0041da10/FUN_0041db60 clear the active bit directly when the core returns -1');
+  assert.deepEqual(game.enemies, [], 'the allocator slot is immediately reusable');
+});
+
 test('op100 allocates the native id13 aura at the enemy position', () => {
   const runtime = makeRuntime([[
     instruction(0, 100, [i32(6), f32(-0.3), f32(-0.7), f32(-0.3), f32(96)])
@@ -347,6 +448,71 @@ test('mode-2 movement runs controller step 1 in the allocator and step 2 on the 
     runtime.updateEnemy(game, enemy);
     close(enemy.x, 1, `mode ${mode} completion snap`);
   }
+});
+
+test('mode-2 movement stages op54/op55 interpolation fields through native float32', () => {
+  for (const sign of [-1, 1]) {
+    const angle = sign * Math.PI / 2;
+    const runtime = makeRuntime([[
+      instruction(0, 54, [i32(30), i32(0), f32(angle), f32(0.8)])
+    ]]);
+    const game = makeHost();
+    const enemy = runtime.spawnEclEnemy(game, { subId: 0, x: 192, y: 128 });
+
+    assert.equal(enemy.ecl.axisSpeed.x, 0,
+      'the near-vertical op54 target rounds back to the exact native X field');
+    assert.equal(enemy.ecl.heading, Math.fround(angle),
+      'op54 publishes the exact float32 vertical heading');
+
+    for (let frame = 1; frame < 30; frame++) runtime.updateEnemy(game, enemy);
+    assert.equal(enemy.x, 192,
+      'the completion snap must not retain a double-precision 191.999... residue');
+    assert.equal(enemy.y, Math.fround(128 + sign * 24));
+    assert.equal(enemy.ecl.heading, Math.fround(angle));
+  }
+
+  const start = {
+    x: Math.fround(191.12345),
+    y: Math.fround(73.98765),
+    z: Math.fround(-0.125)
+  };
+  const target = {
+    x: Math.fround(300.3333),
+    y: Math.fround(-12.7777),
+    z: Math.fround(4.625)
+  };
+  const duration = 7;
+  const runtime = makeRuntime([[
+    instruction(0, 55, [
+      i32(duration), i32(0), f32(target.x), f32(target.y), f32(target.z)
+    ])
+  ]]);
+  const game = makeHost();
+  const enemy = runtime.spawnEclEnemy(game, { subId: 0, ...start });
+  const delta = {
+    x: Math.fround(target.x - start.x),
+    y: Math.fround(target.y - start.y),
+    z: Math.fround(target.z - start.z)
+  };
+  const progress = Math.fround(1 / duration);
+  const firstTarget = {
+    x: Math.fround(Math.fround(progress * delta.x) + start.x),
+    y: Math.fround(Math.fround(progress * delta.y) + start.y),
+    z: Math.fround(Math.fround(progress * delta.z) + start.z)
+  };
+  assert.deepEqual(enemy.ecl.axisSpeed, {
+    x: Math.fround(firstTarget.x - start.x),
+    y: Math.fround(firstTarget.y - start.y),
+    z: Math.fround(firstTarget.z - start.z)
+  }, 'op55 publishes float32-staged per-axis deltas on its allocator tick');
+
+  for (let frame = 1; frame < duration; frame++) runtime.updateEnemy(game, enemy);
+  assert.deepEqual([enemy.x, enemy.y, enemy.z], [
+    Math.fround(start.x + delta.x),
+    Math.fround(start.y + delta.y),
+    Math.fround(start.z + delta.z)
+  ], 'op55 completion snaps through the native float32 start-plus-delta fields');
+  assert.deepEqual(enemy.ecl.axisSpeed, { x: 0, y: 0, z: 0 });
 });
 
 test('op54 uses speed times duration and mirrors the X delta', () => {
@@ -468,6 +634,22 @@ test('op59 bounds mode-1 recomputation but preserves its final velocity', () => 
   close(enemy.x, 2, 'second mode-1 tick');
   runtime.updateEnemy(game, enemy);
   close(enemy.x, 3, 'last velocity persists after mode bits clear');
+});
+
+test('op124 resolves its item id variable and preserves types 8 and 9', () => {
+  const runtime = makeRuntime([[
+    instruction(0, 4, [i32(10000), i32(8)]),
+    instruction(0, 124, [i32(10000)], 1),
+    instruction(0, 4, [i32(10000), i32(9)]),
+    instruction(0, 124, [i32(10000)], 1),
+  ]]);
+  const game = makeHost();
+  runtime.spawnEclEnemy(game, { subId: 0, x: 64, y: 96 });
+
+  assert.deepEqual(game.observations.drops, [
+    { type: 'pointBullet', x: 64, y: 96 },
+    { type: 'case9Cherry', x: 64, y: 96 },
+  ]);
 });
 
 test('op106 death modes preserve the exe lifecycle, scoring, and callback rules', () => {
@@ -608,6 +790,33 @@ test('helper sweep defers death callbacks to each fixed-slot manager pass', () =
     'zero-HP FIRE does not decode random template operands or spawn bullets');
   assert.equal(runtime.killEnemy(game, helper), true);
   assert.equal(helper.ecl.ctx.subId, 1, 'normal death switch enters the callback afterward');
+});
+
+test('helper sweep directly enters an op116-disabled actor death callback', () => {
+  const runtime = makeRuntime([
+    [],
+    [instruction(0, 4, [i32(10000), i32(99)])]
+  ]);
+  const game = makeHost();
+  const helper = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
+  helper.ecl.interactable = false;
+  helper.ecl.deathCallbackSub = 1;
+  helper.ecl.bulletRankSpeedLow = -0.15;
+  helper.ecl.periodicSub = { subId: 0, period: 10, elapsed: 3, elapsedFrac: 0 };
+
+  runtime.killNonBossEnemies(game);
+
+  assert.equal(helper.hp, 0);
+  assert.equal(helper.ecl.ctx.subId, 1,
+    'FUN_004217c0 enters the callback because the manager death gate cannot');
+  assert.equal(helper.ecl.deathCallbackSub, -1, 'the sweep consumes the callback handle');
+  assert.equal(helper.ecl.bulletRankSpeedLow, -0.15,
+    'the direct cursor entry does not apply retained-death template resets');
+  assert.notEqual(helper.ecl.periodicSub, null,
+    'the direct cursor entry does not disarm the periodic slot');
+
+  runtime.tickEnemyCore(game, helper);
+  assert.equal(helper.ecl.vars[0], 99, 'the callback runs on the helper fixed-slot pass');
 });
 
 test('stage-4 unset interrupt 12 defaults to sub 0 and cleans slots 4-6', () => {

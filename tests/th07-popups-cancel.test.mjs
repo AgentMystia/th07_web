@@ -29,8 +29,11 @@ function cancelScene() {
   scene.playerObj = { power: 0 };
   scene.items = [];
   scene.enemyBullets = [];
+  scene.enemyBulletSlots = new Array(1024).fill(null);
+  scene.enemyBulletOffscreenCounters = new Uint16Array(1024);
   scene.enemyLasers = [];
   scene.postBombLaserCounter = 0;
+  scene.cancelItemType = 'cherry';
   return scene;
 }
 
@@ -99,17 +102,19 @@ test('FUN_00422ea0(1) converts live bullets and samples non-immune lasers every 
   const normal = laser();
   const immune = laser({ x: 200, flags: 4 });
   scene.enemyLasers.push(normal, immune);
+  scene.enemyBulletOffscreenCounters[519] = 38;
 
   scene.cancelBulletsToItems();
 
   assert.deepEqual(scene.items.map((it) => [it.type, it.x, it.y, it.state]), [
     ['cherry', 1, 2, 1],
-    ['cherry', 10, 20, 1],
     ['cherry', 42, 20, 1],
     ['cherry', 74, 20, 1],
     ['cherry', 106, 20, 1]
   ]);
   assert.equal(scene.enemyBullets.length, 0);
+  assert.equal(scene.enemyBulletOffscreenCounters[519], 0,
+    'FUN_00422ea0 item conversion zeroes the complete fixed bullet slot');
   assert.equal(normal.state, 2);
   assert.equal(normal.width, 7);
   assert.equal(normal.shrinkCutoff, 0);
@@ -117,10 +122,21 @@ test('FUN_00422ea0(1) converts live bullets and samples non-immune lasers every 
   assert.equal(scene.postBombLaserCounter, 10);
 });
 
+test('Stage-6 pre-boss cancel type promotes subsequent clears from 6 to 9', () => {
+  const scene = cancelScene();
+  scene.cancelItemType = 'case9Cherry';
+  scene.enemyBullets.push({ x: 1, y: 2 });
+
+  scene.cancelBulletsToItems();
+
+  assert.deepEqual(scene.items.map((it) => [it.type, it.state]), [['case9Cherry', 1]]);
+});
+
 test('FUN_00423100 sweep converts immune lasers but excludes laser items from score total', () => {
   const scene = cancelScene();
   scene.enemyBullets.push({ x: 1, y: 2 }, { x: 3, y: 4, dead: true });
   scene.enemyLasers.push(laser({ flags: 4, nearDist: 0, farDist: 33 }));
+  scene.enemyBulletOffscreenCounters[519] = 38;
   const popups = [];
   scene.spawnScorePopup = (...args) => popups.push(args);
 
@@ -129,6 +145,32 @@ test('FUN_00423100 sweep converts immune lasers but excludes laser items from sc
   // Bullet + laser origin + d=0 + d=32. The duplicate origin is native.
   assert.equal(scene.items.length, 4);
   assert.equal(scene.enemyLasers[0].state, 2);
+  assert.equal(scene.enemyBulletOffscreenCounters[519], 38,
+    'FUN_00423100 state-5 sweep preserves the slot-local off-screen counter');
+});
+
+test('type-9 cancel Cherry shares case-6 score but awards +100 cherryPlus', () => {
+  const scene = cancelScene();
+  scene.graze = 400;
+  scene.score = 0;
+  scene.playerObj.sht = { pocLineY: 128 };
+  scene.playSfx = () => {};
+  scene.addScore = (value) => { scene.score += value; };
+  const popups = [];
+  scene.spawnScorePopup = (...args) => popups.push(args);
+  let case9Awards = 0;
+  scene.cherry = {
+    grazeScaledItemScore: () => 40,
+    onCase9CherryItem: () => { case9Awards++; }
+  };
+  const item = { type: 'case9Cherry', x: 12, y: 34, dead: false };
+
+  scene.collectItem(item);
+
+  assert.equal(item.dead, true);
+  assert.equal(scene.score, 40);
+  assert.equal(case9Awards, 1);
+  assert.deepEqual(popups, [[400, 12, 34, 0xffffffff, true]]);
 });
 
 test('bomb attack slots convert bullets to small cherry even at full power', () => {

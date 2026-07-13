@@ -17,12 +17,13 @@ const { StageScene } = await import('../tests/.build/poc-latch/stage-scene.mjs')
 
 function itemScene({ power = 128, character = 'reimuA', difficulty = 3, x = 192, y = 100 } = {}) {
   const scene = Object.create(StageScene.prototype);
+  scene.id = 1;
   scene.slowRate = 1;
   scene.difficulty = difficulty;
   scene.items = [];
   scene.cherry = { borderActive: false };
   scene.playerObj = {
-    x, y, power, character,
+    x, y, power, character, materializeFrame: -1,
     alive: true,
     sht: { pocLineY: 128, autocollectSpeed: 8, itemRadius: 24 }
   };
@@ -100,6 +101,38 @@ test('border force-collect still latches every item', () => {
   const it = addItem(scene);
   scene.updateItems();
   assert.equal(it.state, 1);
+  assert.equal(it.guaranteedMax, true, 'Border also latches native +0x280 max-value flag');
+});
+
+test('state-1 homing stores the native float32 velocity then runs the common gravity tail', () => {
+  const scene = itemScene({ power: 128, x: 192, y: 100 });
+  const it = addItem(scene, { x: 300, y: 300 });
+  const dx = Math.fround(scene.playerObj.x - it.x);
+  const dy = Math.fround(scene.playerObj.y - it.y);
+  const angle = Math.fround(Math.atan2(dy, dx));
+  const vx = Math.fround(Math.cos(angle) * scene.playerObj.sht.autocollectSpeed);
+  const vy = Math.fround(Math.sin(angle) * scene.playerObj.sht.autocollectSpeed);
+
+  scene.updateItems();
+
+  assert.equal(it.vx, vx, 'FUN_004074e0 writes vx to item+0x258');
+  assert.equal(it.x, Math.fround(300 + Math.fround(vx)), 'common integration consumes stored vx');
+  assert.equal(it.y, Math.fround(300 + Math.fround(vy)), 'gravity is after position integration');
+  assert.equal(it.vy, Math.fround(vy + Math.fround(0.03)),
+    'the common gravity tail also executes for state-1 homing');
+});
+
+test('respawn materialize clears homing but retains vx for its transition tick', () => {
+  const scene = itemScene({ power: 0, x: 192, y: 400 });
+  scene.playerObj.materializeFrame = 0;
+  const it = addItem(scene, { x: 50, y: 50, vx: 2, vy: 7, state: 1 });
+
+  scene.updateItems();
+
+  assert.equal(it.state, 0);
+  assert.equal(it.x, 52, '0x430f73 writes only vy; the previous vx survives this tick');
+  assert.equal(it.y, 49.5);
+  assert.equal(it.vy, Math.fround(-0.5 + Math.fround(0.03)));
 });
 
 test('unlatched items keep ordinary gravity fall', () => {
@@ -107,6 +140,36 @@ test('unlatched items keep ordinary gravity fall', () => {
   const it = addItem(scene, { x: 50, y: 50 });
   scene.updateItems();
   assert.equal(it.state, 0);
-  assert.ok(Math.abs(it.vy - -2.17) < 1e-9, 'gravity accel applied');
+  assert.equal(it.vy, Math.fround(Math.fround(-2.2) + 0.03), 'gravity writes back as float32');
   assert.equal(it.x, 50, 'no horizontal drift');
+});
+
+test('item allocation is rotating next-fit and manager iteration is fixed-slot order', () => {
+  const scene = itemScene({ power: 0, x: 192, y: 400 });
+  scene.playerObj.alive = false;
+  scene.spawnItem('power', 50, 50);
+  scene.spawnItem('point', 60, 50);
+  scene.spawnItem('cherry', 70, 50);
+  assert.deepEqual(scene.items.map((it) => it.poolSlot), [0, 1, 2]);
+
+  scene.items[1].dead = true;
+  scene.updateItems();
+  scene.itemPoolCursor = 1;
+  scene.spawnItem('bomb', 80, 50);
+  assert.deepEqual(scene.items.map((it) => it.poolSlot), [0, 1, 2],
+    'a freed physical slot is reused and the dense view remains slot-sorted');
+
+  const order = [];
+  scene.playerObj.alive = true;
+  for (const it of scene.items) {
+    it.x = scene.playerObj.x;
+    it.y = scene.playerObj.y;
+    it.state = 1;
+  }
+  scene.collectItem = (it) => {
+    order.push(it.poolSlot);
+    it.dead = true;
+  };
+  scene.updateItems();
+  assert.deepEqual(order, [0, 1, 2], 'FUN_00430c10 scans slots 0..1099');
 });

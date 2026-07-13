@@ -39,6 +39,23 @@ test('border triggers at 50000 cherry+ and survives with bonus (§4)', () => {
   assert.deepEqual(events, ['start', ['survived', 60000]]);
 });
 
+test('border countdown uses the native integer/f32 retreat clock under slow motion', () => {
+  const c = new CherrySystem();
+  c.debugAddCherry(CHERRY_PLUS_MAX);
+
+  c.tick(1 / 3);
+  assert.equal(c.cherryPlus, 50000, 'HUD samples integer 540 before the first retreat');
+  assert.equal(c.borderTimer, 539, 'zero fraction borrows on the first slow wall tick');
+
+  c.tick(1 / 3);
+  assert.equal(c.cherryPlus, 49907);
+  assert.equal(c.borderTimer, 539, 'the second wall tick remains in integer interval 539');
+
+  c.tick(1 / 3);
+  assert.equal(c.cherryPlus, 49907);
+  assert.equal(c.borderTimer, 538, 'f32 subtraction borrows again on the third wall tick');
+});
+
 test('border request defers and retries while player state is blocked', () => {
   let action = 'defer';
   const events = [];
@@ -187,29 +204,33 @@ test('grazeScaledItemScore matches graze/40*10+300, min 10, /10 (§3b cases 6/9)
 
 test('large-cherry-item score bonus only fires once cherry is saturated (§3b case 7, unspawned)', () => {
   const c = new CherrySystem();
-  assert.equal(c.largeCherryItemScore(100, 128, false), 0); // not at max
+  assert.equal(c.largeCherryItemScore(100, 128), 0); // not at max
   c.cherry = c.cherryMax;
-  assert.equal(c.largeCherryItemScore(100, 128, false), 5000); // 50000/10
+  assert.equal(c.largeCherryItemScore(100, 128), 5000); // 50000/10
+  assert.equal(c.largeCherryItemScore(139.528656, 128), 4890); // x87 ftol truncates 11.528 -> 11
+  assert.equal(c.largeCherryItemScore(300, 128, true), 5000); // Border +0x280 override
 });
 
-// exe-cherry-border.md §3c, base=0 collapse. v = 50000-100*round(y-pocY)
+// exe-cherry-border.md §3c, base=0 collapse. v = 50000-100*ftol(y-pocY)
 // (or 50000 at/above the line); headroom bonus/cap once cherry>50000;
 // floor10; score += v/10.
 test('point item score decays 100/px below the PoC line, floored to 10, /10 (§3c)', () => {
   const c = new CherrySystem();
-  assert.equal(c.pointItemScore(228, 128, false), 4000); // (50000-100*100)/10
-  assert.equal(c.pointItemScore(130, 128, false), 4980); // (50000-100*2)/10
-  assert.equal(c.pointItemScore(128, 128, false), 5000); // at the line: flat
-  assert.equal(c.pointItemScore(100, 128, false), 5000); // above the line: flat
+  assert.equal(c.pointItemScore(228, 128), 4000); // (50000-100*100)/10
+  assert.equal(c.pointItemScore(130, 128), 4980); // (50000-100*2)/10
+  assert.equal(c.pointItemScore(184.765747, 128), 4440); // x87 ftol truncates 56.765 -> 56
+  assert.equal(c.pointItemScore(128, 128), 5000); // at the line: zero falloff
+  assert.equal(c.pointItemScore(100, 128), 5000); // above the line: flat
 });
 
 test('point item score gets a cherry-headroom bonus below 50000, capped down above it (§3c)', () => {
   const c = new CherrySystem();
   c.cherry = 75000; // 25000 above the 50000 headroom line
   // Below the line: v=40000 (< 50000) so += floor((75000-50000)/5) = 5000.
-  assert.equal(c.pointItemScore(228, 128, false), 4500); // (40000+5000)/10
+  assert.equal(c.pointItemScore(228, 128), 4500); // (40000+5000)/10
   // At/above the line: v=50000 (>= 50000) so v is capped DOWN to cherry.
-  assert.equal(c.pointItemScore(100, 128, false), 7500); // 75000/10
+  assert.equal(c.pointItemScore(100, 128), 7500); // 75000/10
+  assert.equal(c.pointItemScore(300, 128, true), 7500); // Border +0x280 reaches cherry cap
 });
 
 test('death uses the selected SHT cherry-loss ratio and character-specific cap (§3d)', () => {

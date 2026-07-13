@@ -202,3 +202,67 @@ test('op-4 story dialogue leaves gameplay managers live while MSG input gates re
   assert.deepEqual(scene.items.map((item) => item.age), itemAges.map((age) => age + 3),
     'priority-12 item manager continues alongside the message');
 });
+
+test('Stage 6 result op9 credits next tick and op11 ends at the native replay boundary', async () => {
+  const mod = await loadEngine();
+  const rpy = new mod.Rpy(readFileSync('tests/replays/th7_udFe25.rpy'));
+  const stageIndex = 5;
+  const stage = rpy.stages[stageIndex];
+  const scene = new mod.StageScene(
+    makeStubAssets(mod), makeStubAudio(), rpy.difficulty, rpy.character,
+    stage.stage, null, stage.rngSeed
+  );
+  applySnapshot(scene, rpy, stageIndex, { restoreRng: false });
+  const source = new mod.ReplayInputSource();
+
+  // Direct native v1.00b evidence:
+  // - MSG case9 @ 0x428aa0 executes at the priority-13 tail;
+  // - FUN_004294c8 @ 0x429a6e sees its flag on the following scheduler pass;
+  // - PRE25779 reads the credited live score 116283036;
+  // - PRE rows end at 26433, whose processing executes MSG case0xb/op11.
+  for (let f = 0; f <= 25777; f++) scene.update(source.frame(stage.inputs[f] ?? 0));
+  assert.equal(scene.score, 83873016);
+  assert.equal(scene.stageResultsActive, false);
+  assert.equal(scene.stageClear, false);
+
+  scene.update(source.frame(stage.inputs[25778] ?? 0));
+  assert.equal(scene.score, 116283036);
+  assert.equal(scene.stageResultsActive, true);
+  assert.equal(scene.stageClear, false,
+    'op9 exposes the tally while the authored post-boss message keeps running');
+
+  for (let f = 25779; f <= 26433; f++) scene.update(source.frame(stage.inputs[f] ?? 0));
+  assert.equal(scene.stageClear, true);
+  assert.equal(scene.dialogue, null);
+  assert.equal(scene.score, 116283036);
+});
+
+test('Stages 1-5 defer op11 state publication through one final gameplay/PRE tick', async () => {
+  const mod = await loadEngine();
+  const rpy = new mod.Rpy(readFileSync('tests/replays/th7_udFe25.rpy'));
+  const stageIndex = 1;
+  const stage = rpy.stages[stageIndex];
+  const scene = new mod.StageScene(
+    makeStubAssets(mod), makeStubAudio(), rpy.difficulty, rpy.character,
+    stage.stage, null, stage.rngSeed
+  );
+  applySnapshot(scene, rpy, stageIndex, { restoreRng: false });
+  const source = new mod.ReplayInputSource();
+  let draws = 0;
+  const originalU16 = scene.rng.u16.bind(scene.rng);
+  scene.rng.u16 = () => { draws++; return originalU16(); };
+
+  // FUN_00428392 case 0xb sets +0x209bc for stages 1-5. FUN_00426656 does
+  // not publish game state 3 until its next priority-13 pass, so native has
+  // PRE13704 after op11. That final gameplay pass runs the ambient id20
+  // effect and consumes its exact 22 draws before the Stage-3 seed boundary.
+  for (let f = 0; f <= 13703; f++) scene.update(source.frame(stage.inputs[f] ?? 0));
+  assert.equal(scene.dialogue, null);
+  assert.equal(scene.stageClear, false);
+  assert.equal(draws, 203200);
+
+  scene.update(source.frame(stage.inputs[13704] ?? 0));
+  assert.equal(scene.stageClear, true);
+  assert.equal(draws, 203222);
+  assert.equal(scene.rng.seed, rpy.stages[stageIndex + 1].rngSeed);
+});

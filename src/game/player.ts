@@ -182,6 +182,11 @@ export class Player {
   bombs = 3;
   power = 0;
   invulnFrames = 0;
+  // Player state-3's timer is the native {integer current, f32 fraction}
+  // pair at +0x16a08/+0x16a04, retreated through FUN_00436a06. Keeping one
+  // JS double made 1/3 slowmo retain a tiny positive tail for three extra
+  // wall frames and shifted the player-shot collision gate in Stage 5.
+  invulnFrac = 0;
   // Persistent deathbomb meter, exe player+0x23f8 (site enumeration in
   // recon exe-player-hit.md): seeded to SHT.deathbombWindow at spawn and at
   // the materialize->invuln handoff (0x43e2c7), zeroed while materializing
@@ -279,7 +284,24 @@ export class Player {
   // player-side timers accumulate fractionally (spec-slowmo.md §3.1/§3.2).
   update(input: InputFrame, rate = 1, allowShotArm = true): void {
     this.updateFocusGlide(input.held.has('focus'), rate);
-    if (this.invulnFrames > 0) this.invulnFrames = Math.max(0, this.invulnFrames - rate);
+    if (this.invulnFrames > 0) {
+      const rateF32 = Math.fround(rate);
+      if (rateF32 > 0.99) {
+        this.invulnFrames--;
+      } else {
+        this.invulnFrac = Math.fround(this.invulnFrac - rateF32);
+        while (this.invulnFrac < 0) {
+          this.invulnFrames--;
+          this.invulnFrac = Math.fround(this.invulnFrac + 1);
+        }
+      }
+      // FUN_0043e2e0 exits state 3 as soon as the integer current is < 1;
+      // the remaining positive fraction is discarded with the state reset.
+      if (this.invulnFrames < 1) {
+        this.invulnFrames = 0;
+        this.invulnFrac = 0;
+      }
+    }
     if (this.bombInvuln > 0) this.bombInvuln = Math.max(0, this.bombInvuln - rate);
     if (this.bombTimer > 0) {
       this.bombTimer = Math.max(0, this.bombTimer - rate);
@@ -296,6 +318,7 @@ export class Player {
       if (this.materializeFrame >= MATERIALIZE_FRAMES) {
         this.materializeFrame = -1;
         this.invulnFrames = SPAWN_INVULN_FRAMES;
+        this.invulnFrac = 0;
         this.deathbombMeter = Math.trunc(this.unfocused.deathbombWindow);
       }
     }
@@ -622,6 +645,7 @@ export class Player {
     this.y = SPAWN_Y;
     this.materializeFrame = 0;
     this.invulnFrames = 0;
+    this.invulnFrac = 0;
     this.bullets.length = 0;
   }
 }

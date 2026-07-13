@@ -68,7 +68,12 @@ export class CherrySystem {
   cherry = 0;
   cherryMax = INITIAL_CHERRY_MAX_BY_DIFFICULTY[1];
   cherryPlus = 0;
-  borderTimer = 0; // frames remaining while the border is active
+  // Player+0x16a08/+0x16a04: the Border retreat clock is an integer current
+  // plus an f32 fraction, advanced by FUN_00436a06.  Keeping the halves
+  // separate matters under op121 slow motion: the HUD reads only the integer
+  // current, and the first 1/3-rate wall tick borrows immediately from zero.
+  borderTimer = 0; // integer frames remaining while the border is active
+  borderTimerFrac = 0;
   borderPending = false;
   // The exe's *(stats+0x1c) per-run counter driving the case-7 "big
   // Cherry" item amount (spec §3b). CONFIRMED = spell-capture count: the
@@ -132,6 +137,7 @@ export class CherrySystem {
   private startBorder(): void {
     this.borderPending = false;
     this.borderTimer = BORDER_DURATION;
+    this.borderTimerFrac = 0;
     // The live cherryPlus storage is repurposed as the border meter while
     // state 4 is active. FUN_0043e890 leaves it pinned at 50000 on entry;
     // FUN_0043e2e0 overwrites it with the countdown percentage each later
@@ -155,8 +161,25 @@ export class CherrySystem {
     // tick still exposes 50000 even though borderTimer becomes 539.
     this.cherryPlus = Math.max(0,
       Math.trunc((this.borderTimer * CHERRY_PLUS_MAX) / BORDER_DURATION));
-    this.borderTimer = Math.max(0, this.borderTimer - rate);
-    if (this.borderTimer === 0) {
+    // Th07.exe v1.00b FUN_00436a06 @ 0x436a06.  At normal rate the fast
+    // branch decrements the integer directly.  At <=0.99 it stores the
+    // rate/fraction as f32, subtracts first, then borrows an integer tick
+    // whenever the fraction is negative.  A scalar JS countdown instead
+    // smoothed the HUD and expired Stage 5's slow-motion Border two wall
+    // frames late, changing one graze and all later point-item scores.
+    const rateF32 = Math.fround(rate);
+    if (rateF32 <= Math.fround(0.99)) {
+      this.borderTimerFrac = Math.fround(this.borderTimerFrac - rateF32);
+      while (this.borderTimerFrac < 0) {
+        this.borderTimer--;
+        this.borderTimerFrac = Math.fround(this.borderTimerFrac + 1);
+      }
+    } else {
+      this.borderTimer--;
+    }
+    if (this.borderTimer < 1) {
+      this.borderTimer = 0;
+      this.borderTimerFrac = 0;
       return this.finishBorderSurvival();
     }
     return 0;
@@ -172,6 +195,7 @@ export class CherrySystem {
     if (!this.borderEngaged) return 0;
     this.borderPending = false;
     this.borderTimer = 0;
+    this.borderTimerFrac = 0;
     return this.finishBorderSurvival();
   }
 
@@ -196,6 +220,7 @@ export class CherrySystem {
   breakBorder(includePending = false): boolean {
     if (this.borderActive) {
       this.borderTimer = 0;
+      this.borderTimerFrac = 0;
       this.borderPending = false;
       this.cherryPlus = 0; // FUN_0043eb00 resets DAT_00625870 (all.c:28983)
       this.events.onBorderEnd?.('broken', 0);
@@ -372,17 +397,22 @@ export class CherrySystem {
 
   // Th07.exe FUN_00430c10 case 1 ("P" point item), spec §3c, base=0
   // collapse (§1a):
-  //   v = (autoCollected || y <= pocLineY) ? 50000
-  //       : 50000 - 100*round(y - pocLineY)
+  //   v = (guaranteedMax || y < pocLineY) ? 50000
+  //       : 50000 - 100*ftol(y - pocLineY)
   //   if v < 50000 and cherry > 50000: v += floor((cherry-50000)/5)
   //   else if v >= 50000 and cherry > 50000: v = cherry
   //   v = floor10(v)
   //   score += v/10
-  // The `item.flag_0x280` "guaranteed max" override is dead code in
-  // retail (its only setter is gated on the always-0 `DAT_004b5ec5` dead
-  // flag, spec §3c) — omitted with zero behavioral difference.
-  pointItemScore(y: number, pocLineY: number, autoCollected: boolean): number {
-    let v = autoCollected || y <= pocLineY ? 50000 : 50000 - 100 * Math.round(y - pocLineY);
+  pointItemScore(y: number, pocLineY: number, guaranteedMax = false): number {
+    // FUN_00430c10 case 1 tests only the item's live Y position here. The
+    // auto-collect byte is +0x27f, while the separate +0x280 guaranteed-max
+    // byte is the one that can override this calculation. DAT_004b5ec5 is
+    // the live Border force-collect flag: Border attraction sets +0x280,
+    // while ordinary PoC attraction and pre-latched clear items do not.
+    // FUN_00481260 is MSVC's x87 float-to-int helper: despite Ghidra's
+    // `ROUND` label it corrects FISTP back to truncation toward zero. Native
+    // Stage-1 item y=184.765747 therefore uses 56, not Math.round(...)=57.
+    let v = guaranteedMax || y < pocLineY ? 50000 : 50000 - 100 * Math.trunc(y - pocLineY);
     if (v < 50000) {
       if (this.cherry > 50000) v += Math.trunc((this.cherry - 50000) / 5);
     } else if (this.cherry > 50000) {
@@ -395,9 +425,13 @@ export class CherrySystem {
   // cherry is saturated at cherryMax; same height falloff shape as the
   // point-item formula but no cherry-headroom bonus term; fires with the
   // 'bigCherry' ItemType (exe type 7) once cherry is saturated.
-  largeCherryItemScore(y: number, pocLineY: number, autoCollected: boolean): number {
+  largeCherryItemScore(y: number, pocLineY: number, guaranteedMax = false): number {
     if (this.cherry < this.cherryMax) return 0;
-    const bonus = autoCollected || y <= pocLineY ? 50000 : 50000 - 100 * Math.round(y - pocLineY);
+    // Case 7 has the same +0x280 guaranteed-max override as point items,
+    // not an auto-collect override. Native Stage-3 processing 704 collects
+    // an attracted type-7 item below the line for 4890, while the old port
+    // incorrectly credited the flat 5000.
+    const bonus = guaranteedMax || y < pocLineY ? 50000 : 50000 - 100 * Math.trunc(y - pocLineY);
     return Math.trunc(floor10(bonus) / 10);
   }
 

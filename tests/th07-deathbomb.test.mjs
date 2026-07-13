@@ -182,6 +182,19 @@ test('failure path bookkeeping: life-- and bomb reset land at the respawn, drops
   assert.ok(p.materializeFrame >= 0, 'materialize started');
 });
 
+test('state-3 invulnerability retreats on the native integer/f32 split clock', () => {
+  const p = new Player('sakuyaA', anms);
+  p.invulnFrames = 40;
+  p.invulnFrac = 0;
+  const input = { held: new Set(), pressed: new Set() };
+
+  for (let i = 0; i < 116; i++) p.update(input, 1 / 3);
+  assert.equal(p.invulnFrames, 1, 'integer current remains live through wall tick 116');
+  p.update(input, 1 / 3);
+  assert.equal(p.invulnFrames, 0, 'FUN_0043e2e0 exits when integer current becomes <1');
+  assert.equal(p.invulnFrac, 0, 'state exit discards the remaining fraction');
+});
+
 // --- StageScene-level: gate ordering, Held semantics, Border interplay ----
 
 function gateScene(borderEngaged = false) {

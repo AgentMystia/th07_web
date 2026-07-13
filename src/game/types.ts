@@ -3,7 +3,7 @@ import type { AnmRunner } from '../formats/anm';
 
 export type ItemType =
   | 'power' | 'point' | 'bigPower' | 'bomb' | 'fullPower' | 'life'
-  | 'cherry' | 'bigCherry' | 'pointBullet';
+  | 'cherry' | 'bigCherry' | 'pointBullet' | 'case9Cherry';
 
 export interface EnemyBullet {
   id: number;
@@ -44,6 +44,7 @@ export interface EnemyBullet {
   // states 2/3/4). The normal-state `age` counter is reset to zero when
   // this reaches spawnDuration, exactly as FUN_004241c0 does.
   spawnAge?: number;
+  spawnAgeFrac?: number;
   spawnDuration: number;
   spawnMoveScale: number;
   // Activated ex-behavior flags (exe bullet+0xbf4). FUN_004229f0 promotes
@@ -132,6 +133,9 @@ export interface EnemyLaser {
 
 export interface ItemEntity {
   id: number;
+  // Stable slot in Th07.exe's 1100-entry item pool. FUN_00430970 allocates
+  // with a rotating next-fit cursor; FUN_00430c10 updates slots 0..1099.
+  poolSlot: number;
   x: number;
   y: number;
   vx: number;
@@ -141,6 +145,11 @@ export interface ItemEntity {
   // Th07.exe item+0x27f: 0 = falling, 1 = homing toward the player (a
   // permanent latch), 2 = spawn-mode-2 positional tween (death drops).
   state: number;
+  // Th07.exe item+0x280: guaranteed maximum value/color. This is distinct
+  // from the +0x27f homing latch and is set when an active Border forces the
+  // item into collection; ordinary PoC and pre-latched clear items leave it
+  // false.
+  guaranteedMax?: boolean;
   // Mode-2 tween block (exe item+0x258..+0x26c while state==2): origin and
   // target of the 60-frame lerp plus the split elapsed/frac counter
   // (+0x278/+0x274, advanced fractionally under slowmo via FUN_00436acc).
@@ -277,6 +286,9 @@ export interface GameHost {
   // slot-faithful storage; lightweight unit-test hosts may omit them and use
   // the dense-array fallback in StageRuntime.
   addEnemy?(enemy: Enemy): boolean;
+  // A t=0 op1 returned from the allocator core frees the native slot without
+  // passing through the manager's release/AUX-event path.
+  discardAllocatedEnemy?(enemy: Enemy): void;
   addEnemyBullet?(bullet: EnemyBullet): boolean;
   removeEnemyBullet?(bullet: EnemyBullet): void;
   clearEnemyBullets?(): void;
@@ -370,7 +382,15 @@ export interface EclState {
   // live vars at each firing (all.c:7089-7095), exported back at that
   // firing's op42 return (+0x8f4 flag, all.c:10024-10032) — its state
   // carries across firings without disturbing the interrupted flow.
-  periodicSub: { period: number; subId: number; elapsed: number; savedVars: Float64Array } | null;
+  periodicSub: {
+    period: number;
+    subId: number;
+    // enemy+0x2f64/+0x2f60: integer/fraction split counter advanced by
+    // FUN_00436acc. A single JS double drifts at rate 1/3.
+    elapsed: number;
+    elapsedFrac: number;
+    savedVars: Float64Array;
+  } | null;
   // The +0x8f4 flag: the next op42 exports the live vars to the stash.
   periodicExportArmed: boolean;
   // Pending interrupt-table index (exe +0x2b08), written by op109/timeline
@@ -407,7 +427,11 @@ export interface EclState {
   bulletExSlots: (BulletExSlot | null)[];
   shootDisabled: boolean;
   shootInterval: number;
+  // enemy+0x2cb4/+0x2cb0: native split auto-fire counter. The integer and
+  // fractional halves must stay separate under slowmo; repeated JS `1/3`
+  // addition makes interval-5 volleys drift one wall frame per cycle.
   shootTimer: number;
+  shootTimerFrac: number;
   hitbox: { x: number; y: number; z: number };
   isBoss: boolean;
   bossSlot: number | null;

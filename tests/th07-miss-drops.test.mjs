@@ -88,7 +88,10 @@ test('death drops fly a 60-frame positional tween to the rand target, then fall 
   assert.equal(it.state, 2, 'death drops spawn in tween state (mode 2)');
   assert.deepEqual([it.x, it.y], [sx, sy], 'frame 0: at the death point');
 
-  const at = (t) => [t * tx + (1 - t) * sx, t * ty + (1 - t) * sy];
+  const at = (t) => [
+    Math.fround(t * tx + (1 - t) * sx),
+    Math.fround(t * ty + (1 - t) * sy)
+  ];
   scene.updateItems(); // elapsed 0 -> t=0 (no move on the first tick)
   assert.deepEqual([it.x, it.y], [sx, sy], 'frame 1: t=0 keeps the origin');
   scene.updateItems(); // elapsed 1 -> t=1/60
@@ -112,7 +115,8 @@ test('death drops fly a 60-frame positional tween to the rand target, then fall 
   assert.ok(Math.abs(it.vy - 0.03) < 1e-9, 'frame 62: gravity is stored for the next frame');
   assert.equal(it.x, ex, 'frame 62: no horizontal drift after the tween');
   scene.updateItems();
-  assert.ok(Math.abs(it.y - (ey + 0.03)) < 1e-6, `frame 63: falls 0.03 (${it.y})`);
+  const afterGravity = Math.fround(ey + Math.fround(0.03));
+  assert.equal(it.y, afterGravity, `frame 63: float32 fall by 0.03 (${it.y})`);
 });
 
 test('a top-of-field target rises during the tween but falls back after it ends', () => {

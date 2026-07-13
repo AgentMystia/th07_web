@@ -156,6 +156,27 @@ test('op144 periodic gosub runs during a parent wait and restores its wait conte
   );
 });
 
+test('op144 period-6 clock fires on wall tick 18 at 1/3 slowmo', () => {
+  // Th07.exe stores this timer at enemy+0x2f64/+0x2f60 and advances the
+  // integer/fraction pair with FUN_00436acc. A single floating elapsed
+  // value becomes 5.999999999999998 after 18 additions and fires late.
+  const runtime = makeRuntime([
+    [instruction(0, 45, [i32(100)])],
+    [instruction(0, 19, [f32(10005), f32(10005), f32(1)]), instruction(0, 42)]
+  ]);
+  const game = makeHost();
+  game.slowRate = 1 / 3;
+  const enemy = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
+  enemy.ecl.periodicSub = {
+    period: 6, subId: 1, elapsed: 0, elapsedFrac: 0, savedVars: new Float64Array(26)
+  };
+
+  for (let i = 0; i < 17; i++) runtime.updateEnemy(game, enemy);
+  assert.equal(enemy.ecl.periodicSub.savedVars[5], 0, 'period 6 has not elapsed after 17 wall ticks');
+  runtime.updateEnemy(game, enemy);
+  assert.equal(enemy.ecl.periodicSub.savedVars[5], 1, 'periodic sub fires on wall tick 18');
+});
+
 test('op144 snapshots the current variable block when it is armed', () => {
   const runtime = makeRuntime([
     [

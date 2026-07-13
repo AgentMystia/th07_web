@@ -170,6 +170,24 @@ test('the ECL clock advances fractionally under the rate', () => {
   assert.equal(e.ecl.ctx.time - t0, 2);
 });
 
+test('the ECL split fraction is stored as float32 before the integer carry', () => {
+  const sub = [instruction(999, 0, [])];
+  const stage = { ...TH07_DATA.stages[1], ecl: makeEcl([sub]) };
+  const runtime = new StageRuntime(stage, { etama, enemy: noAnm, effect: noAnm });
+  const host = makeHost();
+  const e = runtime.spawnEclEnemy(host, { subId: 0, x: 0, y: 0, life: 1, item: -1, score: 0 });
+  host.slowRate = 1 / 3;
+  e.ecl.ctx.time = 10;
+  // This is the kind of sub-ULP residue retained by repeated JS-double loop
+  // clocks. FUN_00436acc stores it to enemy+0x6ec as f32 before the next add.
+  e.ecl.ctx.timeFrac = 0.6666666666666659;
+
+  runtime.updateEnemy(host, e);
+
+  assert.equal(e.ecl.ctx.time, 11, 'the f32 add carries on this wall tick');
+  assert.equal(e.ecl.ctx.timeFrac, 0);
+});
+
 test('op142 damage shield countdown retreats on the global split clock', () => {
   const sub = [instruction(0, 142, [i32(3)]), instruction(999, 0, [])];
   const stage = { ...TH07_DATA.stages[1], ecl: makeEcl([sub]) };
@@ -180,8 +198,11 @@ test('op142 damage shield countdown retreats on the global split clock', () => {
 
   assert.deepEqual([e.ecl.damageShield, e.ecl.damageShieldFrac], [3, 0]);
   runtime.tickEnemyManagerTail(host, e);
+  assert.equal(e.ecl.damageShield, 2, 'retreat clock borrows on the first slow wall tick');
   runtime.tickEnemyManagerTail(host, e);
-  assert.equal(e.ecl.damageShield, 3, 'two wall frames do not consume an integer shield tick');
+  assert.equal(e.ecl.damageShield, 2, 'second wall tick remains in the same integer interval');
   runtime.tickEnemyManagerTail(host, e);
-  assert.equal(e.ecl.damageShield, 2, 'third wall frame consumes one tick at rate 1/3');
+  assert.equal(e.ecl.damageShield, 1, 'f32 one-third borrows the next integer on the third wall tick');
+  runtime.tickEnemyManagerTail(host, e);
+  assert.equal(e.ecl.damageShield, 1, 'fourth wall tick begins the next fractional interval');
 });

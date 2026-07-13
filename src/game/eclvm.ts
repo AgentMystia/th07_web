@@ -24,6 +24,12 @@ const NATIVE_QUARTER_PI_F32 = 0.7853981852531433;
 const NATIVE_SIXTH_PI_F32 = 0.5235987901687622;
 const NATIVE_THIRD_PI_F32 = 1.0471975803375244;
 const NATIVE_THREE_HALF_PI_F32 = 4.71238899230957;
+const NATIVE_ONE_POINT_FIVE_F32 = 1.5;
+const NATIVE_ONE_TENTH_F32 = 0.10000000149011612;
+const EFFECT8_EASY_RANDOM_SCALE_F32 = 0.30000001192092896; // Th07.exe @ 0x48ead8
+const EFFECT8_EASY_BASE_F32 = 0.699999988079071; // Th07.exe @ 0x48eb7c
+const EFFECT8_HARD_RANDOM_SCALE_F32 = 0.4000000059604645; // Th07.exe @ 0x48ec74
+const EFFECT8_HARD_BASE_F32 = 0.800000011920929; // Th07.exe @ 0x48eb78
 
 // Th07.exe FUN_0042fff0 @ 0x42fff0 stores both operands through float32
 // parameters before adding/wrapping them. The distinction is observable in
@@ -44,7 +50,7 @@ function normalizeNativeAngleF32(angle: number, delta = 0): number {
 // normal-state bullet-manager tick, including the spawn-ANM transition tick.
 // Unselected slots and 0x2000 grace slots can be skipped in one invocation,
 // but at most ONE movement behavior is promoted before returning.
-export function advanceBulletExBehavior(bullet: EnemyBullet): void {
+export function advanceBulletExBehavior(bullet: EnemyBullet, activationRate = 1): void {
   if (!bullet.exSlots) return;
   let idx = bullet.exBehaviorIndex ?? 0;
   while (idx < 5) {
@@ -70,7 +76,14 @@ export function advanceBulletExBehavior(bullet: EnemyBullet): void {
       case 0x10:
         bullet.exFlags |= 0x10;
         bullet.exAccel = {
-          mag: slot.f0,
+          // Th07.exe FUN_004229f0 @ 0x422be9-0x422c0f bakes the CURRENT
+          // global slow-rate into the acceleration vector when the queue
+          // slot is promoted. FUN_00423910 multiplies that retained vector
+          // by the current rate again on every tick. Stage-6 Sub28 promotes
+          // this slot while rate=1/2, so retaining the nominal magnitude
+          // made its three bullet layers accelerate exactly 2x too fast and
+          // produced the first false graze at PRE25254.
+          mag: Math.fround(slot.f0 * activationRate),
           angle: slot.f1 <= -990 ? bullet.angle : slot.f1,
           limit: slot.arg3
         };
@@ -115,12 +128,13 @@ export function advanceBulletExBehavior(bullet: EnemyBullet): void {
 }
 
 // Item ids as used by ECL drop fields, confirmed against Th07.exe (v1.00b)
-// collection switch FUN_00430c10 @ 0x430c10 (case 0..7 award behavior): the
+// collection switch FUN_00430c10 @ 0x430c10 (case 0..9 award behavior): the
 // ECL id is passed unchanged as the spawn type -- there is no lookup table.
 // 0 power, 1 point, 2 bigPower, 3 bomb, 4 fullPower, 5 life/1up, 6 cherry,
-// 7 bigCherry.
+// 7 bigCherry, 8 border petal, 9 Stage-6+ cancel cherry.
 const ITEM_TABLE: (ItemType | null)[] = [
-  'power', 'point', 'bigPower', 'bomb', 'fullPower', 'life', 'cherry', 'bigCherry'
+  'power', 'point', 'bigPower', 'bomb', 'fullPower', 'life', 'cherry', 'bigCherry',
+  'pointBullet', 'case9Cherry'
 ];
 
 // Th07.exe (v1.00b) @ 0x494f90 -- the default-drop random table (32 bytes),
@@ -174,6 +188,33 @@ function applyEclEase(t: number, mode: number): number {
     case 5: return 1 - (1 - t) ** 3;
     case 6: return 1 - (1 - t) ** 4;
     default: return t;
+  }
+}
+
+// FUN_0040f6c0's mode-2 controller stores the normalized progress and every
+// formula result through float locals before constructing the Cartesian
+// target (Th07.exe v1.00b @ 0x415b7d-0x415d01).  The generic helper above is
+// also used by higher-level data paths where retaining a JS double is useful;
+// movement must use the executable's staged single-precision variant.
+function applyEclEaseNativeF32(t: number, mode: number): number {
+  const v = Math.fround(t);
+  switch (mode) {
+    case 1: return Math.fround(v * v);
+    case 2: return Math.fround(v * v * v);
+    case 3: return Math.fround(v * v * v * v);
+    case 4: {
+      const inv = Math.fround(1 - v);
+      return Math.fround(1 - Math.fround(inv * inv));
+    }
+    case 5: {
+      const inv = Math.fround(1 - v);
+      return Math.fround(1 - Math.fround(inv * inv * inv));
+    }
+    case 6: {
+      const inv = Math.fround(1 - v);
+      return Math.fround(1 - Math.fround(inv * inv * inv * inv));
+    }
+    default: return v;
   }
 }
 
@@ -429,6 +470,19 @@ export class StageRuntime {
     // slot has not yet been scanned can therefore run the core twice before
     // its first integration: once here and once in the manager pass.
     this.tickEnemyCore(game, e, true);
+    if (e.dead) {
+      // Th07.exe (v1.00b) FUN_0041da10/FUN_0041db60 @ all.c:13402-13408 /
+      // 13461-13467: when the synchronous FUN_0040f6c0 returns -1, the
+      // allocator clears enemy+0x2e28 bit7 immediately. It does NOT call
+      // FUN_0041ea00, so no replay AUX-0x20 slot-vacate event is emitted.
+      // Stage 2 Sub28/29 are common t=0 fire wrappers that take this path.
+      if (game.discardAllocatedEnemy) game.discardAllocatedEnemy(e);
+      else {
+        const dense = game.enemies.indexOf(e);
+        if (dense >= 0) game.enemies.splice(dense, 1);
+      }
+      return e;
+    }
     // FUN_0041db60 (child allocator) reapplies an explicit HP after t0;
     // timeline FUN_0041da10 deliberately keeps a t0 op110 result.
     if (parent && hasLife) e.hp = life | 0;
@@ -482,6 +536,7 @@ export class StageRuntime {
       shootDisabled: false,
       shootInterval: 0,
       shootTimer: 0,
+      shootTimerFrac: 0,
       hitbox: { x: 28, y: 28, z: 32 },
       isBoss: false,
       bossSlot: null,
@@ -712,13 +767,18 @@ export class StageRuntime {
 
   private varWrite(game: GameHost, e: Enemy, id: number, value: number): void {
     const s = e.ecl;
+    // FUN_0040e560 writes every float-backed destination through a 32-bit
+    // slot. Keep the cast at the resolver boundary so arithmetic opcodes,
+    // call parameters, and special movement aliases cannot retain JS-double
+    // residue between instructions.
+    const f32 = Math.fround(value);
     switch (id) {
       // Th07.exe FUN_0040e560: own position is writable through the float
       // var system; the player-position slots (10021-10023) are technically
       // writable too but no retail script does — refuse defensively.
-      case 10018: e.x = value; return;
-      case 10019: e.y = value; return;
-      case 10020: e.z = value; return;
+      case 10018: e.x = f32; return;
+      case 10019: e.y = f32; return;
+      case 10020: e.z = f32; return;
       case 10021: case 10022: case 10023:
         warnOnce(`w${id}`, `ignored write to player position var ${id}`);
         return;
@@ -728,30 +788,36 @@ export class StageRuntime {
       case 10029: case 10030: case 10031: case 10032:
         s.vars[18 + (id - 10029)] = value; return;
       case 10033: case 10034: case 10035: case 10036:
-        s.vars[22 + (id - 10033)] = value; return;
+        s.vars[22 + (id - 10033)] = f32; return;
       case 10037: case 10038: case 10039: case 10040:
         this.globalsInt[id - 10037] = Math.trunc(value); return;
       case 10041: case 10042: case 10043: case 10044:
-        this.globalsFloat[id - 10041] = value; return;
+        this.globalsFloat[id - 10041] = f32; return;
       // Movement-state vars (see varRead): writable ones alias to the named
       // movement fields so ECL writes reach the integrator. 10045 is the
       // stored heading (+0x2b54, FUN_0040e560 case 0x273d) — mode-1 motion
       // reads it back as the travel angle.
-      case 10045: s.heading = value; s.angle = value; return;
-      case 10046: s.angularVelocity = value; return;
-      case 10047: s.speed = value; return;
-      case 10048: s.acceleration = value; return;
-      case 10049: s.orbitSpeed = value; return;
-      case 10053: s.orbitAngle = value; return;
-      case 10054: s.orbitAngularVelocity = value; return;
+      case 10045: s.heading = f32; s.angle = f32; return;
+      case 10046: s.angularVelocity = f32; return;
+      case 10047: s.speed = f32; return;
+      case 10048: s.acceleration = f32; return;
+      case 10049: s.orbitSpeed = f32; return;
+      case 10053: s.orbitAngle = f32; return;
+      // Th07.exe FUN_0040e560 stores special float var 10054 directly into
+      // enemy+0x2b60. Stage-4 Sub135 op19 increments this orbit angular
+      // velocity every frame and feeds it to op85; retaining JS-double
+      // precision shifts the rotating laser rectangles enough to change
+      // effect-8 bullet contacts at PRE24123/24151/24154. The native f32
+      // store makes the complete Stage-4 PRE stream exact through 24444.
+      case 10054: s.orbitAngularVelocity = f32; return;
       case 10070: s.itemDrop = Math.trunc(value); return;
       case 10071: e.score = Math.trunc(value); return;
-      case 10072: s.vars[16] = value; return;
-      case 10073: s.vars[17] = value; return;
+      case 10072: s.vars[16] = f32; return;
+      case 10073: s.vars[17] = f32; return;
     }
     const rel = id - VAR_BASE;
     if (rel >= 0 && rel <= 15) {
-      s.vars[rel] = value;
+      s.vars[rel] = f32;
       return;
     }
     warnOnce(`w${id}`, `ignored write to unmapped variable ${id}`);
@@ -837,9 +903,28 @@ export class StageRuntime {
   private tickPeriodicSub(game: GameHost, e: Enemy): void {
     const s = e.ecl;
     if (!s.periodicSub || s.periodicSub.subId < 0) return;
-    s.periodicSub.elapsed += game.slowRate ?? 1;
-    if (s.periodicSub.elapsed < s.periodicSub.period) return;
-    s.periodicSub.elapsed = 0;
+    // Th07.exe FUN_0040f6c0 @ all.c:7074-7082 stores the op144 clock as
+    // integer +0x2f64 and fraction +0x2f60 and advances it with
+    // FUN_00436acc. The old single-double accumulation reaches only
+    // 5.999999999999998 after 18 additions of 1/3, delaying every period-6
+    // callback by one wall frame. Stage-5 spell 75 repeats that callback
+    // five times during bullet-time, displacing its sword-cut parents by
+    // exactly five slowed velocity vectors.
+    const periodic = s.periodicSub;
+    periodic.elapsedFrac ??= 0;
+    const rate = game.slowRate ?? 1;
+    if (rate > 0.99) {
+      periodic.elapsed++;
+    } else {
+      periodic.elapsedFrac += rate;
+      if (periodic.elapsedFrac >= 1) {
+        periodic.elapsed++;
+        periodic.elapsedFrac -= 1;
+      }
+    }
+    if (periodic.elapsed < periodic.period) return;
+    periodic.elapsed = 0;
+    periodic.elapsedFrac = 0;
     // all.c:7081-7102: periodic entry pushes the current 0x218-byte frame,
     // loads the sub's persistent variable stash, and arms the first RETURN
     // to export that stash through enemy+0x8f4.
@@ -854,39 +939,61 @@ export class StageRuntime {
     if (s.moveMode === 2 && s.interp) {
       const m = s.interp;
       m.left = Math.max(0, m.left - rate);
-      const elapsed = m.duration - m.left;
-      const t = applyEclEase(clamp(elapsed / Math.max(1, m.duration), 0, 1), s.interpKind);
-      const tx = m.start.x + m.delta.x * t;
-      const ty = m.start.y + m.delta.y * t;
-      const tz = m.start.z + m.delta.z * t;
-      let vx = tx - e.x;
-      const vy = ty - e.y;
-      const vz = tz - e.z;
+      // Th07.exe FUN_0040f6c0 @ 0x415b7d-0x415ed8 stages progress,
+      // eased displacement, absolute target, per-axis delta, and heading
+      // through float32 locals/fields.  Keeping the tiny intermediate target
+      // residue in double precision is not benign: Stage-4 Sub133's nominal
+      // vertical move left the top Prismriver at x=191.9997406 instead of
+      // native x=192.  SakuyaA then broke a strict closest-|dx| tie and aimed
+      // a whole volley at the wrong sister.
+      const progress = Math.fround(clamp(
+        1 - m.left / Math.max(1, m.duration),
+        0,
+        1
+      ));
+      const t = applyEclEaseNativeF32(progress, s.interpKind);
+      const tx = Math.fround(Math.fround(t * Math.fround(m.delta.x)) + Math.fround(m.start.x));
+      const ty = Math.fround(Math.fround(t * Math.fround(m.delta.y)) + Math.fround(m.start.y));
+      const tz = Math.fround(Math.fround(t * Math.fround(m.delta.z)) + Math.fround(m.start.z));
+      let vx = Math.fround(tx - Math.fround(e.x));
+      const vy = Math.fround(ty - Math.fround(e.y));
+      const vz = Math.fround(tz - Math.fround(e.z));
       // FUN_0040f6c0 flips the computed X delta for mirrored actors; the
       // manager integrator flips it back when applying it (all.c:7161/13126).
-      if (s.mirrored) vx = -vx;
+      if (s.mirrored) vx = Math.fround(-vx);
       s.axisSpeed = { x: vx, y: vy, z: vz };
       // FUN_0048166a consumes the controller vector after the internal
       // mirror flip, before FUN_0041d050 applies the second flip on screen
       // (all.c:7152-7165). Keep this separate from vars 10063..10065.
-      if (vx !== 0 || vy !== 0) s.heading = Math.atan2(vy, vx);
+      if (vx !== 0 || vy !== 0) s.heading = Math.fround(Math.atan2(vy, vx));
       if (m.left <= 0) {
         // Mode-2 completion snaps inside the core even on an allocation-only
         // tick, then clears the velocity before the manager integrator.
-        e.x = m.start.x + m.delta.x;
-        e.y = m.start.y + m.delta.y;
-        e.z = m.start.z + m.delta.z;
+        e.x = Math.fround(Math.fround(m.start.x) + Math.fround(m.delta.x));
+        e.y = Math.fround(Math.fround(m.start.y) + Math.fround(m.delta.y));
+        e.z = Math.fround(Math.fround(m.start.z) + Math.fround(m.delta.z));
         s.axisSpeed = { x: 0, y: 0, z: 0 };
         s.moveMode = 0;
         s.interp = null;
       }
     } else if (s.moveMode === 3) {
-      s.orbitAngle = normalizeAngle(s.orbitAngle + s.orbitAngularVelocity * rate);
-      s.orbitSpeed += s.orbitAcceleration * rate;
-      s.axisSpeed.x = (Math.cos(s.orbitAngle) * s.orbitSpeed + s.orbitTarget.x) - e.x;
-      s.axisSpeed.y = (Math.sin(s.orbitAngle) * s.orbitSpeed + s.orbitTarget.y) - e.y;
+      // Th07.exe (v1.00b) FUN_0040f6c0 @ all.c:7168-7191 stores every
+      // mode-3 controller result back through 32-bit fields: normalized
+      // angle, radial speed, FUN_004074e0's orbit vector, and the final
+      // Cartesian delta. Retaining doubles moves long-lived Stage-4 laser
+      // owners by ~1e-3px and changes effect-8 edge membership.
+      const rateF32 = Math.fround(rate);
+      const angleDelta = Math.fround(Math.fround(s.orbitAngularVelocity) * rateF32);
+      s.orbitAngle = normalizeNativeAngleF32(s.orbitAngle, angleDelta);
+      s.orbitSpeed = Math.fround(
+        Math.fround(s.orbitAcceleration) * rateF32 + Math.fround(s.orbitSpeed)
+      );
+      const orbitX = Math.fround(Math.cos(s.orbitAngle) * s.orbitSpeed);
+      const orbitY = Math.fround(Math.sin(s.orbitAngle) * s.orbitSpeed);
+      s.axisSpeed.x = Math.fround(orbitX + Math.fround(s.orbitTarget.x) - Math.fround(e.x));
+      s.axisSpeed.y = Math.fround(orbitY + Math.fround(s.orbitTarget.y) - Math.fround(e.y));
       if (s.axisSpeed.x !== 0 || s.axisSpeed.y !== 0) {
-        s.heading = Math.atan2(s.axisSpeed.y, s.axisSpeed.x);
+        s.heading = Math.fround(Math.atan2(s.axisSpeed.y, s.axisSpeed.x));
       }
       if (s.orbitDuration > 0 && (s.orbitLeft -= rate) < 1) s.moveMode = 0;
     } else if (s.moveMode === 1) {
@@ -914,9 +1021,15 @@ export class StageRuntime {
     prev.x = e.x;
     prev.y = e.y;
     prev.z = e.z;
-    e.x += (s.mirrored ? -s.axisSpeed.x : s.axisSpeed.x) * rate;
-    e.y += s.axisSpeed.y * rate;
-    e.z += s.axisSpeed.z * rate;
+    // Th07.exe (v1.00b) FUN_0041d050 @ all.c:13115-13118 performs each
+    // multiply/add in x87, then fstp writes the result back to the enemy's
+    // 32-bit x/y/z fields. Preserving JS-double positions accumulates a
+    // sub-pixel drift; in Stage 3 it moved bullet slot 109 just outside the
+    // graze box on frame 12024 and delayed its id8 RNG event by one frame.
+    const rateF32 = Math.fround(rate);
+    e.x = Math.fround(e.x + (s.mirrored ? -s.axisSpeed.x : s.axisSpeed.x) * rateF32);
+    e.y = Math.fround(e.y + s.axisSpeed.y * rateF32);
+    e.z = Math.fround(e.z + s.axisSpeed.z * rateF32);
     this.clampEnemyPosition(e);
   }
 
@@ -959,15 +1072,24 @@ export class StageRuntime {
     // clock `--` expired Youmu's 240-tick shield during her rate-1/3 spell
     // 192 damage too early (Stage 5 native HP 205 vs WT 13 at PRE7732).
     if (s.damageShield > 0) {
-      const rate = game.slowRate ?? 1;
+      const rate = Math.fround(game.slowRate ?? 1);
       if (rate > 0.99) {
         s.damageShield--;
       } else {
-        s.damageShieldFrac += rate;
-        if (s.damageShieldFrac >= 1) {
+        // FUN_00436a06 is a retreat clock: subtract first, then borrow one
+        // integer tick whenever the f32 fraction crosses below zero. The old
+        // forward accumulator delayed the first shield decrement until the
+        // third 1/3-rate wall tick, leaving Stage-5 spell 87 one HP too high
+        // at its native lethal hit (processing 18748).
+        s.damageShieldFrac = Math.fround(s.damageShieldFrac - rate);
+        while (s.damageShieldFrac < 0) {
           s.damageShield--;
-          s.damageShieldFrac -= 1;
+          s.damageShieldFrac = Math.fround(s.damageShieldFrac + 1);
         }
+      }
+      if (s.damageShield <= 0) {
+        s.damageShield = 0;
+        s.damageShieldFrac = 0;
       }
     }
   }
@@ -1205,23 +1327,64 @@ export class StageRuntime {
     return -1;
   }
 
-  private bulletInsideLaser(bullet: EnemyBullet, laser: EnemyLaser, fullWidth: number): boolean {
-    const dx = bullet.x - laser.x;
-    const dy = bullet.y - laser.y;
-    const cos = Math.cos(laser.angle);
-    const sin = Math.sin(laser.angle);
-    const along = dx * cos + dy * sin;
-    const perpendicular = -dx * sin + dy * cos;
-    const halfWidth = fullWidth / 2;
+  private bulletInsideLaser(bullet: EnemyBullet, laser: EnemyLaser, widthScale = 1): boolean {
+    // Th07.exe (v1.00b) FUN_00417cb0 @ 0x417d32-0x417e5c stages
+    // every rectangle input and both transformed coordinates through f32
+    // locals before FUN_00417740 performs its inclusive AABB test.  Keeping
+    // the algebra in relative double precision is observably different at
+    // rotating-laser edges: native Stage-4 PRE23639 accepts fixed bullet
+    // slot 1011 with 0.00067px remaining, while the unstaged port rejects it
+    // by 0.00168px and shifts every later effect-8 RNG draw.
+    const lx = Math.fround(laser.x);
+    const ly = Math.fround(laser.y);
+    const angle = Math.fround(laser.angle);
+    const cos = Math.fround(Math.cos(angle));
+    const sin = Math.fround(Math.sin(angle));
+    const dx = Math.fround(Math.fround(bullet.x) - lx);
+    const dy = Math.fround(Math.fround(bullet.y) - ly);
+    const nearDist = Math.fround(laser.nearDist);
+    const farDist = Math.fround(laser.farDist);
+    const length = Math.fround(farDist - nearDist);
+    const width = Math.fround(Math.fround(laser.width) * Math.fround(widthScale));
+    // The center expression remains in x87 until this final f32 store; it
+    // recomputes far-near instead of consuming the stored length local.
+    const centerX = Math.fround((farDist - nearDist) / 2 + nearDist + lx);
+    const rotatedX = Math.fround(Math.fround(dx * cos + dy * sin) + lx);
+    const rotatedY = Math.fround(Math.fround(dy * cos - dx * sin) + ly);
+    const halfLength = Math.fround(length / 2);
+    const halfWidth = Math.fround(width / 2);
+    const minX = Math.fround(centerX - halfLength);
+    const maxX = Math.fround(centerX + halfLength);
+    const minY = Math.fround(ly - halfWidth);
+    const maxY = Math.fround(ly + halfWidth);
     // FUN_00417740 rejects only strict separation, so all four edges count.
-    return along >= laser.nearDist && along <= laser.farDist
-      && perpendicular >= -halfWidth && perpendicular <= halfWidth;
+    return rotatedX >= minX && rotatedX <= maxX && rotatedY >= minY && rotatedY <= maxY;
   }
 
   private isType8Seed(bullet: EnemyBullet): boolean {
     // etama entry 0 script 8 starts at global sprite 0x278; its eight color
     // offsets therefore cover exactly the exe's [0x278, 0x280) seed range.
     return bullet.sprite === 8 && bullet.spriteOffset >= 0 && bullet.spriteOffset < 8;
+  }
+
+  private resetDeflectedBulletTemplate(bullet: EnemyBullet): void {
+    const stillSpawning = (bullet.spawnAge ?? bullet.spawnDuration) < bullet.spawnDuration;
+    // Both laser-deflection callbacks copy template 5's first 0xb8c bytes
+    // over the live bullet, preserving the FIRE color offset at +0xbf8.
+    // Th07.exe v1.00b FUN_004179f0 @ 0x417bd1 and FUN_00417cb0 @ 0x417e70;
+    // DAT_006292f4 = template base 0x625938 + 5*0xb8c.
+    bullet.sprite = 5;
+    bullet.rect = this.bulletRect(5, bullet.spriteOffset);
+    bullet.grazeW = BULLET_HITBOX_BY_SPRITE[5];
+    bullet.grazeH = BULLET_HITBOX_BY_SPRITE[5];
+    if (stillSpawning) {
+      // The copied block contains all five embedded ANM VMs. State 2/3/4
+      // itself lives after +0xb8c and is retained, so a deflection during a
+      // spawn intro restarts template 5's corresponding authored VM clock.
+      bullet.spawnAge = 0;
+      bullet.spawnAgeFrac = 0;
+      bullet.spawnDuration = bullet.flags & 2 ? 10 : bullet.flags & 4 ? 16 : 32;
+    }
   }
 
   // op121/122 bullet-effect table (24 entries @ Th07.exe .data 0x495148).
@@ -1258,18 +1421,26 @@ export class StageRuntime {
         const bullets = this.bulletsInPoolOrder(game);
         for (const laser of this.lasersInPoolOrder(game)) {
           if (laser.poolSlot !== selectedSlot || laser.state >= 2) continue;
-          const sin = Math.sin(laser.angle);
-          const cos = Math.cos(laser.angle);
+          const laserAngle = Math.fround(laser.angle);
+          const sin = Math.fround(Math.sin(laserAngle));
+          const cos = Math.fround(Math.cos(laserAngle));
           for (const bullet of bullets) {
-            if (bullet.dead || !this.bulletInsideLaser(bullet, laser, laser.width)) continue;
+            if (bullet.dead || !this.bulletInsideLaser(bullet, laser)) continue;
             if (bullet.effectState > 0) bullet.effectState--;
             if (bullet.effectState !== 0) continue;
-            if (bullet.speed > 0.5) bullet.speed -= 0.1;
-            const side = sin * bullet.vx + cos * bullet.vy;
-            bullet.angle = normalizeAngle(laser.angle + (side < 0 ? -Math.PI / 2 : Math.PI / 2));
-            bullet.vx = Math.cos(bullet.angle) * bullet.speed;
-            bullet.vy = Math.sin(bullet.angle) * bullet.speed;
+            if (bullet.speed > 0.5) bullet.speed = Math.fround(bullet.speed - NATIVE_ONE_TENTH_F32);
+            const side = Math.fround(
+              sin * Math.fround(bullet.vx) + cos * Math.fround(bullet.vy)
+            );
+            bullet.angle = normalizeNativeAngleF32(
+              laserAngle,
+              side < 0 ? -NATIVE_HALF_PI_F32 : NATIVE_HALF_PI_F32
+            );
+            const scaledSpeed = Math.fround(Math.fround(game.slowRate ?? 1) * bullet.speed);
+            bullet.vx = Math.fround(Math.cos(bullet.angle) * scaledSpeed);
+            bullet.vy = Math.fround(Math.sin(bullet.angle) * scaledSpeed);
             bullet.effectState = 10;
+            this.resetDeflectedBulletTemplate(bullet);
           }
         }
         return;
@@ -1279,21 +1450,38 @@ export class StageRuntime {
         const bullets = this.bulletsInPoolOrder(game);
         for (const laser of this.lasersInPoolOrder(game)) {
           if (laser.poolSlot % 3 !== selectedModulo || laser.state >= 2) continue;
-          const sin = Math.sin(laser.angle);
-          const cos = Math.cos(laser.angle);
-          const nx = -sin;
+          const laserAngle = Math.fround(laser.angle);
+          const sin = Math.fround(Math.sin(laserAngle));
+          const cos = Math.fround(Math.cos(laserAngle));
+          const nx = Math.fround(-sin);
           const ny = cos;
           for (const bullet of bullets) {
+            // local_24[0x79] is the live ANM sprite pointer. Every drawable
+            // bullet in this port has a resolved rect, so `dead` is the
+            // corresponding allocation/live gate.
             if (bullet.dead || bullet.effectState < 0 || bullet.effectState === laser.poolSlot + 1) continue;
-            if (!this.bulletInsideLaser(bullet, laser, laser.width * 1.5)) continue;
+            if (!this.bulletInsideLaser(bullet, laser, NATIVE_ONE_POINT_FIVE_F32)) continue;
             // FUN_0042ffc0 is consumed only after every filter and the rectangle test.
             const random = game.rng.u32() / 0x100000000;
-            bullet.speed *= game.difficulty < 2 ? 0.7 + random * 0.3 : 0.8 + random * 0.4;
-            const normalDot = nx * bullet.vx + ny * bullet.vy;
-            const direction = normalDot < 0 ? -1 : 1;
-            bullet.vx = nx * direction * bullet.speed;
-            bullet.vy = ny * direction * bullet.speed;
-            bullet.angle = Math.atan2(bullet.vy, bullet.vx);
+            const scale = game.difficulty < 2
+              ? EFFECT8_EASY_RANDOM_SCALE_F32
+              : EFFECT8_HARD_RANDOM_SCALE_F32;
+            const base = game.difficulty < 2 ? EFFECT8_EASY_BASE_F32 : EFFECT8_HARD_BASE_F32;
+            // The random multiply/add and old-speed multiply stay in x87;
+            // only the completed nominal speed is stored to bullet+0xbb0.
+            bullet.speed = Math.fround((random * scale + base) * Math.fround(bullet.speed));
+            const normalDot = Math.fround(nx * Math.fround(bullet.vx) + ny * Math.fround(bullet.vy));
+            const chosenX = normalDot < 0 ? Math.fround(-nx) : nx;
+            const chosenY = normalDot < 0 ? Math.fround(-ny) : ny;
+            // The selected unit normal is first stored to vx/vy, converted
+            // to a stored f32 angle by atan2, then FUN_004074e0 overwrites
+            // vx/vy with f32 FSINCOS products at the new nominal speed.
+            bullet.vx = chosenX;
+            bullet.vy = chosenY;
+            this.resetDeflectedBulletTemplate(bullet);
+            bullet.angle = Math.fround(Math.atan2(bullet.vy, bullet.vx));
+            bullet.vx = Math.fround(Math.cos(bullet.angle) * bullet.speed);
+            bullet.vy = Math.fround(Math.sin(bullet.angle) * bullet.speed);
             bullet.effectState = game.difficulty < 2 ? -1 : laser.poolSlot + 1;
           }
         }
@@ -1605,22 +1793,52 @@ export class StageRuntime {
         }
         return;
       }
-      case 13: { // FUN_00418650 (armed, per-frame): tag bullets drifting
-        // into the narrow strip directly below the enemy (|dx|<16,
-        // y<352) with processed=1 — cosmetic overlay only, no deletion (§8).
-        for (const b of game.enemyBullets) {
+      case 13: { // FUN_00418650 (armed, per-frame): bullets drifting into
+        // the narrow strip directly below the enemy (|dx|<16, y<352) get a
+        // real opcode-0x20 motion record in slot 0. Despite the old
+        // "cosmetic overlay" reading, a native fixed-slot trace proves the
+        // record changes the bullet trajectory immediately: Stage-5 slot
+        // 878 at processing 14055 loses speed/180 and turns -pi/60 on the
+        // same manager pass (Th07.exe v1.00b @ 0x418650 / 0x4260d0).
+        for (const b of this.bulletsInPoolOrder(game)) {
           if (b.dead || b.effectState !== 0) continue;
           if (b.y <= e.y || b.y >= 352 || Math.abs(b.x - e.x) >= 16) continue;
+          const turn = Math.fround((b.poolSlot & 1) === 0 ? -Math.PI / 60 : Math.PI / 60);
+          const speedDelta = Math.fround(-Math.fround(b.speed) / 180);
+          b.exSlots ??= [null, null, null, null, null];
+          b.exSlots[0] = { opcode: 0x20, cond: 0, arg3: 0xa0, arg4: 0, f0: speedDelta, f1: turn };
+          b.exFireFlags |= 0x20;
+          // FUN_00426020 resets bullet+0xc10 so the normal bullet-manager
+          // queue pass reconsiders slot 0; it does not clear active flags.
+          b.exBehaviorIndex = 0;
           b.effectState = 1;
         }
         return;
       }
       case 14: { // FUN_00418780: sweep every id13-tagged bullet (processed
-        // ==1), orient its overlay toward the player, advance the tag to 2;
-        // 16f pale flash. No deletion (§9).
+        // ==1) and queue a real opcode-0x10 acceleration toward the player's
+        // current position: 90 ticks at f32 0.0266666673. FUN_00426110 uses
+        // the same bullet movement queue as op79, not a separate cosmetic
+        // overlay (Th07.exe v1.00b @ 0x418780 / 0x426110).
         game.startScreenFlash?.(16, 1, 0x50cfcfff);
-        for (const b of game.enemyBullets) {
-          if (!b.dead && b.effectState === 1) b.effectState = 2;
+        for (const b of this.bulletsInPoolOrder(game)) {
+          if (b.dead || b.effectState !== 1) continue;
+          const dx = game.player.x - b.x;
+          const dy = game.player.y - b.y;
+          const angle = dx === 0 && dy === 0
+            ? NATIVE_HALF_PI_F32
+            : Math.fround(Math.atan2(dy, dx));
+          b.exSlots ??= [null, null, null, null, null];
+          b.exSlots[0] = {
+            opcode: 0x10, cond: 0, arg3: 0x5a, arg4: 0,
+            f0: Math.fround(0.02666666731238365), f1: angle
+          };
+          // Native explicitly clears bullet+0xc3c, the opcode field of the
+          // following queue record, after FUN_00426110 installs slot 0.
+          b.exSlots[1] = null;
+          b.exFireFlags |= 0x10;
+          b.exBehaviorIndex = 0;
+          b.effectState = 2;
         }
         return;
       }
@@ -1654,9 +1872,25 @@ export class StageRuntime {
     // AND the fire while dead/dying — no death-frame extra volley
     // (CADENCE-001).
     if (!s.shootInterval || !s.bulletProps || e.hp <= 0) return;
-    s.shootTimer += game.slowRate ?? 1;
+    // Th07.exe FUN_0040f6c0 @ all.c:7195-7207 advances the integer field
+    // +0x2cb4 and fractional field +0x2cb0 through FUN_00436acc, then
+    // compares only the integer half with +0x2ca8. Keeping this as one JS
+    // double made 1/3 accumulate to 4.999999999999999 for interval 5, so
+    // every slowmo volley fired one wall frame late. Stage-5 spell 75's
+    // large bullets accumulated five such late ticks before the sword cut.
+    const rate = game.slowRate ?? 1;
+    if (rate > 0.99) {
+      s.shootTimer++;
+    } else {
+      s.shootTimerFrac += rate;
+      if (s.shootTimerFrac >= 1) {
+        s.shootTimer++;
+        s.shootTimerFrac -= 1;
+      }
+    }
     if (s.shootTimer >= s.shootInterval) {
       s.shootTimer = 0;
+      s.shootTimerFrac = 0;
       this.spawnBullets(game, e, s.bulletProps);
     }
   }
@@ -1752,10 +1986,14 @@ export class StageRuntime {
     if (rate > 0.99) {
       s.ctx.time++;
     } else {
-      s.ctx.timeFrac += rate;
+      // Both the global rate and enemy+0x6ec are float32 fields. Native
+      // FUN_00436acc loads, adds, and stores that fraction every call. A JS
+      // double retained 0.9999999999999991 across Stage-5 Sub1's t18->t14
+      // loop and delayed each id31 flake burst by one wall frame at PRE17165.
+      s.ctx.timeFrac = Math.fround(s.ctx.timeFrac + Math.fround(rate));
       if (s.ctx.timeFrac >= 1) {
         s.ctx.time++;
-        s.ctx.timeFrac -= 1;
+        s.ctx.timeFrac = Math.fround(s.ctx.timeFrac - 1);
       }
     }
   }
@@ -2051,8 +2289,11 @@ export class StageRuntime {
             // FUN_0040e850: encoded speed is per frame, so the complete
             // displacement is speed * duration (there is no /2).
             delta: {
-              x: Math.cos(angle) * speed * duration * (s.mirrored ? -1 : 1),
-              y: Math.sin(angle) * speed * duration,
+              // FUN_0040e850 @ 0x40e8ea-0x40e96d stores the complete
+              // cos/sin * speed * integer-duration vectors as f32 fields.
+              x: Math.fround(Math.cos(Math.fround(angle)) * Math.fround(speed) * duration) *
+                (s.mirrored ? -1 : 1),
+              y: Math.fround(Math.sin(Math.fround(angle)) * Math.fround(speed) * duration),
               z: 0
             },
             duration,
@@ -2082,7 +2323,11 @@ export class StageRuntime {
             start: { x: e.x, y: e.y, z: e.z },
             // FUN_0040ea90 flips the X delta, not the absolute target, for
             // mirrored timeline spawns.
-            delta: { x: (tx - e.x) * (s.mirrored ? -1 : 1), y: ty - e.y, z: tz - e.z },
+            delta: {
+              x: Math.fround(Math.fround(tx) - Math.fround(e.x)) * (s.mirrored ? -1 : 1),
+              y: Math.fround(Math.fround(ty) - Math.fround(e.y)),
+              z: Math.fround(Math.fround(tz) - Math.fround(e.z))
+            },
             duration,
             left: duration
           };
@@ -2155,6 +2400,7 @@ export class StageRuntime {
         }
         s.shootInterval = iv;
         s.shootTimer = op === 74 && iv > 0 ? game.rng.u32InRange(iv) : 0;
+        s.shootTimerFrac = 0;
         return null;
       }
       // Ops 75/76 (exe 0x4a/0x4b) set/clear enemy flag bit 0x20, which gates
@@ -2236,7 +2482,7 @@ export class StageRuntime {
       case 84: s.laserSlotIndex = gi(0); return null; // SELECT_LASER_SLOT
       case 85: { // ADD_LASER_ANGLE (exe FUN_0042fff0: plain add + wrap to ±π)
         const l = s.laserSlots[gi(0)];
-        if (l) l.angle = normalizeAngle(l.angle + gf(4));
+        if (l) l.angle = normalizeNativeAngleF32(l.angle, gf(4));
         return null;
       }
       case 86: { // AIM_LASER_AT_PLAYER + offset (absolute set; retail-unused)
@@ -2246,7 +2492,12 @@ export class StageRuntime {
       }
       case 87: { // REPOSITION_LASER: re-base to the enemy's CURRENT pos + offset
         const l = s.laserSlots[gi(0)];
-        if (l) { l.x = e.x + gf(4); l.y = e.y + gf(8); }
+        // Th07.exe (v1.00b) op87 @ 0x41294b-0x412a8b fstp-writes each
+        // owner+offset sum directly into the laser's f32 position fields.
+        if (l) {
+          l.x = Math.fround(Math.fround(e.x) + Math.fround(gf(4)));
+          l.y = Math.fround(Math.fround(e.y) + Math.fround(gf(8)));
+        }
         return null;
       }
       case 88: return null; // IS_LASER_ALIVE writes enemy+0x8f0 — write-only/vestigial in the exe, no-op
@@ -2478,7 +2729,13 @@ export class StageRuntime {
       }
       case 123: ctx.time += gi(0); return null;
       case 124: {
-        const type = ITEM_TABLE[v.i32(a)];
+        // Th07.exe ECL case 0x7b @ all.c:9418-9425 resolves a masked operand
+        // through FUN_0040d750 before passing the resulting item id to
+        // FUN_00430970. Stage-6 Sub70/71 stores ids 8/0/1 in local 10000;
+        // reading the literal 10000 suppressed the whole authored item ring,
+        // including the full-power type-0 -> type-7 drops that arm the final
+        // Border at PRE24341.
+        const type = ITEM_TABLE[gi(0)];
         if (type) game.spawnItem(type, e.x, e.y);
         return null;
       }
@@ -2614,6 +2871,7 @@ export class StageRuntime {
           period: Math.max(1, period),
           subId,
           elapsed: 0,
+          elapsedFrac: 0,
           // Th07.exe (v1.00b) FUN_0040f6c0 case 0x8f @ all.c:9668-9676:
           // arming op144 copies the CURRENT 26-dword local/parameter block
           // from enemy+0x6fc into the persistent enemy+0x2ee8 stash. Starting
@@ -2743,7 +3001,12 @@ export class StageRuntime {
         count2: this.getInt(game, e, a + 8),
         speed1,
         speed2,
-        angle1: normalizeAngle(this.getFloat(game, e, a + 20)),
+        // FUN_0040f6c0 copies the raw f32 endpoint into the FIRE template;
+        // FUN_00421e90 normalizes only the final constructed angle. This is
+        // load-bearing for random modes 6/8 when an authored interval crosses
+        // +pi: pre-wrapping one endpoint turns the intended short interval
+        // into an almost-full-circle spread (8141 Stage 3 PRE5936).
+        angle1: this.getFloat(game, e, a + 20),
         angle2: this.getFloat(game, e, a + 24),
         flags: this.ecl.view.i32(a + 28),
         sfx: s.bulletSfx,
@@ -2764,7 +3027,7 @@ export class StageRuntime {
       count2: Math.max(1, this.getInt(game, e, a + 8) + add2),
       speed1: speed1 ? Math.max(0.3, speed1 + rankSpeed) : 0,
       speed2: Math.max(0.3, speed2 + rankSpeed / 2),
-      angle1: normalizeAngle(this.getFloat(game, e, a + 20)),
+      angle1: this.getFloat(game, e, a + 20),
       angle2: this.getFloat(game, e, a + 24),
       flags: this.ecl.view.i32(a + 28),
       sfx: s.bulletSfx,
@@ -2846,40 +3109,76 @@ export class StageRuntime {
     // refuses the volley when the latched count was 1024. The allocator below
     // independently enforces the physical fixed-pool limit for other cases.
     if ((game.enemyBulletManagerEntryCount ?? 0) >= ENEMY_BULLET_CAP) return;
-    const shootX = origin?.x ?? e.x + e.ecl.shootOffset.x;
-    const shootY = origin?.y ?? e.y + e.ecl.shootOffset.y;
+    // FUN_0040f6c0 stages enemy position + FIRE offset through f32 template
+    // fields (+0x2bd8/+0x2bdc), and FUN_00421e90 copies those bits verbatim
+    // into bullet+0xb8c/+0xb90.  These are gameplay coordinates before the
+    // first same-frame bullet-manager move, not merely render precision.
+    const shootX = Math.fround(origin?.x ?? e.x + e.ecl.shootOffset.x);
+    const shootY = Math.fround(origin?.y ?? e.y + e.ecl.shootOffset.y);
     // Test-only observability (PLAN.md Phase 0 / LIFE-001): last frame this
     // enemy emitted bullets. Gameplay never reads it.
     e.ecl.lastFireFrame = game.frame;
-    const aim = Math.atan2(game.player.y - shootY, game.player.x - shootX);
+    // FUN_0043f2b0 stores both deltas as f32 before FPATAN; FUN_00423480 then
+    // stores the returned aim once more as f32 before passing it by value.
+    const aimDx = Math.fround(game.player.x - shootX);
+    const aimDy = Math.fround(game.player.y - shootY);
+    const aim = aimDx === 0 && aimDy === 0
+      ? NATIVE_HALF_PI_F32
+      : Math.fround(Math.atan2(aimDy, aimDx));
+    // The FIRE template endpoints are raw f32 values.  Do not pre-wrap angle
+    // endpoints: random modes 6/8 interpolate the authored interval first,
+    // then FUN_0042fff0 wraps only the completed per-bullet angle.
+    const speed1 = Math.fround(p.speed1);
+    const speed2 = Math.fround(p.speed2);
+    const angle1 = Math.fround(p.angle1);
+    const angle2 = Math.fround(p.angle2);
+    const rate = Math.fround(game.slowRate ?? 1);
     const occupied = occupiedPoolSlots ?? this.occupiedBulletPoolSlots(game);
     let rect: { x: number; y: number; w: number; h: number; imageKey: string } | null = null;
     for (let j = 0; j < p.count2; j++) {
-      const speed = p.speed1 - (p.speed1 - p.speed2) * j / p.count2;
+      const speed = p.count2 < 2
+        ? speed1
+        : Math.fround(speed1 - ((speed1 - speed2) * j) / p.count2);
       for (let i = 0; i < p.count1; i++) {
         const poolSlot = this.allocateBulletPoolSlot(occupied);
         if (poolSlot < 0) return;
         let angle = 0;
         if (p.aimMode <= 1) {
-          angle = ((p.count1 & 1) ? Math.floor((i + 1) / 2) : Math.floor(i / 2) + 0.5) * p.angle2;
-          if (i & 1) angle *= -1;
-          if (p.aimMode === 0) angle += aim;
-          angle += p.angle1;
+          angle = Math.fround(
+            ((p.count1 & 1) ? Math.floor((i + 1) / 2) : Math.floor(i / 2) + 0.5) * angle2
+          );
+          if (i & 1) angle = Math.fround(-angle);
+          if (p.aimMode === 0) angle = Math.fround(angle + aim);
+          angle = Math.fround(angle + angle1);
         } else if (p.aimMode === 2 || p.aimMode === 3) {
-          if (p.aimMode === 2) angle += aim;
-          angle += i * TAU / p.count1 + j * p.angle2 + p.angle1;
+          if (p.aimMode === 2) angle = aim;
+          angle = Math.fround(angle + (i * NATIVE_TAU_F32) / p.count1);
+          angle = Math.fround(j * angle2 + angle1 + angle);
         } else if (p.aimMode === 4 || p.aimMode === 5) {
-          if (p.aimMode === 4) angle += aim;
-          angle += Math.PI / p.count1 + i * TAU / p.count1 + p.angle1;
+          if (p.aimMode === 4) angle = aim;
+          angle = Math.fround(angle + NATIVE_PI_F32 / p.count1);
+          angle = Math.fround(angle + (i * NATIVE_TAU_F32) / p.count1);
+          angle = Math.fround(angle + angle1);
         } else if (p.aimMode === 6) {
-          angle = game.rng.range(p.angle1 - p.angle2) + p.angle2;
+          const span = Math.fround(angle1 - angle2);
+          angle = Math.fround(game.rng.range(span) + angle2);
         } else if (p.aimMode === 7) {
-          angle = i * TAU / p.count1 + j * p.angle2 + p.angle1;
+          angle = Math.fround((i * NATIVE_TAU_F32) / p.count1);
+          angle = Math.fround(j * angle2 + angle1 + angle);
         } else {
-          angle = game.rng.range(p.angle1 - p.angle2) + p.angle2;
+          const span = Math.fround(angle1 - angle2);
+          angle = Math.fround(game.rng.range(span) + angle2);
         }
-        angle = normalizeAngle(angle);
-        const spd = p.aimMode === 7 || p.aimMode === 8 ? game.rng.range(p.speed1 - p.speed2) + p.speed2 : speed;
+        angle = normalizeNativeAngleF32(angle);
+        const spd = p.aimMode === 7 || p.aimMode === 8
+          ? Math.fround(game.rng.range(Math.fround(speed1 - speed2)) + speed2)
+          : speed;
+        // FUN_00421e90 stores nominal speed/angle as f32, stages
+        // speed*DAT_0056baa8 through a temporary f32 argument, then
+        // FUN_004074e0 writes each FSINCOS product to f32 vx/vy fields.
+        const scaledSpeed = Math.fround(spd * rate);
+        const vx = Math.fround(Math.cos(angle) * scaledSpeed);
+        const vy = Math.fround(Math.sin(angle) * scaledSpeed);
         if (!rect) rect = this.bulletRect(p.sprite, p.offset);
         const flags = p.flags | 0;
         // Flags select authored etama spawn states 2/3/4. State lifetime is
@@ -2910,10 +3209,17 @@ export class StageRuntime {
           ownerSub: e.ecl.subId,
           spawnFrame: game.frame,
           effectState: 0,
-          x: shootX - (spawnDuration ? Math.cos(angle) * spd * (game.slowRate ?? 1) * 4 : 0),
-          y: shootY - (spawnDuration ? Math.sin(angle) * spd * (game.slowRate ?? 1) * 4 : 0),
-          vx: Math.cos(angle) * spd * (game.slowRate ?? 1),
-          vy: Math.sin(angle) * spd * (game.slowRate ?? 1),
+          // Spawn states 2/3/4 back the copied f32 origin up by four stored
+          // velocity vectors.  Each multiply and subtract is separately
+          // fstp'd to f32 in FUN_00421e90 @ 0x4225cf..0x422900.
+          x: spawnDuration
+            ? Math.fround(shootX - Math.fround(vx * 4))
+            : shootX,
+          y: spawnDuration
+            ? Math.fround(shootY - Math.fround(vy * 4))
+            : shootY,
+          vx,
+          vy,
           speed: spd,
           angle,
           age: 0,
@@ -2925,6 +3231,7 @@ export class StageRuntime {
           grazeH: BULLET_HITBOX_BY_SPRITE[p.sprite] ?? Math.max(3, rect.h * 0.4),
           grazed: false,
           spawnAge: 0,
+          spawnAgeFrac: 0,
           spawnDuration,
           spawnMoveScale,
           exFlags: 0,
@@ -2951,7 +3258,7 @@ export class StageRuntime {
         // FUN_00421e90 calls FUN_004229f0 once after copying the queue into
         // the allocated fixed slot. Spawn-state bullets wait until their ANM
         // transition before the bullet manager promotes another slot.
-        advanceBulletExBehavior(bullet);
+        advanceBulletExBehavior(bullet, game.slowRate ?? 1);
         if (game.addEnemyBullet) {
           if (!game.addEnemyBullet(bullet)) return;
         } else {
@@ -2996,10 +3303,17 @@ export class StageRuntime {
       }
       for (const drop of drops) game.spawnItem('cherry', drop.x, drop.y, { state: 1 });
     }
-    // Th07.exe (v1.00b) FUN_004217c0 @ 0x4217c0, all.c:14883 writes only
-    // enemy+0x2bb8 (HP). The manager death switch at all.c:14303 performs
-    // callback entry/removal later. Non-interactable ambient controllers are
-    // therefore left at hp=0 and remain live, as killEnemy's gate requires.
+    // Th07.exe (v1.00b) FUN_004217c0 @ 0x421925-0x42195f: the normal
+    // manager death switch handles interactable enemies after hp becomes 0,
+    // but an op116-disabled helper cannot enter that switch. The sweep enters
+    // its death callback directly and consumes the callback handle here.
+    // This is only a raw FUN_0040d6d0 cursor entry: unlike killEnemy's retained
+    // death path it does not reset rank/fire templates or the periodic slot.
+    if (!s.interactable && s.deathCallbackSub >= 0) {
+      const callback = s.deathCallbackSub;
+      s.deathCallbackSub = -1;
+      this.enterSub(s, callback);
+    }
     return drops;
   }
 

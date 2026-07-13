@@ -495,7 +495,12 @@ async function boot(): Promise<void> {
       // Test-only, same spirit as setLives: hold spawn-invulnerability so
       // probes can observe full bullet patterns without death-wipes
       // (player death clears all enemy bullets) resetting the field.
-      setInvuln: (frames: number) => { if (stage) stage.playerObj.invulnFrames = frames; },
+      setInvuln: (frames: number) => {
+        if (stage) {
+          stage.playerObj.invulnFrames = frames;
+          stage.playerObj.invulnFrac = 0;
+        }
+      },
       bgm: () => ({ active: audio.active, decoded: audio.decodedTracks })
     };
   }

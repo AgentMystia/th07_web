@@ -73,6 +73,7 @@ export function applySnapshot(scene, rpy, stageIndex, opts = {}) {
   scene.cherry.cherryPlus = s.cherryPlus;
   scene.cherry.spellsCaptured = s.spellsCaptured;
   scene.extendLevel = s.extendLevel;
+  scene.captureStageEntryTotals();
   if (scene.extendThreshold !== s.extendThreshold) {
     throw new Error(
       `T7RP stage ${s.stage} extend threshold ${s.extendThreshold} ` +
@@ -226,7 +227,6 @@ export async function runStage(rpy, stageIndex, opts = {}) {
   const killFrames = new Set();
   const collectFrames = new Set();
   const playerHitFrames = new Set();
-  const seenHitRecords = new Set(scene.hitLog);
   let prevLives = scene.playerObj.lives;
   let prevBombs = scene.playerObj.bombs;
   const graceFrames = opts.graceFrames ?? 900;
@@ -272,6 +272,12 @@ export async function runStage(rpy, stageIndex, opts = {}) {
       collectFrames.add(f);
       return origCollect(item);
     };
+    // Replay AUX-0x02 is written at the collision-contact seam, before the
+    // player-state/invulnerability outcome gate. Native Stage-5 frame 11587
+    // records a slot-917 bullet contact while state 3 absorbs it; hitLog is
+    // intentionally committed-hit-only and therefore cannot serve as this
+    // oracle. Tap the shared contact handler instead without changing play.
+    scene.onPlayerContact = () => playerHitFrames.add(f);
   }
   for (; f < stage.inputs.length + graceFrames; f++) {
     const word = f < stage.inputs.length ? stage.inputs[f] : 0;
@@ -283,22 +289,19 @@ export async function runStage(rpy, stageIndex, opts = {}) {
     // input stream to play out even while patterns still misalign — the
     // permanent invuln suppresses hit outcomes without touching RNG use
     // inside the collision path (graze still runs, like the exe's states 3/4).
-    if (opts.ghost) scene.playerObj.invulnFrames = Math.max(scene.playerObj.invulnFrames, 2);
+    if (opts.ghost && scene.playerObj.invulnFrames < 2) {
+      scene.playerObj.invulnFrames = 2;
+      scene.playerObj.invulnFrac = 0;
+    }
     scene.update(source.frame(word));
-    // T7RP stage records end when gameplay arms the native results screen;
-    // the unrecorded tally/dismiss UI then hands its already-computed carry
-    // to the next stage. Browser arcade flow still waits for dismissal and
-    // fires onStageComplete normally, but replay verification must stop at
-    // this authored gameplay boundary instead of manufacturing empty-input
-    // result-screen ticks.
-    if (!completed && stage.stage < 6 && scene.stageClear) {
+    // MSG op9 arms the native results tally while replay recording continues;
+    // op11 later requests the next game state and is the last authored PRE
+    // boundary. The compressed block can retain zero sentinel/padding records
+    // after that transition, so verification stops on the stage-flow latch
+    // instead of manufacturing result-screen ticks from array exhaustion.
+    if (!completed && scene.stageClear) {
       completed = true;
       carryOut = scene.carryState();
-    }
-    for (const hit of scene.hitLog) {
-      if (seenHitRecords.has(hit)) continue;
-      seenHitRecords.add(hit);
-      playerHitFrames.add(f);
     }
     if (scene.playerObj.lives < prevLives) deaths.push({ frame: f, stageFrame: scene.stageFrame });
     if (scene.playerObj.bombs < prevBombs) bombs.push({ frame: f, stageFrame: scene.stageFrame });

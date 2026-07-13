@@ -5,8 +5,8 @@ import { BinaryView } from './bin';
 // Ops used by TH07 stage dialogue: 0 end, 1/2 portrait enter (side, anm
 // script), 3 text line (color?, lineIndex, shift-jis text), 4 wait, 5 face
 // expression (side, variant), 6 ecl-resume ticket, 7 music change, 8 boss
-// intro line, 9 stage result, 10 wait forever, 11 hide portraits, 12 bgm
-// fadeout, 13 text-skippability flag.
+// intro line, 9 stage-result snapshot, 10 post-transition stop, 11 stage
+// transition, 12 BGM fadeout, 13 text-skippability flag, 14 screen fade.
 
 export interface MsgInstr {
   time: number;
