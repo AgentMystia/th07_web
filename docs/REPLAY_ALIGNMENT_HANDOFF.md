@@ -12,11 +12,12 @@ order: the current user request; approved modernizations in `AGENTS.md`;
 original data and `reference/Th07.exe` v1.00b; then the current port. Existing
 web behavior and tests are not behavioral authority.
 
-`tests/th07-replay-golden.test.mjs` is a sparse regression alarm. Never run
-`UPDATE_REPLAY_GOLDEN=1 npm test` merely to make an alignment change green.
-Regenerate it only after direct native evidence proves the new behavior and
-the complete replay verification criteria pass. Otherwise regeneration hides
-the first wrong frame by recording it as a new baseline.
+`tests/th07-replay-golden.test.mjs` is a sparse regression alarm, not behavioral
+authority. For every intentional, evidence-backed simulation change, regenerate
+it with `UPDATE_REPLAY_GOLDEN=1 npm test`, review the digest diff, and commit it
+with the change so normal `npm test` and CI remain green. A passing digest only
+means the current implementation is stable; native traces and executable data
+still decide whether that implementation is correct.
 
 The exact acceptance target for every Stage 1-6 replay is:
 
@@ -282,13 +283,12 @@ error state. Run `node scripts/pixel-report.mjs` on representative stage frames
 used for visual acceptance. Static `index.html` must remain functional without
 a development server or runtime ESM imports.
 
-For the user-requested 2026-07-13 preview checkpoint, `npm test` is expected to
-fail only at the stale replay-golden digest: 205/206 tests pass, and the frame-0
-digest changed because the native-proven seed/bootstrap and manager behavior
-changed. Report that exact exception and do not regenerate the digest yet.
-This is a one-checkpoint user-authorized exception to the normal `AGENTS.md`
-commit invariant, not a standing policy for future commits. Never describe the
-preview as fully converged.
+The 2026-07-13 preview initially shipped with a stale replay golden and caused
+the Pages CI build to fail at frame 0. That exception is closed: the digest was
+regenerated and reviewed in the follow-up CI fix. Every future commit must keep
+the full test suite green, including the golden lock. Do not describe a passing
+golden as native convergence; the PRE boundaries above remain the authority for
+unfinished alignment.
 
 Before committing:
 
@@ -301,5 +301,5 @@ Before committing:
 
 The final convergence commit comes only after all six complete native traces,
 exact event/end-state verification, zero unexpected deaths, clean build/tests,
-headless boot, and rendering probes. Only then regenerate and review the replay
-golden, commit it with the proven alignment change, and push `main`.
+headless boot, and rendering probes. Regenerate and review the replay golden
+with the final behavior change as usual, then push `main`.
