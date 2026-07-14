@@ -825,18 +825,9 @@ export class StageScene implements GameHost {
   }
 
   private syncEnemySlots(): void {
-    const live = this.enemies.filter((enemy) => enemy && !enemy.dead);
-    let valid = live.length === this.enemySlots.reduce((n, enemy) => n + (enemy ? 1 : 0), 0);
-    if (valid) {
-      for (const enemy of live) {
-        if (enemy.poolSlot < 0 || enemy.poolSlot >= ENEMY_POOL_CAP || this.enemySlots[enemy.poolSlot] !== enemy) {
-          valid = false;
-          break;
-        }
-      }
-    }
-    if (valid) return;
+    if (this.slotsConsistent(this.enemies, this.enemySlots, ENEMY_POOL_CAP, (e) => !e.dead)) return;
     this.enemySlots.fill(null);
+    const live = this.enemies.filter((enemy) => enemy && !enemy.dead);
     const rebuilt: Enemy[] = [];
     for (const enemy of live) {
       let slot = Number.isInteger(enemy.poolSlot) ? enemy.poolSlot : -1;
@@ -851,18 +842,9 @@ export class StageScene implements GameHost {
   }
 
   private syncPlayerBulletSlots(): void {
-    const live = this.playerBullets.filter((bullet) => bullet && !bullet.dead);
-    let valid = live.length === this.playerBulletSlots.reduce((n, bullet) => n + (bullet ? 1 : 0), 0);
-    if (valid) {
-      for (const bullet of live) {
-        if (bullet.poolSlot < 0 || bullet.poolSlot >= PLAYER_BULLET_POOL_CAP || this.playerBulletSlots[bullet.poolSlot] !== bullet) {
-          valid = false;
-          break;
-        }
-      }
-    }
-    if (valid) return;
+    if (this.slotsConsistent(this.playerBullets, this.playerBulletSlots, PLAYER_BULLET_POOL_CAP, (e) => !e.dead)) return;
     this.playerBulletSlots.fill(null);
+    const live = this.playerBullets.filter((bullet) => bullet && !bullet.dead);
     const rebuilt: PlayerBullet[] = [];
     for (const bullet of live) {
       let slot = Number.isInteger(bullet.poolSlot) ? bullet.poolSlot : -1;
@@ -877,18 +859,9 @@ export class StageScene implements GameHost {
   }
 
   private syncEnemyBulletSlots(): void {
-    const live = this.enemyBullets.filter((bullet) => bullet && !bullet.dead);
-    let valid = live.length === this.enemyBulletSlots.reduce((n, bullet) => n + (bullet ? 1 : 0), 0);
-    if (valid) {
-      for (const bullet of live) {
-        if (bullet.poolSlot < 0 || bullet.poolSlot >= ENEMY_BULLET_POOL_CAP || this.enemyBulletSlots[bullet.poolSlot] !== bullet) {
-          valid = false;
-          break;
-        }
-      }
-    }
-    if (valid) return;
+    if (this.slotsConsistent(this.enemyBullets, this.enemyBulletSlots, ENEMY_BULLET_POOL_CAP, (e) => !e.dead)) return;
     this.enemyBulletSlots.fill(null);
+    const live = this.enemyBullets.filter((bullet) => bullet && !bullet.dead);
     const rebuilt: EnemyBullet[] = [];
     for (const bullet of live) {
       let slot = Number.isInteger(bullet.poolSlot) ? bullet.poolSlot : -1;
@@ -907,18 +880,9 @@ export class StageScene implements GameHost {
   private syncItemSlots(): void {
     this.itemSlots ??= new Array(ITEM_POOL_CAP).fill(null);
     if (!Number.isInteger(this.itemPoolCursor)) this.itemPoolCursor = 0;
-    const live = this.items.filter((item) => item && !item.dead);
-    let valid = live.length === this.itemSlots.reduce((n, item) => n + (item ? 1 : 0), 0);
-    if (valid) {
-      for (const item of live) {
-        if (item.poolSlot < 0 || item.poolSlot >= ITEM_POOL_CAP || this.itemSlots[item.poolSlot] !== item) {
-          valid = false;
-          break;
-        }
-      }
-    }
-    if (valid) return;
+    if (this.slotsConsistent(this.items, this.itemSlots, ITEM_POOL_CAP, (e) => !e.dead)) return;
     this.itemSlots.fill(null);
+    const live = this.items.filter((item) => item && !item.dead);
     const rebuilt: ItemEntity[] = [];
     for (const item of live) {
       let slot = Number.isInteger(item.poolSlot) ? item.poolSlot : -1;
@@ -942,20 +906,47 @@ export class StageScene implements GameHost {
     this.syncEffectSlots();
   }
 
-  private syncEffectSlots(): void {
-    const live = this.particles.filter((particle) => particle && particle.age < particle.life);
-    let valid = live.length === this.effectSlots.reduce((n, particle) => n + (particle ? 1 : 0), 0);
-    if (valid) {
-      for (const particle of live) {
-        if (particle.poolSlot < 0 || particle.poolSlot >= EFFECT_POOL_CAP ||
-            this.effectSlots[particle.poolSlot] !== particle) {
-          valid = false;
-          break;
-        }
+  // Allocation-free validity check shared by the five sync*Slots methods. Returns
+  // true when the dense iteration array and the fixed-slot array are mutually
+  // consistent (same live set, each live entity's poolSlot points back at it, and
+  // the live count equals the non-null slot count), so the caller can skip the
+  // (allocating) rebuild. The decision is byte-identical to the old
+  // `.filter()` + `.reduce()` + back-pointer check — it just allocates nothing.
+  // This removes 5 fresh arrays + 5 reduce closures from every 60 Hz tick.
+  private slotsConsistent<T extends { poolSlot: number }>(
+    dense: T[], slots: (T | null)[], cap: number, isLive: (e: T) => boolean
+  ): boolean {
+    let live = 0;
+    for (let i = 0; i < dense.length; i++) {
+      const e = dense[i];
+      if (e && isLive(e)) {
+        live++;
+        const ps = e.poolSlot;
+        if (ps < 0 || ps >= cap || slots[ps] !== e) return false;
       }
     }
-    if (valid) return;
+    let slotCount = 0;
+    for (let s = 0; s < cap; s++) if (slots[s]) slotCount++;
+    return live === slotCount;
+  }
+
+  // Order-preserving in-place compaction — replaces `this.x = this.x.filter(e => !e.dead)`
+  // at three mid-update sites. A stable partition on !dead keeps the poolSlot-sorted
+  // dense order intact and allocates nothing (the .filter allocated a fresh array each
+  // tick, the dominant steady-state GC pressure). Result is byte-identical to the filter.
+  private compactLive<T extends { dead?: boolean }>(arr: T[]): void {
+    let w = 0;
+    for (let r = 0; r < arr.length; r++) {
+      const e = arr[r];
+      if (e && !e.dead) arr[w++] = e;
+    }
+    arr.length = w;
+  }
+
+  private syncEffectSlots(): void {
+    if (this.slotsConsistent(this.particles, this.effectSlots, EFFECT_POOL_CAP, (e) => e.age < e.life)) return;
     this.effectSlots.fill(null);
+    const live = this.particles.filter((particle) => particle && particle.age < particle.life);
     const rebuilt: EffectParticle[] = [];
     for (const particle of live) {
       let slot = Number.isInteger(particle.poolSlot) ? particle.poolSlot : -1;
@@ -2732,7 +2723,7 @@ export class StageScene implements GameHost {
       b.age += rate;
       if (b.dead && this.playerBulletSlots[slot] === b) this.playerBulletSlots[slot] = null;
     }
-    this.playerBullets = this.playerBullets.filter((b) => !b.dead);
+    this.compactLive(this.playerBullets);
     this.refreshActiveAttackSlots();
   }
 
@@ -3355,7 +3346,7 @@ export class StageScene implements GameHost {
         this.runtime.releaseEnemy(this, e);
       }
     }
-    this.enemies = this.enemies.filter((e) => !e.dead);
+    this.compactLive(this.enemies);
   }
 
   private tickSpellBonusDecay(e: Enemy): void {
@@ -3528,7 +3519,7 @@ export class StageScene implements GameHost {
     // then 1023 down through 1 (all.c:16038-16049,16197-16203).
     updateSlot(0);
     for (let slot = ENEMY_BULLET_POOL_CAP - 1; slot >= 1; slot--) updateSlot(slot);
-    this.enemyBullets = this.enemyBullets.filter((b) => !b.dead);
+    this.compactLive(this.enemyBullets);
     if (wave && wave.ticksLeft <= 0) this.borderClearWave = null;
     // Advance the bomb clear-region blast after this frame's cancellations: the
     // expanding-circle consumer grows the radius by `growth` per frame and retires
