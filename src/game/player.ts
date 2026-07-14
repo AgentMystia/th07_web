@@ -78,9 +78,11 @@ export interface PlayerBullet {
   // Per-frame vertical sprite stretch for the beam types (exe writes the VM
   // scaleY directly: optionY/14 resp. (playerY+64)/14 — sprite 70 is 14px).
   scaleYOverride?: number;
-  // Type 5 beam-history ring (up to 16 previous beam centers); each sample
-  // is a damage-1 helper box and an alpha-faded ghost draw.
+  // Type 5 beam-history ring: the physical ring is always 16 entries, while
+  // historyDepth caches the spawning SHT record's interval and limits both
+  // helper collision boxes and alpha-faded ghost draws.
   history?: { x: number; y: number }[];
+  historyDepth?: number;
   // Beam release-fade request (exe slot+0x1c6): the ANM VM only consumes the
   // interrupt while parked at its waitInt checkpoint, so the request re-tries
   // each frame until delivered (spec-marisab-beams.md §0.4).
@@ -430,8 +432,14 @@ export class Player {
     const pose = movingLeft ? 'left' : movingRight ? 'right' : 'idle';
     if (pose === this.poseState) return;
     this.poseState = pose;
-    // playerXX.anm scripts: 0 idle, 1 bank left, 2 bank right.
-    const script = pose === 'left' ? 1 : pose === 'right' ? 2 : 0;
+    // playerXX.anm movement scripts (Th07.exe FUN_0043be00 @ all.c:28120-28143,
+    // table at +0x29ef4..+0x29f00): 0 idle, 1 bank-left, 2 return-from-left,
+    // 3 bank-right, 4 return-from-right. Scripts 3/4 are scripts 1/2 with the
+    // sprite MIRRORED (scaleX<0) — that mirror is the only thing that makes
+    // moving right lean right. The old mapping used script 2 (return-from-left,
+    // unmirrored) for the right pose, so right movement showed a left lean
+    // identical to the left pose. Right must use the mirrored bank script 3.
+    const script = pose === 'left' ? 1 : pose === 'right' ? 3 : 0;
     if (this.anm.hasScript(script)) this.runner = new AnmRunner(this.anm, script);
   }
 
@@ -490,7 +498,14 @@ export class Player {
           if (!settled || this.focusHeld !== wantFocused) continue;
           const b = this.makeBullet(shot);
           if (!b) continue;
-          if (shot.shotType === 5) b.history = [];
+          if (shot.shotType === 5) {
+            // Th07.exe FUN_00438ef0 @ 0x438ef0 initializes every history X
+            // and the live bullet X to the exact -999.0 sentinel. The first
+            // beam tick therefore records an empty sample before anchoring.
+            b.history = Array.from({ length: 16 }, () => ({ x: -999, y: -999 }));
+            b.historyDepth = Math.min(16, Math.max(0, shot.interval | 0));
+            b.x = -999;
+          }
           // funcs0=2 seeds the countdown from the record's interval field
           // (130-330 by power); funcs0=3 seeds 999 (held indefinitely).
           this.laserSlots[slotId] = { bullet: b, timer: wantFocused ? 999 : Math.max(1, shot.interval), fading: false };
