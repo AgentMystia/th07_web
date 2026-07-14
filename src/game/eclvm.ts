@@ -1508,6 +1508,7 @@ export class StageRuntime {
             }
           }
         }
+        game.setBulletTimeVisual?.(true);
         game.setSlowRate?.(f);
         return;
       }
@@ -1528,6 +1529,7 @@ export class StageRuntime {
             }
           }
         }
+        game.setBulletTimeVisual?.(false);
         game.setSlowRate?.(1);
         return;
       }

@@ -467,6 +467,11 @@ export class StageScene implements GameHost {
     declAge: number;
     portraitSprite: number;
   } | null = null;
+  // Stage 5 owns two spell-background VMs from eff05.anm. Unlike the
+  // simpler scrolling sheets, both receive bullet-time interrupt 2/1 from
+  // FUN_00418020/FUN_00418130 and must remain real ANM runners so their
+  // authored tint, additive blend, scale and rotation transitions survive.
+  private spellBackgroundRunners: AnmRunner[] = [];
   private spellBanner = 0;
   // Spell-card capture popup (spec-ui-stageclear.md §4): label + value on
   // success only. Failure draws nothing (exe skips FUN_004264e3 entirely).
@@ -1104,6 +1109,15 @@ export class StageScene implements GameHost {
     this.slowRate = rate;
   }
 
+  setBulletTimeVisual(active: boolean): void {
+    // Th07.exe v1.00b @ 0x418020/0x418130 writes 2/1 to the +0x1c6 interrupt
+    // field of both global spell-background VMs. The writes occur even for
+    // effect-10 param=1 (rate remains 1): this is an authored visual state,
+    // not a color inferred from slowRate.
+    const label = active ? 2 : 1;
+    for (const runner of this.spellBackgroundRunners) runner.interrupt(label);
+  }
+
   // Screen FX scheduler (exe FUN_004459c0). Type 1 shake: each frame both
   // camera axes independently pick {0, +mag, -mag}, mag ramping from->to
   // over the duration. Type 3 flash: a full-screen tint held `duration`
@@ -1629,6 +1643,15 @@ export class StageScene implements GameHost {
       declAge: 0,
       portraitSprite
     };
+    this.spellBackgroundRunners = this.stageNumber === 5
+      ? this.effectAnm.entries.slice(0, 2).map((entry, entryIndex) =>
+          new AnmRunner(this.effectAnm, 0, {
+            entryIndex,
+            spriteIndexOffset: entry.spriteBase,
+            rng: this.rng
+          })
+        )
+      : [];
     this.spellBanner = 150;
     const tally = this.spellHistory.get(spellId) ?? { seen: 0, got: 0 };
     tally.seen++;
@@ -1664,6 +1687,7 @@ export class StageScene implements GameHost {
     }
     this.spellName = '';
     this.spellcard = null;
+    this.spellBackgroundRunners = [];
     // Exe FUN_0040f340: the scored phase-end field sweep only runs when the
     // spell did not time out (DAT_012f40a8 still 1). Getting HIT during the
     // spell voids the bonus but NOT the sweep.
@@ -1998,6 +2022,7 @@ export class StageScene implements GameHost {
     if (this.spellBanner > 0) this.spellBanner--;
     if (this.spellcard) {
       this.spellcard.declAge++;
+      for (const runner of this.spellBackgroundRunners) runner.update(this.slowRate);
     }
     if (this.bonusPopup && --this.bonusPopup.timer <= 0) this.bonusPopup = null;
     if (this.borderMessage) {
@@ -4885,6 +4910,12 @@ export class StageScene implements GameHost {
   private drawSpellBackground(r: Renderer): void {
     const sc = this.spellcard;
     if (!sc) return;
+    if (this.stageNumber === 5 && this.spellBackgroundRunners.length) {
+      for (const runner of this.spellBackgroundRunners) {
+        r.drawAnmFrame(runner.spriteFrame(), 0, 0);
+      }
+      return;
+    }
     // Per-stage effect sheet; resolved via the ANM entry's own texture name
     // (eff07.anm's textures are eff07b/eff07c — there is no eff07.png).
     const img = r.image(this.effectAnm.entries[0]?.imageKey ?? 'eff01');

@@ -71,7 +71,9 @@ const etama = new Anm(TH07_DATA.anm.etama, 'etama');
 const noAnm = { hasScript: () => false };
 
 function makeHost() {
+  const bulletTimeVisuals = [];
   const host = {
+    bulletTimeVisuals,
     rng: { range: () => 0, u32: () => 0, u32InRange: () => 0 },
     difficulty: 3,
     rank: 0,
@@ -87,6 +89,7 @@ function makeHost() {
     timeStopped: false,
     slowRate: 1,
     setSlowRate(r) { host.slowRate = r; },
+    setBulletTimeVisual(active) { bulletTimeVisuals.push(active); },
     addScore() {},
     spawnItem() {},
     spawnEffectParticles() {},
@@ -129,6 +132,7 @@ test('effect 10 sets 1/param and rescales live bullet velocity, not nominal spee
   host.enemyBullets.push(makeBullet(0));
   runtime.spawnEclEnemy(host, { subId: 0, x: 100, y: 100, life: 100, item: -1, score: 0 });
   assert.equal(host.slowRate, 0.5);
+  assert.deepEqual(host.bulletTimeVisuals, [true]);
   assert.equal(host.enemyBullets[0].vx, 1.5); // 3 * 0.5
   assert.equal(host.enemyBullets[0].speed, 3); // nominal speed untouched
 });
@@ -193,6 +197,7 @@ test('effect 11 restores velocities by the inverse of the current rate', () => {
   assert.equal(host.slowRate, 0.25, 'still slowed through wall update #39');
   runtime.updateEnemy(host, e);
   assert.equal(host.slowRate, 1, 'effect 11 fired on wall update #40');
+  assert.deepEqual(host.bulletTimeVisuals, [true, false]);
   assert.ok(Math.abs(host.enemyBullets[0].vx - 3) < 1e-6, 'velocity restored');
 });
 

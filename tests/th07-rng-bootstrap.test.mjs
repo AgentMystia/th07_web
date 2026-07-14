@@ -212,6 +212,39 @@ test('spell declaration does not synthesize a generic RNG-consuming burst', () =
   assert.equal(scene.particles.length, 0, 'spell declaration is not a generic id-3 particle request');
 });
 
+test('Stage 5 bullet-time interrupts both authored eff05 spell-background VMs', () => {
+  const scene = sceneFor(4);
+  scene.bossActive = { x: 192, y: 96, ecl: { timerCallbackThreshold: 3000 } };
+  scene.startBossSpell(87, 0, 'test');
+  assert.equal(scene.spellBackgroundRunners.length, 2);
+
+  for (let i = 0; i < 61; i++) {
+    for (const runner of scene.spellBackgroundRunners) runner.update();
+  }
+  let [base, overlay] = scene.spellBackgroundRunners.map((runner) => runner.spriteFrame());
+  assert.equal(base.imageKey, 'eff05');
+  assert.equal(overlay.imageKey, 'eff05b');
+  assert.equal(base.alpha, 255);
+  assert.equal(overlay.blendAdd, false);
+
+  scene.setBulletTimeVisual(true);
+  for (const runner of scene.spellBackgroundRunners) runner.update(0);
+  [base, overlay] = scene.spellBackgroundRunners.map((runner) => runner.spriteFrame());
+  assert.equal(base.alpha, 64);
+  assert.equal(base.color & 0xffffff, 0xff4040);
+  assert.equal(overlay.color & 0xffffff, 0xff60ff);
+  assert.equal(overlay.blendAdd, true);
+  assert.ok(overlay.scaleX > 2.9, 'interrupt 2 starts the authored enlarged overlay');
+
+  scene.setBulletTimeVisual(false);
+  for (const runner of scene.spellBackgroundRunners) runner.update(0);
+  [base, overlay] = scene.spellBackgroundRunners.map((runner) => runner.spriteFrame());
+  assert.equal(base.alpha, 255);
+  assert.equal(base.color & 0xffffff, 0xffffff);
+  assert.equal(overlay.color & 0xffffff, 0xffffff);
+  assert.equal(overlay.blendAdd, false);
+});
+
 test('nonspell op91 cleanup does not run the spell-end helper sweep', () => {
   const scene = sceneFor(0);
   assert.equal(scene.spellcard, null);

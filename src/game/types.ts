@@ -216,6 +216,9 @@ export interface GameHost {
   // fractionally; collision always runs at wall clock.
   slowRate?: number;
   setSlowRate?(rate: number): void;
+  // Th07.exe FUN_00418020/FUN_00418130 write interrupt 2/1 to the first
+  // two global spell-background ANM VMs (+0x1c6 at 0x0133e1ce/0x0133e41a).
+  setBulletTimeVisual?(active: boolean): void;
   addScore(v: number): void;
   spawnItem(type: ItemType, x: number, y: number, options?: { state?: number; vx?: number; vy?: number; tweenTarget?: { tx: number; ty: number } }): void;
   // seed = op118's 3-float operand (exe writes it to the particle's velocity-

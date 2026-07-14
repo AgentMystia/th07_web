@@ -439,8 +439,14 @@ comparisons against real play).
   confirmed at all.c:14226; op 142 = N-frame damage shield, boss /9 /
   non-boss 0, countdown at all.c:14440.)
 - `ins_30/31` render flags unknown (no-op everywhere, matches PyTouhou).
-- Spell declaration presentation: the eff01.anm background script is
-  open-coded (its op-4 loop defeats AnmRunner's frame-keyed fades); the
+- Spell declaration presentation: the simple scrolling/static stage sheets
+  remain open-coded where their op-4 loops defeat AnmRunner's frame-keyed
+  fades. Stage 5 is data-driven through both real `eff05.anm` entry VMs:
+  bullet-time effect 10 interrupts both with label 2 (base alpha 64/red;
+  `eff05b` purple additive scale/rotation), and effect 11 restores label 1.
+  This is the meaning of the writes to ANM VM `+0x1c6` at
+  `0x0133e1ce/0x0133e41a`; the old `spec-slowmo.md` “dead write” conclusion
+  is overruled by the VM layout and the original visual trace. The
   capture.anm flash draws as a flat teal tint (its runtime `'@'` texture is
   not extractable); the face_01_00 cutin sweep path/timing and the red
   name-banner gradient (text.anm textures not extractable) are hand-tuned;
@@ -473,9 +479,11 @@ comparisons against real play).
 - Slowmo clock (op121 ids 10/11): the executable scales STD, ANM, ECL,
   player, enemies, lasers, items, bombs, and timers while collision remains
   wall-clock. The port now drives all of these from one global `slowRate`
-  (effect 10 = 1/param + retroactive bullet-vector rescale, effect 11 =
-  inverse + reset; split-counter timers accumulate fractionally); see
-  spec-slowmo.md.
+  (effect 10 = 1/param + retroactive bullet-vector rescale + shape
+  0x260..0x26f -> 0x26f + spell-background interrupt 2; effect 11 = inverse
+  + shape restore + background interrupt 1 + rate reset; split-counter
+  timers accumulate fractionally). See `spec-slowmo.md`, with its old claim
+  that the two background writes are dead explicitly overruled above.
 - Extra/Phantasm starting bombs/power PROBABLE (community convention),
   not exe-verified.
 - ESC pause menu: presentation is the authored ascii.anm entry-2
