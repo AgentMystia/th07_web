@@ -2339,6 +2339,22 @@ export class StageScene implements GameHost {
         return;
       }
     }
+    // ReimuA seal orbs write r=128 CONSTANT circle clear-regions at each orb into
+    // the same +0x17dc pool (native-verified), NOT the 48/256 attack-slot box the
+    // web uses to damage enemies. Test the orb positions as circles. Other
+    // characters' clear radii are not yet traced — fall back to the box test.
+    if (this.playerObj.character === 'reimuA') {
+      for (const s of this.activeBombSlots) {
+        const dx = b.x - s.x;
+        const dy = b.y - s.y;
+        if (dx * dx + dy * dy < 128 * 128) {
+          this.spawnItem('cherry', b.x, b.y, { state: 1 });
+          this.removeEnemyBullet(b);
+          return;
+        }
+      }
+      return;
+    }
     for (const s of this.activeBombSlots) {
       if (Math.abs(b.x - s.x) > s.radiusX / 2 || Math.abs(b.y - s.y) > s.radiusY / 2) continue;
       // Bomb attack-slot contact becomes a type-6 auto-collecting Cherry
