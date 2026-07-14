@@ -179,7 +179,9 @@ export class BombRunner {
           orb.vx = orb.vy = 0;
           ctx.playSfx(15);
           ctx.startScreenShake(16, 8, 0);
-          ctx.spawnParticles(6, orb.x, orb.y, 12, 0xffffffff);
+          // Th07.exe FUN_00407840 orb detonation: FUN_0041b320(6, orb, 8, ...) — the
+          // swing-back burst is 8 particles (32 draws), not 12.
+          ctx.spawnParticles(6, orb.x, orb.y, 8, 0xffffffff);
         }
         this.engine.set(i, orb.x, orb.y, 48, 48, 8);
       } else if (orb.state === 2) {
