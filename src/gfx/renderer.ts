@@ -39,7 +39,13 @@ export class Renderer {
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
-    const ctx = canvas.getContext('2d');
+    // desynchronized: let the browser pipeline Canvas 2D to the display
+    // compositor with lower latency (Chrome/GL backends) — a direct cut to
+    // input-to-photon. alpha:false: the playfield is fully redrawn each frame
+    // (clear + draw), so the page-level alpha channel is unused; skipping it
+    // saves the per-pixel page blend. Both are hints — unsupported browsers
+    // ignore them and behave exactly as before.
+    const ctx = canvas.getContext('2d', { desynchronized: true, alpha: false });
     if (!ctx) throw new Error('Canvas 2D context unavailable');
     this.ctx = ctx;
     ctx.imageSmoothingEnabled = false;
