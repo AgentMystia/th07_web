@@ -3633,6 +3633,30 @@ export class StageScene implements GameHost {
     '#44ff88', '#44cc44', '#aaff44', '#ffff44', '#ffcc44', '#ff8844', '#cccccc', '#ffffff'
   ];
 
+  // The player body sprite (Th07.exe FUN_0043eff0 @ 0x43f033-0x43f089), drawn
+  // in every lifecycle state except game-over. It renders UNDER the danmaku
+  // (enemy bullet/laser) layer — only the focus hitbox indicator is drawn on
+  // top of the bullets so it stays visible.
+  private drawPlayerSprite(r: Renderer, ox: number, oy: number): void {
+    const p = this.playerObj;
+    if (!(p.alive || p.hitState || p.materializeFrame >= 0 || p.dyingFrame >= 0)) return;
+    const pf = p.runner.spriteFrame();
+    const dt = p.dyingTransform();
+    const mt = p.materializeTransform();
+    if (dt) {
+      // Death squish (exe state 2): in-place scaleX 1->0, scaleY 1->4.
+      r.drawAnmFrame(pf, ox + p.x, oy + p.y, dt);
+    } else if (mt) {
+      // Respawn materialize (exe state 1): in-place scale/alpha ramp.
+      r.drawAnmFrame(pf, ox + p.x, oy + p.y, mt);
+    } else {
+      // Spawn/respawn invuln (exe state 3): dark-tint 0x404040 on frames where
+      // (timer & 7) < 2 (fcn.0043e2e0), instead of an invisibility blink.
+      const dim = p.invulnFrames > 0 && (p.invulnFrames & 7) < 2;
+      r.drawAnmFrame(pf, ox + p.x, oy + p.y, dim ? { color: 0x404040 } : {});
+    }
+  }
+
   private drawLasers(r: Renderer, ox: number, oy: number): void {
     const ctx = r.ctx;
     for (const l of this.enemyLasers) {
@@ -4255,6 +4279,9 @@ export class StageScene implements GameHost {
         r.drawAnmFrame(frame, ox + e.x, oy + e.y, rotation != null ? { rotation } : {});
       }
       this.markPass('enemies');
+      // Th07.exe layers the player sprite UNDER the enemy bullet/laser danmaku
+      // (only the focus hitbox indicator, drawn later, sits on top).
+      this.drawPlayerSprite(r, ox, oy);
       this.drawLasers(r, ox, oy);
       // Enemy bullets dominate entity draw counts in dense spells. Their
       // sprites are untinted, so one saved Canvas state can safely cover the
@@ -4359,36 +4386,16 @@ export class StageScene implements GameHost {
           }
         }
       }
-      // Th07.exe FUN_0043eff0 @ 0x43f033-0x43f089: the main player sprite
-      // draws in EVERY lifecycle state — including state 2's deathbomb
-      // window (p.hitState) — gated only by the terminal game-over flag.
-      // Options (drawn above) stay keyed to p.alive: the exe excludes
-      // states 1/2 for them (0x43f0a3-0x43f0ca).
-      if (p.alive || p.hitState || p.materializeFrame >= 0 || p.dyingFrame >= 0) {
-        const pf = p.runner.spriteFrame();
-        const dt = p.dyingTransform();
-        const mt = p.materializeTransform();
-        if (dt) {
-          // Death squish (exe state 2): in-place scaleX 1->0, scaleY 1->4.
-          r.drawAnmFrame(pf, ox + p.x, oy + p.y, dt);
-        } else if (mt) {
-          // Respawn materialize (exe state 1): in-place scale/alpha ramp.
-          r.drawAnmFrame(pf, ox + p.x, oy + p.y, mt);
-        } else {
-          // Spawn/respawn invuln (exe state 3): dark-tint 0x404040 on frames
-          // where (timer & 7) < 2 (fcn.0043e2e0), instead of an invisibility
-          // blink -- the original dims the sprite, never hides it.
-          const dim = p.invulnFrames > 0 && (p.invulnFrames & 7) < 2;
-          r.drawAnmFrame(pf, ox + p.x, oy + p.y, dim ? { color: 0x404040 } : {});
-        }
-        if (this.focusHeld && p.alive) {
-          r.ctx.fillStyle = '#fff';
-          r.ctx.beginPath();
-          r.ctx.arc(ox + p.x, oy + p.y, p.hitboxHalf + 1.5, 0, Math.PI * 2);
-          r.ctx.fill();
-          r.ctx.strokeStyle = '#f66';
-          r.ctx.stroke();
-        }
+      // The player body sprite itself is drawn earlier, UNDER the danmaku
+      // layer (drawPlayerSprite). Only the focus hitbox indicator stays here,
+      // on top of the bullets, so it remains visible against dense fire.
+      if (this.focusHeld && p.alive) {
+        r.ctx.fillStyle = '#fff';
+        r.ctx.beginPath();
+        r.ctx.arc(ox + p.x, oy + p.y, p.hitboxHalf + 1.5, 0, Math.PI * 2);
+        r.ctx.fill();
+        r.ctx.strokeStyle = '#f66';
+        r.ctx.stroke();
       }
       if (this.cherry.borderActive) this.drawBorder(r, ox, oy);
       if (this.screenFlash) {
