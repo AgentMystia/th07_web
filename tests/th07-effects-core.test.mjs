@@ -476,6 +476,70 @@ test('effect 21 uses its wider band and all children carry EX without a spawn bl
   close(children[0].angle, Math.PI / 4, 'param 1 wraps the narrow arc around pi/4');
 });
 
+test('effect 22 constructs the Extra large-bullet aura volleys in fixed-slot order', () => {
+  const runtime = makeRuntime();
+  const game = makeHost([0]);
+  const caller = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
+  caller.ecl.bossTimer = 2;
+  const eligible = makeBullet(7, {
+    x: 120, y: 100, spriteOffset: 1,
+    rect: { x: 0, y: 0, w: 64, h: 64, imageKey: 'etama2' }
+  });
+  const tagged = makeBullet(3, {
+    x: 140, y: 100, exFlags: 0x40,
+    rect: { x: 0, y: 0, w: 64, h: 64, imageKey: 'etama2' }
+  });
+  const boundary = makeBullet(5, {
+    x: 160, y: 100,
+    rect: { x: 0, y: 0, w: 64, h: 60, imageKey: 'etama2' }
+  });
+  game.enemyBullets.push(eligible, boundary, tagged);
+
+  runtime.runBulletEffect(game, caller, 22, 0);
+  const children = game.enemyBullets.filter((bullet) =>
+    bullet !== eligible && bullet !== boundary && bullet !== tagged && !bullet.dead);
+  assert.equal(children.length, 2, 'even non-third timer emits the native opposite pair');
+  assert.equal(game.observations.rawRngDraws, 2, 'one frand per qualifying large parent');
+  assert.ok(children.every((bullet) => bullet.sprite === 3 && bullet.spriteOffset === 6));
+  assert.ok(children.every((bullet) => bullet.flags === 0x208 && bullet.spawnDuration === 32));
+  assert.deepEqual(children.map((bullet) => Number(bullet.angle.toFixed(6))),
+    [Number((-Math.PI).toFixed(6)), 0]);
+  assert.equal(tagged.exFlags, 0x40, 'active EX bit 6 excludes the parent');
+  assert.equal(boundary.dead, undefined, 'height exactly 60 is excluded');
+});
+
+test('effect 23 constructs the Phantasm odd-group aura bullet with the FUN_00426190 speed-ramp release', () => {
+  const runtime = makeRuntime();
+  const game = makeHost([0]);
+  const caller = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
+  caller.ecl.bossTimer = 1;
+  const parent = makeBullet(4, {
+    x: 180, y: 319.5, spriteOffset: 2,
+    rect: { x: 0, y: 0, w: 64, h: 64, imageKey: 'etama2' }
+  });
+  game.enemyBullets.push(parent);
+
+  runtime.runBulletEffect(game, caller, 23, 0);
+  const child = game.enemyBullets.find((bullet) => bullet !== parent && !bullet.dead);
+  assert.ok(child);
+  assert.equal(game.observations.rawRngDraws, 2);
+  // The odd group carries the 0x80 EX-record activation bit (native fire flags
+  // 0x208 | 0x80 = 0x288, all.c:11276 FUN_00426190 -> FUN_00426080 which ORs
+  // 0x80 into template flags +0xc4 -> bullet +0xbf6). FUN_00421e90 copies the
+  // template's +0x20 record into the bullet's own +0xc14 op-79 queue and the
+  // construction-time FUN_004229f0 pass promotes it.
+  assert.deepEqual([child.sprite, child.spriteOffset, child.flags], [1, 10, 0x288]);
+  assert.equal(child.exFlags, 0x80, 'odd-group promotes the 0x80 speed-ramp record at construction');
+  assert.ok(child.exDir, 'a real speed-ramp release record is installed (not a cosmetic no-op)');
+  assert.equal(child.exDir.interval, 0x28, 'op23 release fires after 40 frames');
+  assert.equal(child.exDir.maxTimes, 1, 'one-shot release');
+  close(child.exDir.angle, 0, 'aim offset 0 (re-aims straight at the player)');
+  close(child.exDir.newSpeed, Math.fround(2.9), 'op23 release speed 2.9 (0x4039999a)');
+  // Speed stays nominal at construction; FUN_00423e70 (0x80 dirChangeBullet
+  // 'aimed') decays it toward 0 over 40 frames, then snaps it to 2.9.
+  close(child.speed, Math.fround(1.2), 'odd-group nominal spawn speed (before the ramp)');
+});
+
 test('effect 0 copies tracked motion and permanently suppresses movement after disarm', () => {
   const runtime = makeRuntime();
   const game = makeHost();
