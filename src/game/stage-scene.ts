@@ -590,6 +590,13 @@ export class StageScene implements GameHost {
   // FUN_0042819f performs its initial field clear first and writes 9 only
   // afterward, so this must be mutable state rather than a stage constant.
   private cancelItemType: 'cherry' | 'case9Cherry' = 'cherry';
+  // Frame index of the last dialogue-start item collect-all (FUN_0042819f's
+  // FUN_00431d10). startDialogue runs during the enemy manager (before the
+  // manager reaches the swept hp=0 non-boss enemies), so enemy death drops for
+  // that same frame are spawned AFTER the initial home loop. Native's
+  // FUN_00431d10 nonetheless ends up homing them; reproduce that by re-homing
+  // every live item once at the top of updateItems on the dialogue-start frame.
+  private dialogueCollectAllFrame = -1;
 
   constructor(
     private assets: GameAssets,
@@ -1543,6 +1550,14 @@ export class StageScene implements GameHost {
       it.vx = 0;
       it.vy = -0.5;
     }
+    // killNonBossEnemies only sets hp=0 on interactable helpers; their real
+    // itemDrop is spawned later this frame by the manager's death switch
+    // (updateEnemies -> killEnemy), AFTER this loop. Mark the frame so
+    // updateItems re-homes those late drops, matching native FUN_00431d10
+    // (the Phantasm sub56 dialogue at frame 3966 sheds 8 power->bigCherry
+    // drops this way; missing the home let them fall/cull instead of
+    // auto-collecting +1000 cherry each, starving the 2nd Border).
+    this.dialogueCollectAllFrame = this.frame;
     // msg1.dat entry layout is sparse: character*10 + phase (0 pre-boss,
     // 1 post-boss) — entries 0/1 Reimu, 10/11 Marisa, 20/21 Sakuya. The ECL
     // timeline passes only the phase; the engine adds the character offset.
@@ -2249,6 +2264,10 @@ export class StageScene implements GameHost {
     // Choreography has fixed active/radius state for the rest of this frame.
     // Cache the ordered object references instead of restarting the 112-slot
     // generator for every enemy and every bullet in a dense field.
+    this.refreshActiveAttackSlots();
+  }
+
+  private refreshActiveAttackSlots(): void {
     this.activeBombSlots.length = 0;
     for (const slot of this.bombEngine.activeSlots()) this.activeBombSlots.push(slot);
   }
@@ -2269,7 +2288,11 @@ export class StageScene implements GameHost {
       const hw = (hitbox.x + s.radiusX) / 2;
       const hh = (hitbox.y + s.radiusY) / 2;
       if (Math.abs(e.x - s.x) > hw || Math.abs(e.y - s.y) > hh) continue;
-      this.damageEnemy(e, s.damage, 'bomb');
+      this.damageEnemy(
+        e,
+        s.damage,
+        s.source === 'shot' && this.playerObj.bombTimer <= 0 ? 'shot' : 'bomb'
+      );
       s.hitTally += s.damage;
       // Player+0x240c is one global hit counter. Every fourth attack-slot
       // contact emits id3 for slots 0..95, id5 for slots 96..111
@@ -2281,7 +2304,7 @@ export class StageScene implements GameHost {
   }
 
   private cancelBulletWithBombSlots(b: EnemyBullet): void {
-    if (b.dead || (b.flags & 0x1000) !== 0) return;
+    if (this.playerObj.bombTimer <= 0 || b.dead || (b.flags & 0x1000) !== 0) return;
     for (const s of this.activeBombSlots) {
       if (Math.abs(b.x - s.x) > s.radiusX / 2 || Math.abs(b.y - s.y) > s.radiusY / 2) continue;
       // Bomb attack-slot contact becomes a type-6 auto-collecting Cherry
@@ -2596,6 +2619,9 @@ export class StageScene implements GameHost {
 
   private updatePlayerBullets(collide = true): void {
     this.syncPlayerBulletSlots();
+    // Native FUN_0043d8f0 clears attack-slot width before shot behavior VMs
+    // repopulate the MarisaB trail helpers and bomb choreography.
+    this.bombEngine.beginFrame();
     // FUN_0043edc0 clears the shared target after the prior firing pass;
     // FUN_0041ed50 repopulates it per enemy after collision but before death.
     // Therefore this player tick consumes the snapshot built last frame,
@@ -2657,6 +2683,7 @@ export class StageScene implements GameHost {
       if (b.dead && this.playerBulletSlots[slot] === b) this.playerBulletSlots[slot] = null;
     }
     this.playerBullets = this.playerBullets.filter((b) => !b.dead);
+    this.refreshActiveAttackSlots();
   }
 
   private firePlayerBullets(): void {
@@ -2829,14 +2856,6 @@ export class StageScene implements GameHost {
           this.playSfx(20);
         }
       }
-      if (b.shotType === 5 && b.history) {
-        for (const hpt of b.history) {
-          if (Math.abs(hpt.x - e.x) <= (hitbox.x + 10) / 2 &&
-              Math.abs(hpt.y - e.y) <= (hitbox.y + b.hitboxH) / 2) {
-            this.damageEnemy(e, 1, this.playerObj.bombTimer > 0 ? 'bomb' : 'shot');
-          }
-        }
-      }
     }
     this.collideBombSlots(e, hitbox);
   }
@@ -2890,8 +2909,9 @@ export class StageScene implements GameHost {
   // FUN_004398e0 (type 5). Type 4 rides its option: the beam box spans from
   // the option to the screen top (center optionY/2, full height optionY) and
   // the 14px beam sprite stretches to match (VM scaleY = optionY/14).
-  // Type 5 rides the player with 64px of overhang past the top edge and
-  // records its previous centers into the 16-sample history ring.
+  // Type 5 rides the player with 64px of overhang past the top edge. Before
+  // shifting its 16-entry ring it projects only the spawning record's cached
+  // historyDepth into fixed attack slots 0x60..0x6f.
   private anchorBeamBullet(b: PlayerBullet): void {
     const p = this.playerObj;
     if (b.shotType === 4) {
@@ -2902,8 +2922,22 @@ export class StageScene implements GameHost {
       b.y = optY / 2;
       b.scaleYOverride = optY / 14;
     } else if (b.history) {
-      b.history.unshift({ x: b.x, y: b.y });
-      if (b.history.length > 16) b.history.pop();
+      const depth = Math.min(16, b.historyDepth ?? 0);
+      for (let i = 0; i < depth; i++) {
+        const hpt = b.history[i];
+        if (hpt.x < -900) continue;
+        this.bombEngine.set(
+          0x60 + i,
+          Math.fround(hpt.x),
+          Math.fround(hpt.y),
+          Math.fround(b.hitboxW),
+          Math.fround(b.hitboxH),
+          1,
+          'shot'
+        );
+      }
+      for (let i = 15; i > 0; i--) b.history[i] = b.history[i - 1];
+      b.history[0] = { x: Math.fround(b.x), y: Math.fround(b.y) };
       b.x = p.x + b.anchorX;
       b.hitboxH = p.y + 64;
       b.y = p.y / 2 - 32;
@@ -3844,6 +3878,18 @@ export class StageScene implements GameHost {
   private updateItems(): void {
     const p = this.playerObj;
     const sht = p.sht;
+    // Native FUN_0042819f's dialogue-start FUN_00431d10 homes EVERY live item.
+    // Enemy death drops swept by that same dialogue start are only spawned
+    // after startDialogue's own home loop (during the intervening enemy
+    // manager pass), so catch them here on the dialogue-start frame.
+    if (this.dialogueCollectAllFrame >= 0 && this.frame === this.dialogueCollectAllFrame) {
+      for (const it of this.items) {
+        if (it.dead || it.state === 1) continue;
+        it.state = 1;
+        it.vx = 0;
+        it.vy = -0.5;
+      }
+    }
     // Th07.exe FUN_00430c10 @ all.c:21958-21961: the PoC trigger is
     // (power >= 128 OR difficulty > 3 [Extra/Phantasm]) AND player.y <
     // pocLine (strict FCOMP <). DAT_0061c260 is the difficulty byte, not the
@@ -4357,16 +4403,20 @@ export class StageScene implements GameHost {
         // Beam types stretch their 14px segment over the live beam length
         // (exe writes the VM scaleY each frame: FUN_004396a0/FUN_004398e0).
         if (b.scaleYOverride != null) opts.scaleY = b.scaleYOverride;
-        // Type-5 ghost trail (FUN_00439c50, funcs[2]=1): the beam redraws at
-        // each history sample with alpha falling off by sample index.
+        r.drawAnmFrame(frame, ox + b.x, oy + b.y, opts);
+        // FUN_00439c50 runs after the primary draw, visits newest-to-oldest
+        // up to the cached SHT interval, and stops at the first -999 slot.
         if (b.shotType === 5 && b.history) {
-          const n = b.history.length;
-          for (let i = n - 1; i >= 0; i--) {
+          const depth = Math.min(16, b.historyDepth ?? 0);
+          for (let i = 0; i < depth; i++) {
             const hpt = b.history[i];
-            r.drawAnmFrame(frame, ox + hpt.x, oy + hpt.y, { ...opts, alpha: 1 - (i + 1) / 16 });
+            if (hpt.x === -999) break;
+            r.drawAnmFrame(frame, ox + hpt.x, oy + hpt.y, {
+              ...opts,
+              alpha: 1 - i / depth
+            });
           }
         }
-        r.drawAnmFrame(frame, ox + b.x, oy + b.y, opts);
       }
       this.playerEffects.draw(r, ox, oy);
       if (this.focusEffectRunner) {

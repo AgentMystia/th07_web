@@ -1874,11 +1874,70 @@ export class StageRuntime {
       case 19: // FUN_00418ee0: fade the current BGM out over 3.0 seconds.
         game.fadeBgm?.(3);
         return;
-      case 22: case 23: // FUN_00418f20/FUN_00419150: per-frame decorative
-        // aura particles on big bullets, keyed to bossTimer parity — purely
-        // cosmetic, no bullet state changes; not ported (§13/§14, priority
-        // table blesses no-op).
+      case 22: case 23: { // FUN_00418f20 @ 0x418f20 / FUN_00419150 @ 0x419150
+        // Extra/Phantasm arm these handlers continuously with op122. Despite
+        // their aura-like presentation, each qualifying large parent calls
+        // the real enemy-bullet constructor (FUN_00423480), so omitting them
+        // removes collidable bullets, their fixed-pool pressure, and one
+        // frand from the shared RNG stream per parent.
+        const group = e.ecl.bossTimer % 3;
+        if ((id === 22 && group === 0) || (id === 23 && group === 2)) return;
+        const occupied = this.occupiedBulletPoolSlots(game);
+        for (const b of this.bulletsInPoolOrder(game)) {
+          // Native filters bullet+0xbf4 bit 6 (the active EX mask), Y<320,
+          // and the sprite descriptor's +0x2c HEIGHT strictly above 60.
+          if ((b.exFlags & 0x40) !== 0 || b.y >= 320 || b.rect.h <= 60) continue;
+          const variant = id === 22 ? (e.ecl.bossTimer & 1) : group;
+          const angle = Math.fround(game.rng.f() * NATIVE_TAU_F32 - NATIVE_PI_F32);
+          // The odd group (variant !== 0) attaches a real delayed-release
+          // record via FUN_00426190 BEFORE the constructor (all.c:11197 op22 /
+          // 11276 op23). FUN_00426190 -> FUN_00426080 ORs 0x80 into the fire
+          // template's flags (0x208 -> 0x288) and seeds the template's +0x20
+          // op-79 scratch slot 0 with a type-0x80 record. FUN_00421e90 then
+          // memcpy's that +0x20 block into the newborn bullet's own +0xc14
+          // queue (all.c:15374-15381), and the per-frame dispatch
+          // FUN_004229f0 -> FUN_00423e70 (all.c:15936-15972) decays the
+          // bullet's speed toward 0 over `interval` frames, then snaps it to
+          // `newSpeed` and re-aims at the player. This is what makes the aura
+          // bullets pause then shoot off fast; omitting it left them drifting
+          // at ~1.0 and missed the Phantasm frame-5850 graze. (Web's 0x80
+          // exSlot -> dirChangeBullet('aimed') already models FUN_00423e70.)
+          const oddGroup = variant !== 0;
+          this.spawnBullets(game, e, {
+            sprite: variant === 0 ? 3 : 1,
+            offset: id === 22
+              ? (b.spriteOffset === 1 ? 6 : 2)
+              : (b.spriteOffset === 2 ? 10 : 13),
+            count1: id === 22 && variant === 0 ? 2 : 1,
+            count2: 1,
+            speed1: variant === 0 ? Math.fround(0.8) : Math.fround(1.2),
+            speed2: 0,
+            angle1: angle,
+            angle2: -NATIVE_PI_F32,
+            // Odd group carries the 0x80 EX-record activation bit (native
+            // template flags +0xc4 |= 0x80 -> bullet +0xbf6 = 0x288).
+            flags: oddGroup ? 0x288 : 0x208,
+            sfx: 0x19,
+            exSlots: oddGroup
+              ? [
+                  {
+                    // FUN_00426190(&tmpl, 0, interval, 1, 0, newSpeed):
+                    // op22 -> 60 frames / 3.1; op23 -> 40 frames / 2.9.
+                    opcode: 0x80,
+                    cond: 1,
+                    arg3: id === 22 ? 0x3c : 0x28,
+                    arg4: 1,
+                    f0: 0,
+                    f1: id === 22 ? Math.fround(3.1) : Math.fround(2.9)
+                  },
+                  null, null, null, null
+                ]
+              : [null, null, null, null, null],
+            aimMode: 3
+          }, { x: b.x, y: b.y }, occupied);
+        }
         return;
+      }
       case 3: return; // exe stub (confirmed empty; unused by real data)
       default:
         // Retail data uses exactly ids 0-23, all handled above — an id here

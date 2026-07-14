@@ -22,6 +22,7 @@ export interface AttackSlot {
   damage: number;
   hitTally: number;
   active: boolean;
+  source: 'shot' | 'bomb';
 }
 
 export interface BombContext {
@@ -45,17 +46,36 @@ const TAU = Math.PI * 2;
 export class BombEngine {
   slots: AttackSlot[] = Array.from({ length: MAX_SLOTS }, (_, poolSlot) => ({
     poolSlot,
-    x: 0, y: 0, radiusX: 0, radiusY: 0, damage: 0, hitTally: 0, active: false
+    x: 0, y: 0, radiusX: 0, radiusY: 0, damage: 0, hitTally: 0, active: false,
+    source: 'bomb'
   }));
+
+  // FUN_0043d8f0 clears only dims.x for all 112 entries at the head of each
+  // player tick. Other fields persist until an owner rewrites them.
+  beginFrame(): void {
+    for (const s of this.slots) {
+      s.active = false;
+      s.radiusX = 0;
+    }
+  }
 
   reset(): void {
     for (const s of this.slots) {
       s.active = false;
       s.radiusX = s.radiusY = s.damage = s.hitTally = 0;
+      s.source = 'bomb';
     }
   }
 
-  set(i: number, x: number, y: number, radiusX: number, radiusY: number, damage: number): AttackSlot {
+  set(
+    i: number,
+    x: number,
+    y: number,
+    radiusX: number,
+    radiusY: number,
+    damage: number,
+    source: 'shot' | 'bomb' = 'bomb'
+  ): AttackSlot {
     const s = this.slots[i];
     s.x = x;
     s.y = y;
@@ -63,6 +83,7 @@ export class BombEngine {
     s.radiusY = radiusY;
     s.damage = damage;
     s.active = true;
+    s.source = source;
     return s;
   }
 

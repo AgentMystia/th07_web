@@ -145,13 +145,14 @@ export function digestFrame(scene) {
 //    `graceFrames` empty-input ticks without completion.
 export async function runStage(rpy, stageIndex, opts = {}) {
   const mod = await loadEngine();
-  const stage = rpy.stages[stageIndex];
+  const entry = mod.replayStageEntry(rpy, stageIndex);
+  const stage = entry.stage;
   const scene = new mod.StageScene(
     makeStubAssets(mod),
     makeStubAudio(),
     rpy.difficulty,
     rpy.character,
-    stage.stage,
+    entry.runtimeStageNumber,
     null,
     stage.rngSeed
   );
