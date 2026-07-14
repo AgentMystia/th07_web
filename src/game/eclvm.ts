@@ -3084,33 +3084,41 @@ export class StageRuntime {
 
   private readBulletProps(game: GameHost, e: Enemy, aimMode: number, a: number): BulletProps {
     const s = e.ecl;
+    // Th07.exe FUN_0040f6c0 (all.c:8456-8502) resolves the RNG-capable FIRE args
+    // in the order count1(local_1c[1]), count2(local_1c[2]), angle1(local_1c[5]),
+    // speed1(local_1c[3]), angle2(local_1c[6]), speed2(local_1c[4]) — NOT arg
+    // order, and crucially angle1 BEFORE speed1. getInt/getFloat consume RNG for
+    // random special vars (10055/10056/10060), so this order is load-bearing: a
+    // fire with a random speed AND a random angle (Phantasm Sub50 ins_67 =
+    // speed1 [10056] + angle1 [10060]) must give the FIRST frand to the angle and
+    // the second to the speed. Reading speed1 before angle1 (the old order)
+    // assigned the two frand draws to the wrong fields — invisible to the RNG
+    // stream (same two draws) but silently swapping the bullet's speed and angle
+    // (the Phantasm frame-10220 first divergence). sprite/offset are non-random
+    // (packed local_1c[0], resolved first); flags is a literal (i32).
+    const sprite = this.getShort(game, e, a);
+    const offset = this.getShort(game, e, a + 2);
+    const count1raw = this.getInt(game, e, a + 4);
+    const count2raw = this.getInt(game, e, a + 8);
+    // FUN_0040f6c0 copies the raw f32 angle endpoint into the FIRE template;
+    // FUN_00421e90 normalizes only the final constructed angle. Not pre-wrapping
+    // is load-bearing for random modes 6/8 when an authored interval crosses +pi
+    // (8141 Stage 3 PRE5936).
+    const angle1 = this.getFloat(game, e, a + 20);
     const speed1 = this.getFloat(game, e, a + 12);
+    const angle2 = this.getFloat(game, e, a + 24);
     const speed2 = this.getFloat(game, e, a + 16);
-    // Th07.exe FUN_0040f6c0 fire body (all.c:8503): the whole rank/count/speed
-    // scaling + min-1-count + 0.3-speed floors are gated behind
-    // `if (DAT_012f40a8 == 0)` — the GLOBAL spell-active state, so during a
-    // spell EVERY emitter (boss and helpers alike) uses the raw ECL
-    // count/speed args verbatim (audit-fire-aimmode.md D1; CADENCE-001).
+    const flags = this.ecl.view.i32(a + 28);
+    const common = {
+      sprite, offset, angle1, angle2, flags,
+      sfx: s.bulletSfx, exSlots: s.bulletExSlots.slice(), aimMode
+    };
+    // The rank/count/speed scaling + min-1-count + 0.3-speed floors are gated
+    // behind `if (DAT_012f40a8 == 0)` — the GLOBAL spell-active state — so during
+    // a spell EVERY emitter uses the raw ECL count/speed args verbatim
+    // (audit-fire-aimmode.md D1; CADENCE-001).
     if (this.spellActive) {
-      return {
-        sprite: this.getShort(game, e, a),
-        offset: this.getShort(game, e, a + 2),
-        count1: this.getInt(game, e, a + 4),
-        count2: this.getInt(game, e, a + 8),
-        speed1,
-        speed2,
-        // FUN_0040f6c0 copies the raw f32 endpoint into the FIRE template;
-        // FUN_00421e90 normalizes only the final constructed angle. This is
-        // load-bearing for random modes 6/8 when an authored interval crosses
-        // +pi: pre-wrapping one endpoint turns the intended short interval
-        // into an almost-full-circle spread (8141 Stage 3 PRE5936).
-        angle1: this.getFloat(game, e, a + 20),
-        angle2: this.getFloat(game, e, a + 24),
-        flags: this.ecl.view.i32(a + 28),
-        sfx: s.bulletSfx,
-        exSlots: s.bulletExSlots.slice(),
-        aimMode
-      };
+      return { ...common, count1: count1raw, count2: count2raw, speed1, speed2 };
     }
     const rankSpeed = game.rank * (s.bulletRankSpeedHigh - s.bulletRankSpeedLow) / 32 + s.bulletRankSpeedLow;
     // Exe (0x411c76/0x4120d2): idiv truncates the (hi-lo)*rank product BEFORE
@@ -3119,18 +3127,11 @@ export class StageRuntime {
     const add1 = Math.trunc(game.rank * (s.bulletRankAmount1High - s.bulletRankAmount1Low) / 32) + s.bulletRankAmount1Low;
     const add2 = Math.trunc(game.rank * (s.bulletRankAmount2High - s.bulletRankAmount2Low) / 32) + s.bulletRankAmount2Low;
     return {
-      sprite: this.getShort(game, e, a),
-      offset: this.getShort(game, e, a + 2),
-      count1: Math.max(1, this.getInt(game, e, a + 4) + add1),
-      count2: Math.max(1, this.getInt(game, e, a + 8) + add2),
+      ...common,
+      count1: Math.max(1, count1raw + add1),
+      count2: Math.max(1, count2raw + add2),
       speed1: speed1 ? Math.max(0.3, speed1 + rankSpeed) : 0,
-      speed2: Math.max(0.3, speed2 + rankSpeed / 2),
-      angle1: this.getFloat(game, e, a + 20),
-      angle2: this.getFloat(game, e, a + 24),
-      flags: this.ecl.view.i32(a + 28),
-      sfx: s.bulletSfx,
-      exSlots: s.bulletExSlots.slice(),
-      aimMode
+      speed2: Math.max(0.3, speed2 + rankSpeed / 2)
     };
   }
 
