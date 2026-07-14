@@ -65,6 +65,7 @@ const browser = await chromium.launch({
 const pct = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
 const summarize = (arr) => {
   const s = [...arr].sort((a, b) => a - b);
+  if (!s.length) return { p50: 0, p95: 0, p99: 0, max: 0, dropRate: 0, samples: 0 };
   const max = s[s.length - 1];
   const dropped = s.filter((v) => v > FRAME_BUDGET_MS).length;
   return {
