@@ -34,6 +34,7 @@ function cancelScene() {
   scene.enemyLasers = [];
   scene.postBombLaserCounter = 0;
   scene.cancelItemType = 'cherry';
+  scene.bombClearRegions = [];
   return scene;
 }
 
