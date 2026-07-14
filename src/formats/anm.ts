@@ -529,18 +529,21 @@ export class AnmRunner {
         this.mirrored = !this.mirrored;
         break;
       case 12: // rotation
-        this.rotX = v.f32(a);
-        this.rotY = v.f32(a + 4);
-        this.rotZ = v.f32(a + 8);
+        // ANM float operands resolve variables 10000..10011 (op6/op7 pattern);
+        // eff05b's bullet-time rotation is authored as var10004, so a raw read
+        // spins the additive overlay ~262deg/frame (Stage-5 slow-mo flicker).
+        this.rotX = this.getVal(v.f32(a));
+        this.rotY = this.getVal(v.f32(a + 4));
+        this.rotZ = this.getVal(v.f32(a + 8));
         break;
       case 13: // rotation speed
-        this.rotSpeedX = v.f32(a);
-        this.rotSpeedY = v.f32(a + 4);
-        this.rotSpeedZ = v.f32(a + 8);
+        this.rotSpeedX = this.getVal(v.f32(a));
+        this.rotSpeedY = this.getVal(v.f32(a + 4));
+        this.rotSpeedZ = this.getVal(v.f32(a + 8));
         break;
       case 14: // scale speed
-        this.scaleSpeedX = v.f32(a);
-        this.scaleSpeedY = v.f32(a + 4);
+        this.scaleSpeedX = this.getVal(v.f32(a));
+        this.scaleSpeedY = this.getVal(v.f32(a + 4));
         break;
       case 15: // fade to alpha over duration
         this.fadeInterp = { start: this.frame, duration: Math.max(1, v.i32(a + 4)), formula: 0, from: [this.alpha], to: [v.i32(a) & 0xff] };
@@ -622,7 +625,7 @@ export class AnmRunner {
           duration: Math.max(1, v.i32(a)),
           formula: v.i32(a + 4),
           from: [this.rotX, this.rotY, this.rotZ],
-          to: [v.f32(a + 8), v.f32(a + 12), v.f32(a + 16)]
+          to: [this.getVal(v.f32(a + 8)), this.getVal(v.f32(a + 12)), this.getVal(v.f32(a + 16))]
         };
         break;
       case 36: // scale with formula
@@ -631,7 +634,7 @@ export class AnmRunner {
           duration: Math.max(1, v.i32(a)),
           formula: v.i32(a + 4),
           from: [this.scaleX, this.scaleY],
-          to: [v.f32(a + 8), v.f32(a + 12)]
+          to: [this.getVal(v.f32(a + 8)), this.getVal(v.f32(a + 12))]
         };
         break;
       case 37: // set int variable

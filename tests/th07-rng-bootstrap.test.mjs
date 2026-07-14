@@ -236,6 +236,23 @@ test('Stage 5 bullet-time interrupts both authored eff05 spell-background VMs', 
   assert.equal(overlay.blendAdd, true);
   assert.ok(overlay.scaleX > 2.9, 'interrupt 2 starts the authored enlarged overlay');
 
+  // Regression (Stage-5 slow-mo flicker): the eff05b bullet-time rotation is
+  // authored as ANM var10004 (~0.0628 rad/frame). op13 must resolve it via
+  // getVal; reading the literal 10004 spins the additive overlay ~262deg per
+  // wall-clock frame. Advance at the real slow-mo rate (1/3) and confirm the
+  // per-frame rotation stays gentle instead of strobing.
+  const overlayRunner = scene.spellBackgroundRunners[1];
+  let prevRot = overlayRunner.spriteFrame().rotation;
+  let maxRotDelta = 0;
+  for (let i = 0; i < 12; i++) {
+    overlayRunner.update(1 / 3);
+    const rot = overlayRunner.spriteFrame().rotation;
+    maxRotDelta = Math.max(maxRotDelta, Math.abs(rot - prevRot));
+    prevRot = rot;
+  }
+  assert.ok(maxRotDelta < 0.1,
+    `bullet-time overlay rotates gently (var10004 resolved), not strobing; maxRotDelta=${maxRotDelta}`);
+
   scene.setBulletTimeVisual(false);
   for (const runner of scene.spellBackgroundRunners) runner.update(0);
   [base, overlay] = scene.spellBackgroundRunners.map((runner) => runner.spriteFrame());
