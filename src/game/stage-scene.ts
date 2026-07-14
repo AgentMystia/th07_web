@@ -2135,7 +2135,12 @@ export class StageScene implements GameHost {
 
   private onBombUsed(): void {
     this.playSfx(14);
-    this.spawnEffectParticles(3, this.playerObj.x, this.playerObj.y, 24, 0xffffffff);
+    // Th07.exe: bomb activation spawns an ANM VM (FUN_00407620 → FUN_0041b770(0x19))
+    // whose init reseeds 2 object fields via FUN_00401700 (rand%100000 + 0x198f),
+    // consuming exactly 8 RNG draws at the activation frame — NOT a 24-particle
+    // flash. The values are presentation-only ANM state; only the draw count feeds
+    // the shared stream. Model it as 2 effect particles (2 × 4 draws = 8).
+    this.spawnEffectParticles(3, this.playerObj.x, this.playerObj.y, 2, 0xffffffff);
     // FUN_0043d9a0 @ 0x43dc31-0x43dc40: every successful bomb subtracts
     // 200 rank points. A free Border break never enters this path.
     this.adjustRank(-200);
