@@ -37,8 +37,19 @@ export interface AnmEntry {
   // parse time). Callers that address an entry's sprites by embedded id must
   // add this — entry bases depend on every earlier entry's max embedded id.
   spriteBase: number;
+  // Global id of this entry's embedded script 0. Enemy ECL addresses the
+  // loader's concatenated script table, while every ANM entry stores local
+  // ids again. stg6enm's first entry ends at 146, so stg6enm2 local 0..8
+  // are ECL-global 147..155.
+  scriptBase: number;
   spriteIds: number[];
   scriptIds: number[];
+}
+
+export interface GlobalAnmScriptRef {
+  entryIndex: number;
+  localId: number;
+  spriteBase: number;
 }
 
 interface ScriptRef {
@@ -84,6 +95,7 @@ export class Anm {
     // ids (which may be sparse, e.g. player00's 0-17/64-70/128-133) are
     // offset by a base that advances by (max embedded id + 1) per entry.
     let entryBase = 0;
+    let scriptBase = 0;
     for (let guard = 0; guard < 64; guard++) {
       const spriteCount = v.u32(entryStart + 0);
       const scriptCount = v.u32(entryStart + 4);
@@ -96,7 +108,13 @@ export class Anm {
       if (version !== 2) throw new Error(`${this.name}: ANM entry version ${version}, expected 2`);
       const name = v.cstring(entryStart + nameOffset);
       const imageKey = imageKeyFromName(name);
-      const entry: AnmEntry = { name, imageKey, width, height, format, spriteBase: entryBase, spriteIds: [], scriptIds: [] };
+      const entry: AnmEntry = {
+        name, imageKey, width, height, format,
+        spriteBase: entryBase,
+        scriptBase,
+        spriteIds: [],
+        scriptIds: []
+      };
 
       let ptr = entryStart + 64;
       let maxEmbedded = -1;
@@ -119,14 +137,17 @@ export class Anm {
       entryBase += maxEmbedded + 1;
       ptr += spriteCount * 4;
       const entryScriptMap = new Map<number, ScriptRef>();
+      let maxEmbeddedScript = -1;
       for (let i = 0; i < scriptCount; i++) {
         const id = v.i32(ptr + i * 8);
+        if (id >= 0) maxEmbeddedScript = Math.max(maxEmbeddedScript, id);
         const start = entryStart + v.u32(ptr + i * 8 + 4);
         const ref: ScriptRef = { id, start, imageKey };
         this.scriptRefs.set(id, ref);
         entryScriptMap.set(id, ref);
         entry.scriptIds.push(id);
       }
+      scriptBase += maxEmbeddedScript + 1;
       this.entryScripts.push(entryScriptMap);
       this.entries.push(entry);
       if (!nextOffset) break;
@@ -155,6 +176,20 @@ export class Anm {
     const ref = this.entryScripts[entryIndex]?.get(id);
     if (!ref) throw new Error(`${this.name}: missing ANM script ${id} in entry ${entryIndex}`);
     return ref;
+  }
+
+  // Resolve the concatenated global script ids used by ECL back to the
+  // owning ANM entry and its on-disk local id. Scan in file order so global
+  // id 0 selects entry 0 even when a later entry reuses local id 0.
+  resolveGlobalScript(id: number): GlobalAnmScriptRef | null {
+    for (let entryIndex = 0; entryIndex < this.entries.length; entryIndex++) {
+      const entry = this.entries[entryIndex];
+      const localId = id - entry.scriptBase;
+      if (this.hasScriptInEntry(entryIndex, localId)) {
+        return { entryIndex, localId, spriteBase: entry.spriteBase };
+      }
+    }
+    return null;
   }
 
   get scriptIds(): number[] {

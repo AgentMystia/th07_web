@@ -109,6 +109,7 @@ function makeBullet(poolSlot, overrides = {}) {
     speed: 3, angle: 0, age: 20, flags: 0,
     sprite: 0, spriteOffset: 0,
     rect: { x: 0, y: 0, w: 16, h: 16, imageKey: 'etama' },
+    slowmoShapeBackupRect: { x: 0, y: 0, w: 16, h: 16, imageKey: 'etama' },
     grazeW: 4, grazeH: 4, grazed: false,
     spawnDuration: 0, spawnMoveScale: 1,
     exFlags: 0, exAccel: null, exAngle: null, exDir: null, exBounce: null,
@@ -130,6 +131,47 @@ test('effect 10 sets 1/param and rescales live bullet velocity, not nominal spee
   assert.equal(host.slowRate, 0.5);
   assert.equal(host.enemyBullets[0].vx, 1.5); // 3 * 0.5
   assert.equal(host.enemyBullets[0].speed, 3); // nominal speed untouched
+});
+
+test('effects 10/11 swap the native 0x260..0x26f shape family to 0x26f and restore it', () => {
+  const sub = [
+    instruction(0, 121, [i32(10), i32(2)]),
+    instruction(1, 121, [i32(11), i32(0)])
+  ];
+  const stage = { ...TH07_DATA.stages[1], ecl: makeEcl([sub]) };
+  const runtime = new StageRuntime(stage, { etama, enemy: noAnm, effect: noAnm });
+  const host = makeHost();
+  const original = runtime.bulletRect(6, 4);
+  host.enemyBullets.push(makeBullet(0, {
+    sprite: 6,
+    spriteOffset: 4,
+    rect: original,
+    slowmoShapeBackupRect: runtime.bulletRect(6, 0)
+  }));
+  const e = runtime.spawnEclEnemy(host, { subId: 0, x: 100, y: 100, life: 100, item: -1, score: 0 });
+
+  assert.deepEqual(host.enemyBullets[0].rect, runtime.bulletRect(6, 15), 'enter binds fixed shape 0x26f');
+  assert.equal(host.enemyBullets[0].spriteOffset, 4, 'FIRE color/filter field remains unchanged');
+  runtime.updateEnemy(host, e);
+  runtime.updateEnemy(host, e);
+  assert.deepEqual(host.enemyBullets[0].rect, original, 'exit restores the shape saved at enter');
+});
+
+test('a template-6 bullet born during slowmo retains the template offset-0 backup used by native exit', () => {
+  const sub = [instruction(0, 121, [i32(11), i32(0)])];
+  const stage = { ...TH07_DATA.stages[1], ecl: makeEcl([sub]) };
+  const runtime = new StageRuntime(stage, { etama, enemy: noAnm, effect: noAnm });
+  const host = makeHost();
+  host.slowRate = 0.5;
+  host.enemyBullets.push(makeBullet(0, {
+    sprite: 6,
+    spriteOffset: 8,
+    rect: runtime.bulletRect(6, 8),
+    slowmoShapeBackupRect: runtime.bulletRect(6, 0)
+  }));
+
+  runtime.spawnEclEnemy(host, { subId: 0, x: 100, y: 100, life: 100, item: -1, score: 0 });
+  assert.deepEqual(host.enemyBullets[0].rect, runtime.bulletRect(6, 0));
 });
 
 test('effect 11 restores velocities by the inverse of the current rate', () => {

@@ -37,6 +37,10 @@ export interface EnemyBullet {
   sprite: number;
   spriteOffset: number;
   rect: { x: number; y: number; w: number; h: number; imageKey: string };
+  // Native bullet+0x1d6. Templates initialize this to their offset-0 shape;
+  // slowmo effect 10 overwrites it with the current shape for every live
+  // bullet, and effect 11 restores it when the current shape is 0x260..26f.
+  slowmoShapeBackupRect?: { x: number; y: number; w: number; h: number; imageKey: string };
   grazeW: number;
   grazeH: number;
   grazed: boolean;

@@ -137,6 +137,30 @@ test('enemy SET_ANM preserves the native current-sprite pointer across script re
   assert.equal(inherited.alpha, 0, 'the new script still applies its own time-0 alpha state');
 });
 
+test('stage-6 enemy global ANM ids 147..155 resolve to stg6enm2 local scripts 0..8', () => {
+  const enemyAnm = new Anm(TH07_DATA.anm.stg6enm, 'stg6enm');
+  const noAnm = { hasScript: () => false };
+  const runtime = new StageRuntime(
+    { ...TH07_DATA.stages[6], ecl: makeEcl([[]]) },
+    { etama: noAnm, enemy: enemyAnm, effect: noAnm }
+  );
+  const game = makeHost();
+  const enemy = runtime.spawnEclEnemy(game, { subId: 0, x: 0, y: 0 });
+
+  assert.equal(enemyAnm.entries[1].scriptBase, 147);
+  assert.deepEqual(enemyAnm.resolveGlobalScript(151), {
+    entryIndex: 1,
+    localId: 4,
+    spriteBase: 79
+  });
+  runtime.setCurrentAnm(enemy, 151);
+  const frame = enemy.ecl.anmRunner?.spriteFrame();
+  assert.ok(frame, 'Yuyuko pose has a drawable frame');
+  assert.equal(frame.imageKey, 'stg6enm2');
+  assert.deepEqual({ x: frame.x, y: frame.y, w: frame.w, h: frame.h },
+    { x: 96, y: 80, w: 48, h: 80 });
+});
+
 test('ops 10 and 11 apply random sign through their int and float paths', () => {
   const runtime = makeRuntime([[
     instruction(0, 10, [i32(10000), i32(7)]),

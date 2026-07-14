@@ -1494,7 +1494,19 @@ export class StageRuntime {
         // (spec-slowmo.md §1). Repeated enters compound, like the exe.
         const f = param > 0 ? 1 / param : 1;
         for (const b of game.enemyBullets) {
-          if (!b.dead) { b.vx *= f; b.vy *= f; }
+          if (!b.dead) {
+            b.vx *= f;
+            b.vy *= f;
+            // Th07.exe (v1.00b) FUN_00418020 @ 0x418020: +0x1d6 always
+            // snapshots the live shape. Global shapes 0x260..0x26f are the
+            // etama template-6 color row and are rebound to fixed 0x26f.
+            b.slowmoShapeBackupRect = b.rect;
+            if (b.sprite === 6) {
+              b.rect = this.bulletRect(6, 15);
+              b.grazeW = BULLET_HITBOX_BY_SPRITE[6];
+              b.grazeH = BULLET_HITBOX_BY_SPRITE[6];
+            }
+          }
         }
         game.setSlowRate?.(f);
         return;
@@ -1503,7 +1515,18 @@ export class StageRuntime {
         // of whatever rate is CURRENTLY active, then rate = 1.
         const f = 1 / (game.slowRate ?? 1);
         for (const b of game.enemyBullets) {
-          if (!b.dead) { b.vx *= f; b.vy *= f; }
+          if (!b.dead) {
+            b.vx *= f;
+            b.vy *= f;
+            // FUN_00418130 @ 0x418130 only restores bullets whose CURRENT
+            // shape is still in the 0x260..0x26f family. Deflection effects
+            // may have rebound the bullet to template 5 in the meantime.
+            if (b.sprite === 6 && b.slowmoShapeBackupRect) {
+              b.rect = b.slowmoShapeBackupRect;
+              b.grazeW = BULLET_HITBOX_BY_SPRITE[6];
+              b.grazeH = BULLET_HITBOX_BY_SPRITE[6];
+            }
+          }
         }
         game.setSlowRate?.(1);
         return;
@@ -1899,15 +1922,31 @@ export class StageRuntime {
     const s = e.ecl;
     if (script < 0 || s.currentAnm === script) return;
     s.currentAnm = script;
-    s.anmRunner = this.enemyAnm.hasScript(script)
-      ? new AnmRunner(this.enemyAnm, script, {
-          rng: this.anmRng,
-          // Th07.exe FUN_004486e0 @ 0x4486e0 resets the embedded ANM VM but
-          // leaves enemy+0x1e4's current sprite pointer intact. Stage-1
-          // Sub35 script 11's fourth random branch sets no sprite and must
-          // retain script 0's 32x32 rect so FUN_0042bdc7 can cull it.
-          inheritSpriteFrom: s.anmRunner ?? undefined
-        })
+    s.anmRunner = this.makeEnemyAnmRunner(script, s.anmRunner ?? undefined);
+  }
+
+  private makeEnemyAnmRunner(script: number, inheritSpriteFrom?: AnmRunner): AnmRunner | null {
+    // Enemy ECL uses the executable loader's concatenated script ids. ANM
+    // entries store local ids independently; stg6enm global 147..155 are
+    // stg6enm2 local 0..8. Keep the flat fallback for the small test mocks
+    // and any single-entry data lacking the additive resolver.
+    const resolved = typeof this.enemyAnm.resolveGlobalScript === 'function'
+      ? this.enemyAnm.resolveGlobalScript(script)
+      : null;
+    if (resolved) {
+      return new AnmRunner(this.enemyAnm, resolved.localId, {
+        entryIndex: resolved.entryIndex,
+        spriteIndexOffset: resolved.spriteBase,
+        rng: this.anmRng,
+        // Th07.exe FUN_004486e0 @ 0x4486e0 resets the embedded ANM VM but
+        // leaves enemy+0x1e4's current sprite pointer intact. Stage-1
+        // Sub35 script 11's fourth random branch sets no sprite and must
+        // retain script 0's 32x32 rect so FUN_0042bdc7 can cull it.
+        inheritSpriteFrom
+      });
+    }
+    return this.enemyAnm.hasScript(script)
+      ? new AnmRunner(this.enemyAnm, script, { rng: this.anmRng, inheritSpriteFrom })
       : null;
   }
 
@@ -2627,9 +2666,7 @@ export class StageRuntime {
           const script = v.i32(a + 4);
           s.anmSlots[slot] = {
             script,
-            runner: this.enemyAnm.hasScript(script)
-              ? new AnmRunner(this.enemyAnm, script, { rng: this.anmRng })
-              : null
+            runner: this.makeEnemyAnmRunner(script)
           };
         }
         return null;
@@ -3227,6 +3264,11 @@ export class StageRuntime {
           sprite: p.sprite,
           spriteOffset: p.offset,
           rect,
+          // FUN_004256d0 initializes template +0x1d6 from its offset-0
+          // +0x1d4 shape. FUN_00421e90 changes the live shape for FIRE's
+          // color offset without changing this backup, which matters for a
+          // template-6 bullet spawned after slowmo has already begun.
+          slowmoShapeBackupRect: this.bulletRect(p.sprite, 0),
           grazeW: BULLET_HITBOX_BY_SPRITE[p.sprite] ?? Math.max(3, rect.w * 0.4),
           grazeH: BULLET_HITBOX_BY_SPRITE[p.sprite] ?? Math.max(3, rect.h * 0.4),
           grazed: false,
