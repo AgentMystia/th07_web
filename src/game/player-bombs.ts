@@ -171,9 +171,15 @@ export class BombRunner {
     }
     this.actors.forEach((orb, i) => {
       if (orb.state === 1) {
-        orb.speed -= 0.4 * ctx.rate;
-        orb.vx = Math.cos(orb.angle) * orb.speed;
-        orb.vy = Math.sin(orb.angle) * orb.speed;
+        // Orb motion is float32 in the exe (FUN_00407840 @ all.c:3656-3706):
+        //   speed = (float)(speed - 0.4*rate)
+        //   vx/vy = (float)(cos/sin(angle)*speed)   via FUN_004074e0 (recomputed each frame)
+        //   x     = (float)(rate*vx + x)
+        // Match the float32 storage so sub-pixel orb positions don't drift — the r=128
+        // clear-circle / graze-box boundary otherwise flips a bullet clear-vs-graze.
+        orb.speed = Math.fround(orb.speed - 0.4 * ctx.rate);
+        orb.vx = Math.fround(Math.cos(orb.angle) * orb.speed);
+        orb.vy = Math.fround(Math.sin(orb.angle) * orb.speed);
         if (orb.speed < -10) {
           orb.state = 2;
           orb.vx = orb.vy = 0;
@@ -189,8 +195,8 @@ export class BombRunner {
         if (++orb.age > 29) orb.state = 0; // slot stays frozen (exe quirk)
       }
       if (orb.state !== 0) {
-        orb.x += orb.vx * ctx.rate;
-        orb.y += orb.vy * ctx.rate;
+        orb.x = Math.fround(ctx.rate * orb.vx + orb.x);
+        orb.y = Math.fround(ctx.rate * orb.vy + orb.y);
       }
     });
   }
