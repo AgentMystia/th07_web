@@ -525,6 +525,12 @@ export class StageScene implements GameHost {
   // Moving bomb attack hitboxes (exe player+0x9dc pool; see player-bombs.ts).
   private readonly bombEngine = new BombEngine();
   private readonly activeBombSlots: AttackSlot[] = [];
+  // Th07.exe bomb bullet-CLEAR regions (exe player+0x17dc pool, 96 circle slots,
+  // allocated by FUN_0043e7e0/FUN_0043e730 and scanned by FUN_0043b040 during the
+  // per-bullet graze/hit check — BEFORE the graze box). The spec mislabeled this
+  // pool "cosmetic"; it is the bomb's bullet cancellation. ReimuA activation writes
+  // a fixed-center expanding-circle blast (r = 32 + 8·age, 17 frames).
+  private readonly bombClearRegions: { x: number; y: number; radius: number; growth: number; framesLeft: number }[] = [];
   // The active bomb form's decoded state machine (12 forms, player-bombs.ts).
   private bombRunner: BombRunner | null = null;
   // Latched bomb duration (frames) for end-window checks (ReimuA focused's
@@ -2154,6 +2160,14 @@ export class StageScene implements GameHost {
     // VM tied to the invuln duration) — represented here by the character's
     // own bomb ANM scripts plus the runner's choreography.
     const p = this.playerObj;
+    // Th07.exe FUN_00407840 (ReimuA) @0x407862: the activation writes a fixed-center
+    // expanding-circle bullet-clear region via FUN_0043e7e0(player+0x930, r0=32, grow=8,
+    // life=16, 6) into the player+0x17dc pool. Native-verified: center = player snapshot
+    // at cast, radius 32→160 at +8/frame over 17 frames. Other characters' activation
+    // blasts (different r0/grow) are not yet traced — add per character as converged.
+    if (p.character === 'reimuA') {
+      this.bombClearRegions.push({ x: p.x, y: p.y, radius: 32, growth: 8, framesLeft: 17 });
+    }
     this.bombRunner = new BombRunner(this.bombEngine, p.character, p.bombFocused);
     this.bombRunner.start(this.bombCtx());
     this.spawnBombEffects();
@@ -2309,7 +2323,22 @@ export class StageScene implements GameHost {
   }
 
   private cancelBulletWithBombSlots(b: EnemyBullet): void {
-    if (this.playerObj.bombTimer <= 0 || b.dead || (b.flags & 0x1000) !== 0) return;
+    // Th07.exe FUN_004241c0 loop gate (all.c:16158): the per-bullet clear/graze check
+    // only runs for bullets that are not already grazed (+0xc01==0) and older than 15
+    // frames (0xf < +0xbdc); flag-0x1000 bullets are clear-immune.
+    if (this.playerObj.bombTimer <= 0 || b.dead || b.grazed || b.age <= 15 || (b.flags & 0x1000) !== 0) return;
+    // FUN_0043b040 (all.c:27726): the +0x17dc clear-region pool — the activation
+    // expanding blast plus the moving seal orbs — is scanned BEFORE the graze box.
+    // A bullet inside any CIRCLE region is cancelled to an auto-collecting Cherry.
+    for (const r of this.bombClearRegions) {
+      const dx = b.x - r.x;
+      const dy = b.y - r.y;
+      if (dx * dx + dy * dy < r.radius * r.radius) {
+        this.spawnItem('cherry', b.x, b.y, { state: 1 });
+        this.removeEnemyBullet(b);
+        return;
+      }
+    }
     for (const s of this.activeBombSlots) {
       if (Math.abs(b.x - s.x) > s.radiusX / 2 || Math.abs(b.y - s.y) > s.radiusY / 2) continue;
       // Bomb attack-slot contact becomes a type-6 auto-collecting Cherry
@@ -3485,6 +3514,18 @@ export class StageScene implements GameHost {
     for (let slot = ENEMY_BULLET_POOL_CAP - 1; slot >= 1; slot--) updateSlot(slot);
     this.enemyBullets = this.enemyBullets.filter((b) => !b.dead);
     if (wave && wave.ticksLeft <= 0) this.borderClearWave = null;
+    // Advance the bomb clear-region blast after this frame's cancellations: the
+    // expanding-circle consumer grows the radius by `growth` per frame and retires
+    // the region once its lifetime lapses (native: 17 frames, r 32→160).
+    if (this.bombClearRegions.length) {
+      for (const r of this.bombClearRegions) {
+        r.radius += r.growth;
+        r.framesLeft--;
+      }
+      for (let i = this.bombClearRegions.length - 1; i >= 0; i--) {
+        if (this.bombClearRegions[i].framesLeft <= 0) this.bombClearRegions.splice(i, 1);
+      }
+    }
   }
 
   // Per-frame bullet ex-behaviors, matching Th07.exe FUN_004241c0 @ 0x4241c0.
