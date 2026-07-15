@@ -4,35 +4,17 @@
 // Each step is "key@shotName" e.g. "confirm@title" presses confirm then shoots
 // a PNG named <shotName>.png. "wait@x" advances without a press. Keys:
 // up/down/left/right/confirm/back. A leading "N*" repeats the key N times.
-import { chromium } from '@playwright/test';
-import { createServer } from 'node:http';
-import { readFile, mkdir } from 'node:fs/promises';
-import { extname, join } from 'node:path';
+import { mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
+import { attachPageDiagnostics, launchChromium, startStaticServer, uniqueErrors } from './lib/browser-harness.mjs';
 
-const root = new URL('..', import.meta.url).pathname;
 const [outdir = '/tmp/menu', script = 'shot@title'] = process.argv.slice(2);
 await mkdir(outdir, { recursive: true });
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.jpg': 'image/jpeg', '.ogg': 'audio/ogg', '.wav': 'audio/wav', '.map': 'application/json' };
-const server = createServer(async (req, res) => {
-  try {
-    let p = decodeURIComponent(new URL(req.url, 'http://x').pathname);
-    if (p === '/') p = '/index.html';
-    const data = await readFile(join(root, p));
-    res.writeHead(200, { 'content-type': MIME[extname(p)] ?? 'application/octet-stream' });
-    res.end(data);
-  } catch {
-    res.writeHead(404);
-    res.end();
-  }
-});
-await new Promise((r) => server.listen(0, r));
-const port = server.address().port;
-const browser = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome' });
+const server = await startStaticServer();
+const browser = await launchChromium();
 const page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
-const errors = [];
-page.on('pageerror', (e) => errors.push(String(e).slice(0, 200)));
-page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text().slice(0, 200)); });
-await page.goto(`http://127.0.0.1:${port}/index.html?test=1&menu=1`);
+const errors = attachPageDiagnostics(page);
+await page.goto(`${server.baseUrl}/index.html?test=1&menu=1&paused=1`);
 await page.waitForFunction(() => window.__TH07_TEST__?.ready, null, { timeout: 20000 });
 
 // Edge-triggered press: inject as `pressed` for one sim frame, then clear.
@@ -64,6 +46,8 @@ for (const raw of script.split(';')) {
     console.log(`${name}:`, JSON.stringify(snap));
   }
 }
-if (errors.length) console.log('PAGE ERRORS:', JSON.stringify([...new Set(errors)].slice(0, 5)));
+const pageErrors = uniqueErrors(errors);
+if (pageErrors.length) console.log('PAGE ERRORS:', JSON.stringify(pageErrors.slice(0, 5)));
 await browser.close();
-server.close();
+await server.close();
+if (pageErrors.length) process.exitCode = 4;

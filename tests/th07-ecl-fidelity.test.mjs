@@ -570,6 +570,25 @@ test('op54 uses speed times duration and mirrors the X delta', () => {
   assert.deepEqual(sharedEnemy.ecl.orbitTarget, { x: 192, y: 112, z: 0 },
     'op55 mode-2 origin is published through native shared +0x2b8c/90/94 fields');
 
+  const sharedVarReads = makeRuntime([[
+    instruction(0, 55, [i32(30), i32(0), f32(300), f32(200), f32(4)]),
+    instruction(0, 5, [f32(10004), f32(10050)], 2),
+    instruction(0, 5, [f32(10005), f32(10051)], 2),
+    instruction(0, 5, [f32(10006), f32(10052)], 2)
+  ]]);
+  const readEnemy = sharedVarReads.spawnEclEnemy(makeHost(), { subId: 0, x: 192, y: 112, z: 8 });
+  assert.deepEqual(Array.from(readEnemy.ecl.vars.slice(4, 7)), [192, 112, 8],
+    'vars 10050-10052 read the executable shared +0x2b8c/90/94 fields');
+
+  const sharedVarWrites = makeRuntime([[
+    instruction(0, 5, [f32(10050), f32(320)]),
+    instruction(0, 5, [f32(10051), f32(240)]),
+    instruction(0, 5, [f32(10052), f32(16)])
+  ]]);
+  const writeEnemy = sharedVarWrites.spawnEclEnemy(makeHost(), { subId: 0, x: 192, y: 112 });
+  assert.deepEqual(writeEnemy.ecl.orbitTarget, { x: 320, y: 240, z: 16 },
+    'float writes to vars 10050-10052 update the same shared movement fields');
+
   const sharedAngleFields = makeRuntime([[
     instruction(0, 54, [i32(30), i32(0), f32(0), f32(2)])
   ]]);

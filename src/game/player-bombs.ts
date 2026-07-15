@@ -2,6 +2,7 @@ import type { PlayerEffects, PlayerEffectHandle } from './player-effects';
 import type { Player } from './player';
 import type { Rng } from '../core/rng';
 import type { Enemy, EnemyBullet } from './types';
+import type { AnmRunner } from '../formats/anm';
 
 // Player bomb attack-slot engine + the twelve decoded per-form state
 // machines (Th07.exe bomb tick functions 0x407840-0x40cbf0; specs:
@@ -30,6 +31,7 @@ export interface BombContext {
   fx: PlayerEffects;
   rng: Rng;
   frame: number; // integer bomb-local frame (exe 16a38)
+  elapsed: number; // integer + split fraction (exe 16a38 + 16a34)
   duration: number;
   focused: boolean; // latched at cast (exe 16a24)
   rate: number; // global slow-motion rate
@@ -38,10 +40,22 @@ export interface BombContext {
   playSfx(id: number): void;
   spawnParticles(effectId: number, x: number, y: number, count: number, color: number): void;
   startScreenShake(duration: number, from: number, to: number): void;
+  addBulletClearRegion(x: number, y: number, radius: number, growth: number, frames: number): void;
+  createBombAnmRunner(scriptId: number): AnmRunner;
 }
 
 const MAX_SLOTS = 112; // exe pool size (0x70)
 const TAU = Math.PI * 2;
+const PI_F32 = Math.fround(Math.PI);
+const TAU_F32 = Math.fround(Math.PI * 2);
+const HALF_PI_F32 = Math.fround(Math.PI / 2);
+
+function wrapNativeAngleF32(value: number): number {
+  let angle = Math.fround(value);
+  while (angle > PI_F32) angle = Math.fround(angle - TAU_F32);
+  while (angle <= -PI_F32) angle = Math.fround(angle + TAU_F32);
+  return angle;
+}
 
 export class BombEngine {
   slots: AttackSlot[] = Array.from({ length: MAX_SLOTS }, (_, poolSlot) => ({
@@ -118,6 +132,8 @@ export class BombRunner {
   private castY = 0;
   private sweepSign = 1;
   private spawnedCount = 0;
+  private marisaBBeamVms: AnmRunner[] = [];
+  private marisaBBeamAngles: number[] = [];
   // SakuyaA focused: per-knife visual handles for the on-hit script swap.
   private knifeFx: (PlayerEffectHandle | null)[] = [];
 
@@ -131,6 +147,11 @@ export class BombRunner {
     // MarisaB unfocused: the sweep direction sign is locked at cast from
     // which half of the playfield the player stood on (spec-bombs-marisa §3).
     this.sweepSign = this.castX >= 192 ? -1 : 1;
+    if (this.character === 'marisaB' && !this.focused) {
+      this.marisaBBeamVms = [12, 13, 14].map((id) => ctx.createBombAnmRunner(id));
+      this.marisaBBeamAngles = [0, 1, 2].map((i) =>
+        Math.fround((i * TAU_F32) / 3 - HALF_PI_F32));
+    }
     // ReimuB both casts open with the building 2->6 shake (spec-bombs-reimu §5/6).
     if (this.character === 'reimuB') ctx.startScreenShake(60, 2, 6);
   }
@@ -159,7 +180,16 @@ export class BombRunner {
     if (f >= 12 && f <= 54 && f % 6 === 0 && this.actors.length < 8) {
       const i = this.actors.length;
       const mirror = this.castX >= 192 ? -i : i;
-      const angle = mirror * (TAU / 8) - Math.PI / 2;
+      // FUN_00407840 @ all.c:3639-3641 stores the launch heading as float32:
+      //   local_8 = ((float)iVar5 * 2π_f32) / 8_f32 − π/2_f32   (stored float)
+      //   local_18[4] = (float) FUN_0042fff0(local_8)           (wrap + store)
+      // The previous double-precision form (TAU / Math.PI) left orb.angle off
+      // by sub-ULP, drifting each orb over its ~62 state-1 ticks enough to
+      // flip the r=128 clear boundary 2-3 frames late at Phantasm's second
+      // bomb (collect f51879). Math.fround over the float32 constants matches
+      // the single x87→float32 store; wrapNativeAngleF32 is FUN_0042fff0.
+      const angle = wrapNativeAngleF32(
+        Math.fround(mirror * TAU_F32 / 8 - HALF_PI_F32));
       this.actors.push({
         x: ctx.player.x, y: ctx.player.y, vx: 0, vy: 0,
         angle, speed: 15, accel: 0, turnRate: 0, state: 1, age: 0
@@ -171,9 +201,15 @@ export class BombRunner {
     }
     this.actors.forEach((orb, i) => {
       if (orb.state === 1) {
-        orb.speed -= 0.4 * ctx.rate;
-        orb.vx = Math.cos(orb.angle) * orb.speed;
-        orb.vy = Math.sin(orb.angle) * orb.speed;
+        // Orb motion is float32 in the exe (FUN_00407840 @ all.c:3656-3706):
+        //   speed = (float)(speed - 0.4*rate)
+        //   vx/vy = (float)(cos/sin(angle)*speed)   via FUN_004074e0 (recomputed each frame)
+        //   x     = (float)(rate*vx + x)
+        // Match the float32 storage so sub-pixel orb positions don't drift — the r=128
+        // clear-circle / graze-box boundary otherwise flips a bullet clear-vs-graze.
+        orb.speed = Math.fround(orb.speed - 0.4 * ctx.rate);
+        orb.vx = Math.fround(Math.cos(orb.angle) * orb.speed);
+        orb.vy = Math.fround(Math.sin(orb.angle) * orb.speed);
         if (orb.speed < -10) {
           orb.state = 2;
           orb.vx = orb.vy = 0;
@@ -182,15 +218,26 @@ export class BombRunner {
           // Th07.exe FUN_00407840 orb detonation: FUN_0041b320(6, orb, 8, ...) — the
           // swing-back burst is 8 particles (32 draws), not 12.
           ctx.spawnParticles(6, orb.x, orb.y, 8, 0xffffffff);
+          // FUN_0043e7e0(pos, 64, 4.2666669f, 30, 6) allocates an
+          // expanding clear circle that survives 31 bullet-manager passes.
+          // It is collision-relevant: Phantasm slot 754 is consumed by orb
+          // 7's radius ~149 circle before its otherwise-valid graze at
+          // update 10541.
+          ctx.addBulletClearRegion(orb.x, orb.y, 64, Math.fround(64 / 15), 30);
         }
         this.engine.set(i, orb.x, orb.y, 48, 48, 8);
+        // FUN_0043e7e0 writes a circle into player+0x17dc after the attack
+        // slot write on every state-1 tick. With life=0, FUN_0043d8f0
+        // retires it at the head of the next player tick: it is a one-frame
+        // r128 bullet-clear zone, including the state-1 -> state-2 tick.
+        ctx.addBulletClearRegion(orb.x, orb.y, 128, 0, 0);
       } else if (orb.state === 2) {
         this.engine.set(i, orb.x, orb.y, 256, 256, 2);
         if (++orb.age > 29) orb.state = 0; // slot stays frozen (exe quirk)
       }
       if (orb.state !== 0) {
-        orb.x += orb.vx * ctx.rate;
-        orb.y += orb.vy * ctx.rate;
+        orb.x = Math.fround(ctx.rate * orb.vx + orb.x);
+        orb.y = Math.fround(ctx.rate * orb.vy + orb.y);
       }
     });
   }
@@ -203,11 +250,17 @@ export class BombRunner {
   // r256/d400 hitbox while the orb sprite coasts on.
   private reimuAFocused(ctx: BombContext): void {
     const f = ctx.frame;
-    if (f >= 80 && f <= 176 && (f - 60) % 16 === 0 && this.actors.length < 7) {
-      const launch = ctx.rng.range(TAU) - Math.PI;
+    if (f >= 80 && f <= 176 && f % 16 === 0 && this.actors.length < 7) {
+      // Th07.exe (v1.00b) FUN_004082e0 @ 0x4084d7 passes the random angle
+      // and turnParam=8.0 to FUN_004074e0, which stores the full
+      // cos/sin(angle)*8 velocity pair as float32. The old unit vector made
+      // every homing orb follow a different path. Native wave indices are
+      // 1..7 because the frame-64 index 0 branch is explicitly skipped.
+      const launch = Math.fround(ctx.rng.range(TAU) - Math.PI);
       this.actors.push({
-        x: ctx.player.x, y: ctx.player.y,
-        vx: Math.cos(launch), vy: Math.sin(launch),
+        x: Math.fround(ctx.player.x), y: Math.fround(ctx.player.y),
+        vx: Math.fround(Math.cos(launch) * 8),
+        vy: Math.fround(Math.sin(launch) * 8),
         angle: launch, speed: 8 /* turnParam seed */, accel: 0, turnRate: 0, state: 1, age: 0
       });
       ctx.fx.spawn({
@@ -219,32 +272,38 @@ export class BombRunner {
       ctx.playSfx(13);
     }
     this.actors.forEach((orb, i) => {
+      const slotId = i + 1;
       if (orb.state === 1) {
         const dx = ctx.player.x - orb.x;
         const dy = ctx.player.y - orb.y;
-        const dist = Math.hypot(dx, dy);
-        let div = dist / (orb.speed / 8);
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        let div = Math.fround(dist / (orb.speed / 8));
         if (div < 1) div = 1;
         const rawVx = dx / div + orb.vx;
         const rawVy = dy / div + orb.vy;
-        const rawSpeed = Math.hypot(rawVx, rawVy) || 1;
-        orb.speed = Math.max(1, Math.min(10, rawSpeed));
-        orb.vx = (rawVx * orb.speed) / rawSpeed;
-        orb.vy = (rawVy * orb.speed) / rawSpeed;
-        const slot = this.engine.set(i, orb.x, orb.y, 48, 48, 8);
+        const rawSpeed = Math.fround(Math.sqrt(rawVx * rawVx + rawVy * rawVy)) || 1;
+        orb.speed = Math.fround(Math.max(1, Math.min(10, rawSpeed)));
+        orb.vx = Math.fround((rawVx * orb.speed) / rawSpeed);
+        orb.vy = Math.fround((rawVy * orb.speed) / rawSpeed);
+        const slot = this.engine.set(slotId, orb.x, orb.y, 48, 48, 8);
+        // Th07.exe (v1.00b) FUN_004082e0 @ 0x40875b: this clear-zone
+        // allocation precedes the hit-tally/final-30-frame detonation test,
+        // so the transition tick still clears at r128. State 2 does not.
+        ctx.addBulletClearRegion(orb.x, orb.y, 128, 0, 0);
         if (slot.hitTally > 99 || ctx.frame >= ctx.duration - 30) {
           orb.state = 2;
           // Persistent detonation landmine (exe §4.4) — set once, then the
           // slot is never revisited; the orb keeps coasting visually.
-          this.engine.set(i, orb.x, orb.y, 256, 256, 400);
+          this.engine.set(slotId, orb.x, orb.y, 256, 256, 400);
+          ctx.addBulletClearRegion(orb.x, orb.y, 32, Math.fround(10 / 3), 15);
           ctx.playSfx(15);
           ctx.startScreenShake(16, 8, 0);
           ctx.spawnParticles(6, orb.x, orb.y, 12, 0xffffffff);
         }
       }
       if (orb.state !== 0) {
-        orb.x += orb.vx * ctx.rate;
-        orb.y += orb.vy * ctx.rate;
+        orb.x = Math.fround(orb.vx * ctx.rate + orb.x);
+        orb.y = Math.fround(orb.vy * ctx.rate + orb.y);
         if (orb.state === 2 && ++orb.age > 29) orb.state = 0;
       }
     });
@@ -327,21 +386,38 @@ export class BombRunner {
 
   // 恋符「マスタースパーク」 — FUN_0040a910 (spec-bombs-marisa §5): three
   // beams from the live player position at -90°/+30°/+150°, sweeping with
-  // an accelerating per-frame delta sign·(frame·π)/9000; 6 slots per beam
-  // spaced along its length, r128/d10, no frame gating.
+  // an accelerating per-frame delta sign·(elapsed·π)/9000. Six slots per
+  // beam begin at d32 and then use the authored beam VM's live
+  // spriteHeight*scaleY/5 spacing; r128/d10, no continuing-frame gate.
   private marisaBUnfocused(ctx: BombContext): void {
-    if (ctx.frame === 20) ctx.startScreenShake(60, 7, 0);
-    const base = [-Math.PI / 2, Math.PI / 6, (5 * Math.PI) / 6];
-    const sweep = (this.sweepSign * (ctx.frame * ctx.frame * Math.PI)) / 18000;
+    // Frame 0 is the setup branch in FUN_0040a910: it loads scripts 12..14
+    // but publishes no attack/clear slots and does not tick those VMs.
+    if (ctx.frame === 0) return;
+    // Th07.exe v1.00b direct fastcall trace at FUN_004459c0:
+    //   local20 ECX kind=1, EDX duration=60, stack from=1,to=7
+    //   local80 ECX kind=1, EDX duration=100, stack from=24,to=0
+    if (ctx.frame === 20) ctx.startScreenShake(60, 1, 7);
+    if (ctx.frame === 80) ctx.startScreenShake(100, 24, 0);
     for (let b = 0; b < 3; b++) {
-      const angle = base[b] + sweep;
+      const delta = Math.fround(
+        ((Math.fround(ctx.elapsed) * PI_F32) / 30 / ctx.duration) * this.sweepSign
+      );
+      const angle = wrapNativeAngleF32(this.marisaBBeamAngles[b] + delta);
+      this.marisaBBeamAngles[b] = angle;
+      const vm = this.marisaBBeamVms[b];
+      const spriteHeight = vm.spriteSize()?.h ?? 0;
+      const spacing = Math.fround((spriteHeight * vm.currentScale().y) / 5);
+      let distance = 32;
       for (let k = 0; k < 6; k++) {
-        const d = 48 + k * 76;
-        this.engine.set(b * 6 + k,
-          ctx.player.x + Math.cos(angle) * d,
-          ctx.player.y + Math.sin(angle) * d,
-          128, 128, 10);
+        const x = Math.fround(Math.cos(angle) * distance + ctx.player.x);
+        const y = Math.fround(Math.sin(angle) * distance + ctx.player.y);
+        this.engine.set(b * 6 + k, x, y, 128, 128, 10);
+        // FUN_0043e7e0(point, 64, 0, 0, 6): the visual sparkle allocation
+        // is also the native one-frame circular bullet-clear region.
+        ctx.addBulletClearRegion(x, y, 64, 0, 0);
+        distance = Math.fround(distance + spacing);
       }
+      vm.update(ctx.rate);
     }
   }
 

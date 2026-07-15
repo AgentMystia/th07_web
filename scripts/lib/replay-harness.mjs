@@ -7,27 +7,19 @@
 // re-seeded with the recorded per-stage seed (mirroring Th07.exe
 // FUN_00440480 @ all.c:29748), and the recorded input words are fed one per
 // update tick through the same InputFrame seam live keyboards use.
-import { execSync } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
-import { threadId } from 'node:worker_threads';
-
-// Every native-comparison agent runs its own Node process. A shared esbuild
-// outfile let one process import another process's half-written bundle,
-// producing intermittent `Unexpected end of input` failures under parallel
-// replay work. Keep one stable bundle per process/worker instead; loadEngine's
-// in-process promise still guarantees it is built only once for that caller.
-const outDir = `tests/.build/replay-harness/${process.pid}-${threadId}`;
+import { pathToFileURL } from 'node:url';
+import { cachedEsbuild } from './test-build-cache.mjs';
 
 let modsPromise = null;
 
 // Bundles src/testkit/replay-entry.ts once per process and imports it.
 export function loadEngine() {
   modsPromise ??= (async () => {
-    mkdirSync(outDir, { recursive: true });
-    execSync(
-      `npx esbuild src/testkit/replay-entry.ts --bundle --format=esm --outdir=${outDir} --out-extension:.js=.mjs --log-level=silent`
-    );
-    return import(`../../${outDir}/replay-entry.mjs`);
+    const bundle = await cachedEsbuild({
+      name: 'replay-harness',
+      entryPoints: ['src/testkit/replay-entry.ts']
+    });
+    return import(pathToFileURL(bundle).href);
   })();
   return modsPromise;
 }
@@ -251,14 +243,18 @@ export async function runStage(rpy, stageIndex, opts = {}) {
   const killModeTally = { 0: 0, 1: 0, 2: 0, 3: 0 };
   {
     const origKill = scene.runtime.killEnemy.bind(scene.runtime);
-    scene.runtime.killEnemy = (g, e) => {
+    scene.runtime.killEnemy = (g, e, ...args) => {
       // interactable===false is the exe's death gate (all.c:14303); such a
       // call is a no-op that never reaches the switch, so it fires no aux bit.
       if (e.ecl.interactable) {
         killFrames.add(f);
         killModeTally[e.ecl.deathMode & 7] = (killModeTally[e.ecl.deathMode & 7] ?? 0) + 1;
       }
-      return origKill(g, e);
+      // Observation wrappers must be behavior-transparent. In particular,
+      // FUN_0041ed50 forwards its per-frame bomb-contact flag to the death
+      // drop constructor; dropping later arguments here silently changed
+      // replay behavior while the uninstrumented engine remained correct.
+      return origKill(g, e, ...args);
     };
     const origRelease = scene.runtime.releaseEnemy.bind(scene.runtime);
     scene.runtime.releaseEnemy = (g, e) => {

@@ -64,7 +64,15 @@ export interface EnemyBullet {
   // Each behavior owns the split clock/counter used by its native routine.
   exRampElapsed: number;
   exRampFrac: number;
-  exAccel: { mag: number; angle: number; limit: number } | null; // 0x10
+  exAccel: {
+    mag: number;
+    angle: number;
+    // FUN_004229f0 resolves the polar parameters once at promotion and
+    // stores a float32 acceleration vector at bullet+0xccc/+0xcd0.
+    vx: number;
+    vy: number;
+    limit: number;
+  } | null; // 0x10
   exAccelElapsed: number;
   exAccelFrac: number;
   exAngle: { speedDelta: number; angleDelta: number; limit: number } | null; // 0x20
@@ -80,6 +88,11 @@ export interface EnemyBullet {
   exBounce: { speed: number; maxTimes: number } | null; // 0x400/0x800
   dirTimes: number;
   exBounceTimes: number;
+  // Native enemy-bullet state 5 (FUN_004241c0): bomb-clear contact does
+  // not free the fixed slot immediately. The bullet becomes non-collidable,
+  // moves at half velocity while its authored removal ANM runs, then releases
+  // the slot. Stored as remaining logical ANM ticks; absent in normal states.
+  clearFadeFrames?: number;
   dead?: boolean;
 }
 
@@ -189,6 +202,8 @@ export interface EffectParticle {
 export interface GameHost {
   rng: Rng;
   difficulty: number; // 0 E, 1 N, 2 H, 3 L
+  // Runtime stage number (1..8); optional for focused VM hosts.
+  stageNumber?: number;
   rank: number;
   // ECL var 10028 (Th07.exe DAT_00625627): character*2 + shotType (0=ReimuA
   // … 5=SakuyaB).
@@ -210,6 +225,10 @@ export interface GameHost {
   power: number;
   score: number;
   timeStopped?: boolean;
+  // Native DAT_004ca4d8, sampled for the current scheduler pass. Stage 7/8
+  // boss cores use it to suppress every player-shot/attack/body collision
+  // during spell ids >= 118, with a one-core-tick release tail.
+  isBombActive?(): boolean;
   // Global slow-motion rate (exe DAT_0056baa8, spec-slowmo.md): 1.0 normal;
   // bullet-effect 10 writes 1/param, effect 11 restores 1.0. Continuous
   // motion multiplies by it per frame; discrete timers accumulate it
@@ -451,14 +470,27 @@ export interface EclState {
   // no homing eligibility). Distinct from collisionEnabled (bit1, op 102),
   // which gates only the enemy-body-vs-player check.
   shotCollision: boolean;
+  // Op 161 (enemy+0x2e2b bit3): opt this enemy into the native manager
+  // short-circuit while a bomb or Supernatural Border is active. The skip
+  // covers ECL, movement, ANM, collisions, damage, callbacks and aim-cache
+  // publication; only the boss-timer retreat clock still runs.
+  pauseDuringBombOrBorder: boolean;
+  // FUN_0040f6c0's Extra/Phantasm high-spell bomb guard
+  // (enemy+0x2e2b bit2 and i16 +0x2e2c). While set, FUN_0041ed50 skips the
+  // entire body/player-shot/attack collision and homing-target publication
+  // block for this boss.
+  bombCollisionSuppressed: boolean;
+  bombCollisionSuppressionHold: number;
   deathMode: number;
   deathCallbackSub: number;
   lifeThresholds: { threshold: number; sub: number }[];
   timerCallbackThreshold: number;
   timerCallbackSub: number;
   bossTimer: number;
-  // Enemy+0x2bc4: the manager-pass snapshot taken immediately before the
-  // split timer advances. Body-graze cadence compares it with bossTimer.
+  // Enemy+0x2bc4: the split timer's previous/sentinel word. Normal forward
+  // ticks snapshot bossTimer before advancing; op161's normal-rate retreat
+  // fast path deliberately leaves it unchanged. Body-graze cadence compares
+  // it with bossTimer.
   bossTimerPrevious?: number;
   // Fractional accumulator for bossTimer under global slow motion.
   bossTimerFrac?: number;

@@ -79,3 +79,69 @@ test('invulnerability/Border collision clock retreats at the native slowmo caden
   scene.collidePlayerShots(enemy);
   assert.equal(scans, 2, 'state exit resets fractional residue before normal cadence resumes');
 });
+
+test('natural Border expiry resets the shared state-3 collision split timer', () => {
+  const scene = makeScene();
+  const enemy = collisionTarget();
+  let scans = 0;
+  scene.collidePlayerShotsInBox = () => { scans++; };
+  scene.slowRate = 1 / 2;
+
+  // The expiry frame first advances the still-active state-4 clock. Its
+  // fraction is now 0.5, then FUN_0043e620 replaces the timer with a fresh
+  // state-3 current=40/frac=0/previous=-999 tuple.
+  scene.tickPlayerShotCollisionClock(true);
+  scene.cherry.borderTimer = 1;
+  scene.cherry.borderTimerFrac = 0;
+  scene.cherry.tick(scene.slowRate);
+
+  scene.tickPlayerShotCollisionClock(true);
+  scene.collidePlayerShots(enemy);
+  assert.equal(scans, 1,
+    'the first state-3 half-rate tick retreats immediately after Border expiry');
+});
+
+test('the enemy manager skips every collision and aim-cache phase while high-spell bomb suppression is set', () => {
+  const scene = makeScene();
+  const ecl = scene.runtime.makeEnemyState(0, false, -1, null);
+  ecl.bombCollisionSuppressed = true;
+  const enemy = {
+    id: 999,
+    poolSlot: 0,
+    x: 192,
+    y: 128,
+    z: 0,
+    hp: 100,
+    maxHp: 100,
+    pendingShotDmg: 0,
+    pendingBombDmg: 0,
+    score: 0,
+    frame: 0,
+    dead: false,
+    ecl
+  };
+  scene.enemies.length = 0;
+  scene.enemies.push(enemy);
+  scene.enemySlots.fill(null);
+  scene.enemySlots[0] = enemy;
+  scene.tickRankSurvival = () => {};
+  scene.runtime.update = () => {};
+  scene.runtime.tickEnemyCore = () => {};
+  scene.runtime.integrateEnemyPosition = () => {};
+  scene.tickSpellBonusDecay = () => {};
+  scene.updateEnemyTrailHistory = () => {};
+  scene.updateEnemyCull = () => {};
+  scene.runtime.processEnemyCallbacks = () => false;
+  scene.runtime.updateEnemyAnm = () => {};
+  scene.runtime.tickEnemyManagerTail = () => {};
+  const calls = [];
+  scene.collideEnemyBody = () => calls.push('body');
+  scene.collidePlayerShots = () => calls.push('shots');
+  scene.settlePendingDamage = () => calls.push('damage');
+  scene.accumulatePlayerAimCaches = () => calls.push('aim');
+
+  scene.updateEnemies();
+
+  assert.deepEqual(calls, [],
+    'enemy+0x2e2b bit2 bypasses body, FUN_0043a980, settlement and homing publication');
+});

@@ -24,6 +24,8 @@ export class AudioBus {
   private sfxGain: GainNode | null = null;
   active: string | null = null;
   private pendingBgm: { name: string; fadeMs: number } | null = null;
+  private unlockListenersAttached = false;
+  private readonly unlockHandler = (): void => this.unlock();
   unlocked = false;
   muted = false;
 
@@ -35,11 +37,32 @@ export class AudioBus {
   }
 
   constructor() {
-    const unlock = () => {
-      this.unlock();
-    };
-    addEventListener('keydown', unlock, { once: false });
-    addEventListener('pointerdown', unlock, { once: false });
+    this.attachUnlockListeners();
+  }
+
+  private attachUnlockListeners(): void {
+    if (this.unlockListenersAttached) return;
+    this.unlockListenersAttached = true;
+    addEventListener('keydown', this.unlockHandler);
+    addEventListener('pointerdown', this.unlockHandler);
+  }
+
+  private detachUnlockListeners(): void {
+    if (!this.unlockListenersAttached) return;
+    this.unlockListenersAttached = false;
+    removeEventListener('keydown', this.unlockHandler);
+    removeEventListener('pointerdown', this.unlockHandler);
+  }
+
+  private completeUnlock(): void {
+    if (this.unlocked) return;
+    this.unlocked = true;
+    this.detachUnlockListeners();
+    if (this.pendingBgm) {
+      const { name, fadeMs } = this.pendingBgm;
+      this.pendingBgm = null;
+      this.playBgm(name, { fadeMs });
+    }
   }
 
   private ensureCtx(): AudioContext | null {
@@ -59,15 +82,18 @@ export class AudioBus {
   unlock(): void {
     const ctx = this.ensureCtx();
     if (!ctx) return;
-    if (ctx.state === 'suspended') void ctx.resume();
-    if (!this.unlocked) {
-      this.unlocked = true;
-      if (this.pendingBgm) {
-        const { name, fadeMs } = this.pendingBgm;
-        this.pendingBgm = null;
-        this.playBgm(name, { fadeMs });
-      }
+    if (ctx.state === 'running') {
+      this.completeUnlock();
+      return;
     }
+    void ctx.resume()
+      .then(() => {
+        if (ctx.state === 'running') this.completeUnlock();
+      })
+      .catch(() => {
+        // A rejected resume keeps the gesture listeners attached so a later
+        // trusted input can retry.
+      });
   }
 
   private trackInfo(name: string): BgmTrackInfo | null {

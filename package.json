@@ -13,6 +13,11 @@
     "replay:verify": "node scripts/replay-verify.mjs",
     "replay:inspect": "node scripts/replay-inspect.mjs",
     "replay:browser": "node scripts/dev-replay.mjs",
+    "verify:edit": "node scripts/verify.mjs edit",
+    "verify:fast": "node scripts/verify.mjs fast",
+    "verify:full": "node scripts/verify.mjs full",
+    "perf:smoke": "node scripts/perf-smoke.mjs",
+    "latency:trace": "node scripts/latency-probe.mjs",
     "prepare-pages": "node scripts/prepare-pages.mjs",
     "deploy": "node scripts/deploy-pages.mjs"
   },

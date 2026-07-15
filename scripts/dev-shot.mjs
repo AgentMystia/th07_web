@@ -3,35 +3,15 @@
 // A heldKeys entry prefixed with + (e.g. "shoot,+bomb") is injected as a
 // pressed edge on the first batch only — for actions that need a press edge
 // (bombing) rather than a hold.
-import { chromium } from '@playwright/test';
-import { createServer } from 'node:http';
-import { readFile } from 'node:fs/promises';
-import { extname, join } from 'node:path';
+import { attachPageDiagnostics, launchChromium, startStaticServer, uniqueErrors } from './lib/browser-harness.mjs';
 
-const root = new URL('..', import.meta.url).pathname;
 const [out = '/tmp/shot.png', framesArg = '300', query = '', held = ''] = process.argv.slice(2);
 const frames = Number(framesArg);
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.jpg': 'image/jpeg', '.ogg': 'audio/ogg', '.wav': 'audio/wav', '.map': 'application/json' };
-const server = createServer(async (req, res) => {
-  try {
-    let p = decodeURIComponent(new URL(req.url, 'http://x').pathname);
-    if (p === '/') p = '/index.html';
-    const data = await readFile(join(root, p));
-    res.writeHead(200, { 'content-type': MIME[extname(p)] ?? 'application/octet-stream' });
-    res.end(data);
-  } catch {
-    res.writeHead(404);
-    res.end();
-  }
-});
-await new Promise((r) => server.listen(0, r));
-const port = server.address().port;
-const browser = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome' });
+const server = await startStaticServer();
+const browser = await launchChromium();
 const page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
-const errors = [];
-page.on('pageerror', (e) => errors.push(String(e).slice(0, 200)));
-page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text().slice(0, 200)); });
-await page.goto(`http://127.0.0.1:${port}/index.html?test=1${query ? '&' + query : ''}`);
+const errors = attachPageDiagnostics(page);
+await page.goto(`${server.baseUrl}/index.html?test=1&paused=1${query ? '&' + query : ''}`);
 await page.waitForFunction(() => window.__TH07_TEST__?.ready, null, { timeout: 20000 });
 const keyArgs = held ? held.split(',') : [];
 const heldKeys = keyArgs.filter((k) => !k.startsWith('+'));
@@ -57,6 +37,8 @@ console.log(JSON.stringify({
   player: snap.player,
   bgm
 }));
-if (errors.length) console.log('PAGE ERRORS:', JSON.stringify(errors.slice(0, 5)));
+const pageErrors = uniqueErrors(errors);
+if (pageErrors.length) console.log('PAGE ERRORS:', JSON.stringify(pageErrors.slice(0, 5)));
 await browser.close();
-server.close();
+await server.close();
+if (pageErrors.length) process.exitCode = 4;

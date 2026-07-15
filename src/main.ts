@@ -1,6 +1,7 @@
 import { Loop } from './core/loop';
 import { Input } from './core/input';
-import { Renderer } from './gfx/renderer';
+import { LatencyRecorder, type LatencyLogicState, type LatencySample } from './core/latency';
+import { PLAYFIELD, Renderer } from './gfx/renderer';
 import { AudioBus } from './audio/audio';
 import { loadAssets } from './game/assets';
 import { StageScene } from './game/stage-scene';
@@ -44,6 +45,14 @@ interface TestHook {
   clearInput(): void;
   setBombs(n: number): void;
   bgm(): { active: string | null; decoded: string[] };
+  canvasContextAttributes(): {
+    requestedDesynchronized: boolean;
+    actual: CanvasRenderingContext2DSettings | null;
+  };
+  latencySamples(): LatencySample[];
+  clearLatencySamples(): void;
+  playerShotSerial(): number;
+  resetBombForLatencyProbe(): void;
 }
 
 declare global {
@@ -57,13 +66,22 @@ declare global {
 async function boot(): Promise<void> {
   const canvas = document.getElementById('game') as HTMLCanvasElement | null;
   if (!canvas) throw new Error('missing #game canvas');
-  const renderer = new Renderer(canvas);
+  const params = new URLSearchParams(location.search);
+  const isTest = params.get('test') === '1';
+  const latencyEnabled = isTest && params.get('latency') === '1';
+  const perfEnabled = isTest && params.get('perf') === '1' && !latencyEnabled;
+  // desync=0 is a test-only A/B seam. Retail always requests Chrome's
+  // low-latency desynchronized Canvas path and records whether it was accepted.
+  const renderer = new Renderer(canvas, {
+    desynchronized: !(isTest && params.get('desync') === '0')
+  });
   renderer.clear('#000');
   renderer.text('Now Loading...', 270, 230, { size: 16 });
 
   const assets = await loadAssets();
   renderer.assets = assets.images;
-  const input = new Input();
+  const latencyRecorder = latencyEnabled ? new LatencyRecorder() : null;
+  const input = new Input(latencyRecorder ? (timing) => latencyRecorder.recordInput(timing) : undefined);
   const audio = new AudioBus();
   // Eager-preload every BGM track stage 1 can need (title + stage + boss) as
   // soon as the AudioBus exists, so decodeAudioData has already finished by
@@ -74,14 +92,11 @@ async function boot(): Promise<void> {
   // throttled Slow-4G/Fast-3G — with the title theme still audibly looping
   // for the entire gap (measured during the 2026-07-10 BGM preload audit).
   audio.preloadBgm(['th07_01', 'th07_02', 'th07_03']);
-  const params = new URLSearchParams(location.search);
-
   // ?test=1 alone must still boot directly into the stage exactly as before
   // the menu flow existed (scripts/dev-shot.mjs and other automated tooling
   // depend on this). Add ?menu=1 alongside ?test=1 to make the menu flow
   // itself screenshot-testable; without ?test=1 (i.e. a real player), the
   // menu flow is always used.
-  const isTest = params.get('test') === '1';
   const useMenu = !isTest || params.get('menu') === '1';
   // Test-only direct arcade entry: keep the normal menu bypass while using
   // the real stage-clear/continue/next-stage flow. This lets the transition
@@ -101,6 +116,13 @@ async function boot(): Promise<void> {
   } | null = null;
   // Hi-score carried across stage runs within this browser session.
   let sessionHiScore = 100000;
+  const latencyState = (s: StageScene): LatencyLogicState => ({
+    x: s.playerObj.x,
+    y: s.playerObj.y,
+    focused: s.playerObj.focusHeld,
+    playerShotSerial: s.playerShotSerial,
+    bombTimer: s.playerObj.bombTimer
+  });
 
   // Shared by both the menu's "confirm" callback and the direct (?test=1,
   // no ?menu=1) boot path below, so BGM/preload behavior is identical either
@@ -115,6 +137,7 @@ async function boot(): Promise<void> {
   ): StageScene {
     activeReplay = null;
     const s = new StageScene(assets, audio, difficulty, character, stageNumber, carry);
+    s.setLatencyObservationEnabled(latencyEnabled);
     // Headless probes (?test=1 without ?menu=1) keep the scene alive forever;
     // real play gets the arcade flow: continue screen + return to title.
     // Practice (exe DAT_00625628 bit0): one stage, no continues, straight
@@ -227,6 +250,7 @@ async function boot(): Promise<void> {
       null,
       entry.stage.rngSeed
     );
+    s.setLatencyObservationEnabled(latencyEnabled);
     s.mode = 'replay';
     applyReplayStageSnapshot(s, replay, stageIndex);
     s.onExitToTitle = () => showReplayMenu(replay, fileName, stageIndex);
@@ -346,6 +370,9 @@ async function boot(): Promise<void> {
     update: () => {
       if (simHalted) return;
       const liveFrame = input.frame();
+      latencyRecorder?.markSampled(performance.now());
+      const observedStage = stage;
+      const beforeLatency = latencyRecorder && observedStage ? latencyState(observedStage) : null;
       try {
         if (menu) {
           menu.update(liveFrame);
@@ -396,6 +423,14 @@ async function boot(): Promise<void> {
         } else if (stage) {
           stage.update(liveFrame);
         }
+        if (latencyRecorder && observedStage && stage === observedStage && beforeLatency) {
+          latencyRecorder.observeLogic(
+            beforeLatency,
+            latencyState(observedStage),
+            observedStage.frame,
+            performance.now()
+          );
+        }
       } catch (err) {
         simHalted = true;
         reportFatal('simulation', err);
@@ -405,7 +440,24 @@ async function boot(): Promise<void> {
       if (!drawHalted) {
         try {
           if (menu) menu.draw(renderer);
-          else if (stage) stage.draw(renderer);
+          else if (stage) stage.draw(renderer, perfEnabled);
+          if (latencyRecorder && stage) {
+            const samples = latencyRecorder.pendingDrawSamples();
+            if (samples.length > 0) {
+              const sequence = samples[samples.length - 1].sequence;
+              const ctx = renderer.ctx;
+              ctx.save();
+              ctx.fillStyle = sequence & 1 ? '#fff' : '#000';
+              ctx.fillRect(
+                PLAYFIELD.x + 1,
+                Math.max(PLAYFIELD.y, Math.min(PLAYFIELD.y + PLAYFIELD.height - 3, PLAYFIELD.y + stage.playerObj.y - 1)),
+                3,
+                3
+              );
+              ctx.restore();
+              latencyRecorder.markDrawEnd(samples, performance.now());
+            }
+          }
         } catch (err) {
           drawHalted = true;
           if (!simHalted) reportFatal('rendering', err);
@@ -414,7 +466,7 @@ async function boot(): Promise<void> {
       }
       if (simHalted || drawHalted) drawErrorBanner();
     }
-  });
+  }, perfEnabled);
 
   // ?paused=1 (test-only): do not start the rAF loop — the page renders
   // nothing until the probe's first advance(). Removes the boot-frame
@@ -501,7 +553,12 @@ async function boot(): Promise<void> {
           stage.playerObj.invulnFrac = 0;
         }
       },
-      bgm: () => ({ active: audio.active, decoded: audio.decodedTracks })
+      bgm: () => ({ active: audio.active, decoded: audio.decodedTracks }),
+      canvasContextAttributes: () => renderer.contextAttributes(),
+      latencySamples: () => latencyRecorder?.samples() ?? [],
+      clearLatencySamples: () => latencyRecorder?.clear(),
+      playerShotSerial: () => stage?.playerShotSerial ?? 0,
+      resetBombForLatencyProbe: () => stage?.resetBombForLatencyProbe()
     };
   }
   if (!startPaused) loop.start();
