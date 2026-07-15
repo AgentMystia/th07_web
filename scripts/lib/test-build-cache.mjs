@@ -11,6 +11,7 @@ import {
   writeFileSync
 } from 'node:fs';
 import { basename, join, relative, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import * as esbuild from 'esbuild';
 
 const root = resolve(new URL('../..', import.meta.url).pathname);
@@ -59,7 +60,22 @@ function prune(specDir, keep = 4) {
     .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
     .map((entry) => ({ name: entry.name, mtimeMs: statSync(join(specDir, entry.name)).mtimeMs }))
     .sort((a, b) => b.mtimeMs - a.mtimeMs);
-  for (const entry of entries.slice(keep)) rmSync(join(specDir, entry.name), { recursive: true, force: true });
+  for (const entry of entries.slice(keep)) {
+    const path = join(specDir, entry.name);
+    // A cache hit touches the directory before importing. Re-stat here so a
+    // prune scan that raced with that touch cannot delete the module another
+    // process is about to evaluate from a stale mtime snapshot.
+    try {
+      if (statSync(path).mtimeMs !== entry.mtimeMs) continue;
+    } catch {
+      continue;
+    }
+    rmSync(path, { recursive: true, force: true });
+  }
+}
+
+async function importBundle(path) {
+  return import(pathToFileURL(path).href);
 }
 
 export async function cachedEsbuild({ name, entryPoints, buildOptions = {} }) {
@@ -80,8 +96,9 @@ export async function cachedEsbuild({ name, entryPoints, buildOptions = {} }) {
     if (complete(target)) {
       const now = new Date();
       utimesSync(target, now, now);
+      const module = await importBundle(join(target, 'bundle.mjs'));
       prune(specDir);
-      return join(target, 'bundle.mjs');
+      return module;
     }
 
     const temp = join(specDir, `.${before}-${process.pid}-${Math.random().toString(16).slice(2)}`);
@@ -107,8 +124,9 @@ export async function cachedEsbuild({ name, entryPoints, buildOptions = {} }) {
         if (!complete(target)) throw error;
         rmSync(temp, { recursive: true, force: true });
       }
+      const module = await importBundle(join(target, 'bundle.mjs'));
       prune(specDir);
-      return join(target, 'bundle.mjs');
+      return module;
     } catch (error) {
       rmSync(temp, { recursive: true, force: true });
       throw error;

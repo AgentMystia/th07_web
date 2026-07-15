@@ -31,6 +31,8 @@ function colorParts(color: number): { r: number; g: number; b: number } {
 export class Renderer {
   readonly canvas: HTMLCanvasElement;
   readonly ctx: CanvasRenderingContext2D;
+  private readonly displayCtx: CanvasRenderingContext2D;
+  private readonly backbuffer: HTMLCanvasElement | null;
   assets: Record<string, HTMLImageElement | HTMLCanvasElement> = {};
   private tintCache = new Map<string, HTMLCanvasElement>();
   private tintCacheOrder: string[] = [];
@@ -51,20 +53,55 @@ export class Renderer {
     // redrawn each frame (clear + draw), so the page alpha channel is unused
     // and skipping it saves the per-pixel page blend.
     this.requestedDesynchronized = options.desynchronized ?? false;
-    const ctx = canvas.getContext('2d', {
+    const displayCtx = canvas.getContext('2d', {
       desynchronized: this.requestedDesynchronized,
       alpha: false
     });
-    if (!ctx) throw new Error('Canvas 2D context unavailable');
-    this.ctx = ctx;
-    ctx.imageSmoothingEnabled = false;
+    if (!displayCtx) throw new Error('Canvas 2D context unavailable');
+    this.displayCtx = displayCtx;
+    displayCtx.imageSmoothingEnabled = false;
+    const actualDesynchronized = displayCtx.getContextAttributes?.().desynchronized ?? false;
+    if (actualDesynchronized) {
+      // Chrome's low-latency path may expose the front buffer while drawing.
+      // Its own guidance says not to clear that visible context incrementally:
+      // finish the frame offscreen, then copy it in one operation to avoid
+      // flicker/blank scans. This path is opt-in only; normal rendering stays
+      // direct and pays no extra full-canvas copy.
+      const backbuffer = document.createElement('canvas');
+      backbuffer.width = SCREEN_W;
+      backbuffer.height = SCREEN_H;
+      const ctx = backbuffer.getContext('2d', { alpha: false });
+      if (!ctx) throw new Error('Canvas 2D backbuffer unavailable');
+      ctx.imageSmoothingEnabled = false;
+      this.backbuffer = backbuffer;
+      this.ctx = ctx;
+    } else {
+      this.backbuffer = null;
+      this.ctx = displayCtx;
+    }
   }
 
-  contextAttributes(): { requestedDesynchronized: boolean; actual: CanvasRenderingContext2DSettings | null } {
+  contextAttributes(): {
+    requestedDesynchronized: boolean;
+    backBuffered: boolean;
+    actual: CanvasRenderingContext2DSettings | null;
+  } {
     return {
       requestedDesynchronized: this.requestedDesynchronized,
-      actual: this.ctx.getContextAttributes?.() ?? null
+      backBuffered: this.backbuffer != null,
+      actual: this.displayCtx.getContextAttributes?.() ?? null
     };
+  }
+
+  present(): void {
+    if (!this.backbuffer) return;
+    const ctx = this.displayCtx;
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'copy';
+    ctx.drawImage(this.backbuffer, 0, 0);
+    ctx.restore();
   }
 
   clear(color = '#000'): void {
@@ -356,7 +393,7 @@ export class Renderer {
     ctx.clearRect(0, 0, surface.width, surface.height);
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(
-      this.canvas,
+      this.backbuffer ?? this.canvas,
       PLAYFIELD.x, PLAYFIELD.y, PLAYFIELD.width, PLAYFIELD.height,
       128, 0, PLAYFIELD.width, PLAYFIELD.height
     );

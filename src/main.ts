@@ -37,6 +37,10 @@ interface TestHook {
   spawnLog(): { t: number; time: number; sub: number }[];
   lifecycleLog(): { f: number; ev: string; id: number; sub: number; a?: number }[];
   frameCost(): { update: number[]; draw: number[] };
+  // Cost rings are intentionally disabled unless the page was opened with
+  // ?test=1&perf=1; plain ?test=1 returns empty arrays to avoid perturbing
+  // fidelity/latency probes with performance.now() calls.
+  performanceEnabled(): boolean;
   // Last frame's per-pass draw costs (ms), PERF-001 breakdown.
   drawPasses(): Record<string, number>;
   // Test-only: flood the item pool for PERF-001's dense-items scenario.
@@ -47,6 +51,7 @@ interface TestHook {
   bgm(): { active: string | null; decoded: string[] };
   canvasContextAttributes(): {
     requestedDesynchronized: boolean;
+    backBuffered: boolean;
     actual: CanvasRenderingContext2DSettings | null;
   };
   latencySamples(): LatencySample[];
@@ -79,6 +84,7 @@ async function boot(): Promise<void> {
   });
   renderer.clear('#000');
   renderer.text('Now Loading...', 270, 230, { size: 16 });
+  renderer.present();
 
   const assets = await loadAssets();
   renderer.assets = assets.images;
@@ -439,6 +445,7 @@ async function boot(): Promise<void> {
       }
     },
     draw: () => {
+      let drawnLatencySamples: LatencySample[] = [];
       if (!drawHalted) {
         try {
           if (menu) menu.draw(renderer);
@@ -457,8 +464,12 @@ async function boot(): Promise<void> {
                 3
               );
               ctx.restore();
-              latencyRecorder.markDrawEnd(samples, performance.now());
+              drawnLatencySamples = samples;
             }
+          }
+          renderer.present();
+          if (latencyRecorder && drawnLatencySamples.length > 0) {
+            latencyRecorder.markDrawEnd(drawnLatencySamples, performance.now());
           }
         } catch (err) {
           drawHalted = true;
@@ -466,7 +477,10 @@ async function boot(): Promise<void> {
           simHalted = true;
         }
       }
-      if (simHalted || drawHalted) drawErrorBanner();
+      if (simHalted || drawHalted) {
+        drawErrorBanner();
+        renderer.present();
+      }
     }
   }, perfEnabled);
 
@@ -517,6 +531,7 @@ async function boot(): Promise<void> {
       spawnLog: () => stage?.runtime.spawnLog ?? [],
       lifecycleLog: () => stage?.runtime.lifecycleLog ?? [],
       frameCost: () => loop.frameCosts(),
+      performanceEnabled: () => perfEnabled,
       drawPasses: () => stage?.drawPassCosts ?? {},
       fillItems: (n: number) => {
         if (!stage) return;

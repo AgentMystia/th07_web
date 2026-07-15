@@ -7,7 +7,6 @@
 // re-seeded with the recorded per-stage seed (mirroring Th07.exe
 // FUN_00440480 @ all.c:29748), and the recorded input words are fed one per
 // update tick through the same InputFrame seam live keyboards use.
-import { pathToFileURL } from 'node:url';
 import { cachedEsbuild } from './test-build-cache.mjs';
 
 let modsPromise = null;
@@ -15,11 +14,10 @@ let modsPromise = null;
 // Bundles src/testkit/replay-entry.ts once per process and imports it.
 export function loadEngine() {
   modsPromise ??= (async () => {
-    const bundle = await cachedEsbuild({
+    return cachedEsbuild({
       name: 'replay-harness',
       entryPoints: ['src/testkit/replay-entry.ts']
     });
-    return import(pathToFileURL(bundle).href);
   })();
   return modsPromise;
 }

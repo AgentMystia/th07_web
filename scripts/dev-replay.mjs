@@ -1,11 +1,14 @@
 // Browser-local replay acceptance driver.
-// Usage: node scripts/dev-replay.mjs <file.rpy> [stage=1] [frames=300] [shot.png] [mode=0]
+// Usage: node scripts/dev-replay.mjs <file.rpy> [stage=1] [frames=300] [shot.png] [mode=0] [query]
 import { resolve } from 'node:path';
 import { attachPageDiagnostics, launchChromium, startStaticServer, uniqueErrors } from './lib/browser-harness.mjs';
 
-const [fileArg, stageArg = '1', framesArg = '300', out = '/tmp/th07-replay.png', modeArg = '0'] = process.argv.slice(2);
+const [
+  fileArg, stageArg = '1', framesArg = '300', out = '/tmp/th07-replay.png',
+  modeArg = '0', queryArg = ''
+] = process.argv.slice(2);
 if (!fileArg) {
-  console.error('usage: node scripts/dev-replay.mjs <file.rpy> [stage] [frames] [shot.png] [mode]');
+  console.error('usage: node scripts/dev-replay.mjs <file.rpy> [stage] [frames] [shot.png] [mode] [query]');
   process.exit(2);
 }
 const wantedStage = Number(stageArg);
@@ -27,7 +30,8 @@ const press = async (key) => {
 };
 
 try {
-  await page.goto(`${server.baseUrl}/index.html?test=1&menu=1&paused=1`);
+  const extraQuery = queryArg ? `&${queryArg.replace(/^&/, '')}` : '';
+  await page.goto(`${server.baseUrl}/index.html?test=1&menu=1&paused=1${extraQuery}`);
   await page.waitForFunction(() => window.__TH07_TEST__?.ready, null, { timeout: 20000 });
   await page.locator('#replay-file').setInputFiles(resolve(fileArg));
   await page.waitForFunction(() => window.__TH07_TEST__.snapshot().scene === 'replay');
@@ -43,7 +47,8 @@ try {
   await advance(30 + frames);
   await page.screenshot({ path: out });
   snap = await page.evaluate(() => window.__TH07_TEST__.snapshot());
-  console.log(JSON.stringify(snap));
+  const canvas = await page.evaluate(() => window.__TH07_TEST__.canvasContextAttributes());
+  console.log(JSON.stringify({ ...snap, canvas }));
   const pageErrors = uniqueErrors(errors);
   if (pageErrors.length) {
     console.log('PAGE ERRORS:', JSON.stringify(pageErrors.slice(0, 5)));

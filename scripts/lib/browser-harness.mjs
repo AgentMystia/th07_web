@@ -80,7 +80,8 @@ export function attachPageDiagnostics(page) {
 
 export async function launchChromium(options = {}) {
   return chromium.launch({
-    executablePath: resolveChromiumExecutable(),
+    ...options,
+    executablePath: options.executablePath ?? resolveChromiumExecutable(),
     headless: options.headless ?? true,
     args: options.args ?? []
   });
@@ -89,4 +90,3 @@ export async function launchChromium(options = {}) {
 export function uniqueErrors(errors) {
   return [...new Set(errors)];
 }
-

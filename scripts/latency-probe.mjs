@@ -22,6 +22,7 @@ const scenario = args.scenario ?? 'light';
 const runs = Number(args.runs ?? 5);
 const samplesPerRun = Number(args.samples ?? 250);
 const headless = !!args.headless;
+const desynchronized = !!args.desync;
 const allowInvalidRefresh = !!args['allow-invalid-refresh'];
 const expectedChromeMajor = Number(args['chrome-major'] ?? 148);
 const validInputs = new Set(['direction', 'shoot', 'focus', 'bomb']);
@@ -120,7 +121,10 @@ const readTrace = async (stream) => {
 };
 
 try {
-  await page.goto(`${server.baseUrl}/index.html?test=1&latency=1&difficulty=${difficulty}&power=128`);
+  await page.goto(
+    `${server.baseUrl}/index.html?test=1&latency=1&difficulty=${difficulty}&power=128` +
+    (desynchronized ? '&desync=1' : '')
+  );
   await page.waitForFunction(() => window.__TH07_TEST__?.ready, null, { timeout: 30000 });
   const userAgent = await page.evaluate(() => navigator.userAgent);
   const major = Number(/(?:Chrome|HeadlessChrome)\/(\d+)/.exec(userAgent)?.[1] ?? 0);
@@ -201,6 +205,7 @@ try {
     chromeMajor: major,
     scenario,
     input: inputKind,
+    desynchronized,
     runs,
     samplesPerRun,
     refresh: {
