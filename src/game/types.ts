@@ -93,6 +93,7 @@ export interface EnemyBullet {
   // moves at half velocity while its authored removal ANM runs, then releases
   // the slot. Stored as remaining logical ANM ticks; absent in normal states.
   clearFadeFrames?: number;
+  clearRunner?: AnmRunner;
   dead?: boolean;
 }
 

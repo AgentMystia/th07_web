@@ -2,7 +2,10 @@ import { Ecl, type EclInstr, type TimelineEvent } from '../formats/ecl';
 import { Anm, AnmRunner } from '../formats/anm';
 import { Std } from '../formats/std';
 import { Msg } from '../formats/msg';
-import { normalizeAngle, clamp, TAU } from '../core/util';
+import {
+  normalizeAngle, normalizeNativeAngleF32, clamp, TAU,
+  NATIVE_PI_F32, NATIVE_TAU_F32, NATIVE_HALF_PI_F32
+} from '../core/util';
 import type { Rng } from '../core/rng';
 import type { GameHost, Enemy, EnemyBullet, EclState, EclContext, BulletProps, BulletExSlot, ItemType, EnemyLaser } from './types';
 
@@ -17,9 +20,6 @@ import type { GameHost, Enemy, EnemyBullet, EclState, EclContext, BulletProps, B
 // ceiling), which starved the densest Lunatic patterns ~384 bullets early.
 const ENEMY_BULLET_CAP = 1024;
 const ENEMY_LASER_CAP = 64;
-const NATIVE_PI_F32 = 3.1415927410125732;
-const NATIVE_TAU_F32 = 6.2831854820251465;
-const NATIVE_HALF_PI_F32 = 1.5707963705062866;
 const NATIVE_QUARTER_PI_F32 = 0.7853981852531433;
 const NATIVE_SIXTH_PI_F32 = 0.5235987901687622;
 const NATIVE_THIRD_PI_F32 = 1.0471975803375244;
@@ -30,20 +30,6 @@ const EFFECT8_EASY_RANDOM_SCALE_F32 = 0.30000001192092896; // Th07.exe @ 0x48ead
 const EFFECT8_EASY_BASE_F32 = 0.699999988079071; // Th07.exe @ 0x48eb7c
 const EFFECT8_HARD_RANDOM_SCALE_F32 = 0.4000000059604645; // Th07.exe @ 0x48ec74
 const EFFECT8_HARD_BASE_F32 = 0.800000011920929; // Th07.exe @ 0x48eb78
-
-// Th07.exe FUN_0042fff0 @ 0x42fff0 stores both operands through float32
-// parameters before adding/wrapping them. The distinction is observable in
-// effect-12/21 child trajectories after hundreds of frames.
-function normalizeNativeAngleF32(angle: number, delta = 0): number {
-  let value = Math.fround(Math.fround(angle) + Math.fround(delta));
-  for (let i = 0; i < 18 && value > NATIVE_PI_F32; i++) {
-    value = Math.fround(value - NATIVE_TAU_F32);
-  }
-  for (let i = 0; i < 18 && value < -NATIVE_PI_F32; i++) {
-    value = Math.fround(value + NATIVE_TAU_F32);
-  }
-  return value;
-}
 
 // Th07.exe FUN_0043f2b0 @ 0x43f2b0: both deltas are float fields and an
 // exactly coincident source/player pair returns the explicit π/2 constant
@@ -316,6 +302,10 @@ export class StageRuntime {
   // Enemy runners are created from ECL dispatch, so retain the host stream
   // for constructors reached indirectly by pose changes and auxiliary slots.
   private anmRng: Rng | undefined;
+  // DAT_0056babc bit 5. Effect 11 can latch this permanently when its own
+  // parameter is >1; shipped TH07 ECL uses only 0/1, but the executable's
+  // reachable counter semantics still include the branch.
+  private slowCounterExtraStep = false;
 
   constructor(stage: StageData, anms: { etama: Anm; enemy: Anm; effect: Anm }) {
     this.ecl = new Ecl(stage.ecl);
@@ -338,6 +328,7 @@ export class StageRuntime {
     this.bossRegistered = false;
     this.spellActive = false;
     this.currentSpellId = -1;
+    this.slowCounterExtraStep = false;
     this.lifecycleLog = [];
     this.globalsInt.fill(0);
     this.globalsFloat.fill(0);
@@ -1166,6 +1157,13 @@ export class StageRuntime {
   tickEnemyPausedManagerClock(game: GameHost, e: Enemy): void {
     const s = e.ecl;
     const rate = Math.fround(game.slowRate ?? 1);
+    // Th07.exe FUN_00436a06 @ 0x436a06 executes the latched bit-5 retreat
+    // before its ordinary rate branch and resets the split pair's sentinel.
+    if (this.slowCounterExtraStep) {
+      s.bossTimer--;
+      s.bossTimerFrac = 0;
+      s.bossTimerPrevious = -999;
+    }
     if (rate > 0.99) {
       s.bossTimer--;
       return;
@@ -1613,6 +1611,11 @@ export class StageRuntime {
             }
           }
         }
+        // Th07.exe @ 0x4181ff-0x41820b: latch DAT_0056babc bit 5 only when
+        // this exit instruction's OWN param makes 1/param < 1. Real stage
+        // data passes 0 or 1, so this is normally dormant rather than an
+        // unconditional slow-motion-exit side effect.
+        if (1 / param < 1) this.slowCounterExtraStep = true;
         game.setBulletTimeVisual?.(false);
         game.setSlowRate?.(1);
         return;
@@ -3245,6 +3248,18 @@ export class StageRuntime {
     { entryIndex: 0, script: 8 }, { entryIndex: 0, script: 9 },
     { entryIndex: 1, script: 0 }
   ];
+  // Fifth column of Th07.exe's int[11][5] bullet-template script table
+  // @ 0x48b160. These are the authored state-5 removal VMs copied into each
+  // fixed bullet slot by FUN_00421e90.
+  private static readonly BULLET_TEMPLATE_CLEAR: { entryIndex: number; script: number }[] = [
+    { entryIndex: 0, script: 15 },
+    { entryIndex: 0, script: 16 }, { entryIndex: 0, script: 16 },
+    { entryIndex: 0, script: 16 }, { entryIndex: 0, script: 16 },
+    { entryIndex: 0, script: 16 }, { entryIndex: 0, script: 16 },
+    { entryIndex: 0, script: 17 }, { entryIndex: 0, script: 17 },
+    { entryIndex: 0, script: 17 },
+    { entryIndex: 1, script: 1 }
+  ];
   private badBulletWarned = new Set<string>();
 
   bulletRect(sprite: number, offset: number): { x: number; y: number; w: number; h: number; imageKey: string } {
@@ -3270,6 +3285,15 @@ export class StageRuntime {
       this.bulletRectCache.set(key, rect);
       return rect;
     }
+  }
+
+  createBulletClearRunner(sprite: number): AnmRunner | null {
+    const tpl = StageRuntime.BULLET_TEMPLATE_CLEAR[sprite];
+    if (!tpl) return null;
+    return new AnmRunner(this.bulletAnm, tpl.script, {
+      entryIndex: tpl.entryIndex,
+      spriteIndexOffset: this.bulletAnm.entries[tpl.entryIndex]?.spriteBase ?? 0
+    });
   }
 
   private bulletRectInEntry(entryIndex: number, script: number, offset: number): { x: number; y: number; w: number; h: number; imageKey: string } {

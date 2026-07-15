@@ -49,9 +49,12 @@ const BOMB_PARAMS: Record<CharacterId, { unfocused: [number, number, number]; fo
 };
 
 // Th07.exe FUN_00407740 @ 0x407740. Each bomb form supplies one float32
-// percentage and a minimum-total Cherry loss; the helper difficulty-scales
-// the cast-time Cherry, divides both candidates by the form duration, floors
-// them to tens, and stores the larger per-frame drain at player+0x16a2c.
+// percentage and an EDX minimum-total Cherry loss; the helper difficulty-
+// scales the cast-time Cherry, divides both candidates by the form duration,
+// floors them to tens, and stores the larger per-frame drain at +0x16a2c.
+// The EDX immediates below were read directly at all twelve call sites:
+// 0x4079ab, 0x408458, 0x40910c, 0x409668, 0x409adc, 0x40a19f,
+// 0x40aade, 0x40b107, 0x40b5a7, 0x40bd11, 0x40c781, 0x40cece.
 const BOMB_CHERRY_DRAIN: Record<CharacterId, {
   unfocused: [number, number]; focused: [number, number]
 }> = {
@@ -442,7 +445,7 @@ export class Player {
     }
   }
 
-  private move(input: InputFrame, rate = 1, speedMult = this.bombTimer > 0 ? this.bombSpeedMult : 1): void {
+  private move(input: InputFrame, rate = 1, speedMult = 1): void {
     const sht = this.sht;
     // Th07.exe FUN_0043be00 @ all.c:28028-28055 resolves the four direction
     // bits into a direction enum via a PRIORITY chain, not vector addition:

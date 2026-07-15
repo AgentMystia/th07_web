@@ -113,8 +113,9 @@ test('unfocused MarisaB uses authored VM spacing and publishes circular clear re
   const engine = new BombEngine();
   const updates = [0, 0, 0];
   const runners = updates.map((_, i) => ({
-    spriteSize: () => ({ w: 30, h: 94 }),
-    currentScale: () => ({ x: 3, y: 7 }),
+    spriteHeight: () => 94,
+    currentScaleY: () => 7,
+    spriteFrame: () => ({ id: i }),
     update: () => { updates[i]++; }
   }));
   const clearRegions = [];
@@ -158,6 +159,15 @@ test('unfocused MarisaB uses authored VM spacing and publishes circular clear re
   assert.ok(Math.abs(d0 - 32) < 1e-4);
   assert.ok(Math.abs(d1 - 163.6) < 1e-3,
     'spacing is 94*7/5=131.6, not the old fixed 76px approximation');
+
+  const draws = [];
+  runner.draw({ drawAnmFrame: (...args) => draws.push(args) }, 32, 16);
+  assert.equal(draws.length, 3, 'all three authored Master Spark beam VMs are drawn');
+  assert.deepEqual(draws.map((draw) => draw.slice(1, 3)), [
+    [352, 156], [352, 156], [352, 156]
+  ], 'beam VMs follow the live player origin');
+  assert.ok(Math.abs(draws[0][3].rotation) < 1e-3,
+    'the straight-up beam applies the native +pi/2 sprite-axis correction');
 
   ctx.frame = 20;
   ctx.elapsed = 20;

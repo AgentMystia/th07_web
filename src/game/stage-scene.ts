@@ -1,7 +1,9 @@
 import { advanceBulletExBehavior, StageRuntime, type StageData } from './eclvm';
 import type { GameHost, Enemy, EnemyBullet, EnemyLaser, ItemEntity, ItemType, EffectParticle } from './types';
 import { Rng } from '../core/rng';
-import { normalizeAngle, clamp } from '../core/util';
+import {
+  normalizeAngle, normalizeNativeAngleF32, clamp, NATIVE_HALF_PI_F32
+} from '../core/util';
 import type { InputFrame } from '../core/input';
 import { Renderer, PLAYFIELD, SCREEN_W } from '../gfx/renderer';
 import type { GameAssets } from './assets';
@@ -83,26 +85,12 @@ const EFFECT_DRAW_COST: Record<number, number> = {
 const ENEMY_POOL_CAP = 0x1e0;
 const PLAYER_BULLET_POOL_CAP = 0x60;
 const ENEMY_BULLET_POOL_CAP = 0x400;
+const BOMB_CLEAR_REGION_CAP = 0x60;
 const ITEM_POOL_CAP = 0x44c;
 const EFFECT_POOL_CAP = 400;
-const NATIVE_PI_F32 = 3.1415927410125732;
-const NATIVE_TAU_F32 = 6.2831854820251465;
-const NATIVE_HALF_PI_F32 = 1.5707963705062866;
-
-// Th07.exe FUN_0042fff0 @ 0x42fff0 accepts two float arguments, stores each
-// add/subtract back through a float local, and stops after at most 18 wraps.
-// This is observably different from a double-precision `% (2*Math.PI)` for
-// large authored angles and at SakuyaA's knife-hit boundaries.
-function normalizeNativeAngleF32(angle: number, delta = 0): number {
-  let value = Math.fround(Math.fround(angle) + Math.fround(delta));
-  for (let i = 0; i < 18 && value > NATIVE_PI_F32; i++) {
-    value = Math.fround(value - NATIVE_TAU_F32);
-  }
-  for (let i = 0; i < 18 && value < -NATIVE_PI_F32; i++) {
-    value = Math.fround(value + NATIVE_TAU_F32);
-  }
-  return value;
-}
+// Th07.exe v1.00b _DAT_0048eb98 (file value 0x38d1b717), used by
+// FUN_00423910 @ 0x4239e4/0x423a05 before recomputing an accel heading.
+const NATIVE_VELOCITY_EPSILON_F32 = 9.999999747378752e-5;
 // DAT_00494fb0 maps the small effect id to a master ANM script. These are
 // the authored removal times of the corresponding etama scripts; Infinity
 // denotes an interrupt/gate-owned persistent VM. The optional per-frame
@@ -550,9 +538,14 @@ export class StageScene implements GameHost {
   // per-bullet graze/hit check — BEFORE the graze box). The spec mislabeled this
   // pool "cosmetic"; it is the bomb's bullet cancellation. ReimuA activation writes
   // a fixed-center expanding-circle blast (r = 32 + 8·age, 17 frames).
-  private readonly bombClearRegions: { x: number; y: number; radius: number; growth: number; framesLeft: number }[] = [];
+  private readonly bombClearRegions: {
+    x: number; y: number; radius: number; growth: number; framesLeft: number
+  }[] = Array.from({ length: BOMB_CLEAR_REGION_CAP }, () => ({
+    x: 0, y: 0, radius: 0, growth: 0, framesLeft: 0
+  }));
   // The active bomb form's decoded state machine (12 forms, player-bombs.ts).
   private bombRunner: BombRunner | null = null;
+  private bombContext!: BombContext;
   // Latched bomb duration (frames) for end-window checks (ReimuA focused's
   // final-30-frames detonation, etc.).
   private bombDuration = 0;
@@ -731,6 +724,7 @@ export class StageScene implements GameHost {
     this.etamaItemBase = assets.anms.etama.entries[1].spriteBase;
     this.playerObj = new Player(character, assets.anms);
     this.playerEffects = new PlayerEffects(this.playerObj.anm);
+    this.bombContext = this.createBombContext();
     this.player = this.playerObj;
     // Extra/Phantasm run-init (FUN_0042cf2f @ all.c:19715-19717): lives
     // forced to 2 for difficulty >= 4. Power 128 at start is the
@@ -1149,7 +1143,7 @@ export class StageScene implements GameHost {
     this.bombRunner = null;
     this.bombEngine.reset();
     this.activeBombSlots.length = 0;
-    this.bombClearRegions.length = 0;
+    for (const region of this.bombClearRegions) region.framesLeft = 0;
     this.playerEffects.clear();
     this.screenShakes.length = 0;
     this.shakeX = 0;
@@ -1210,15 +1204,13 @@ export class StageScene implements GameHost {
           continue;
         }
         const mag = shake.from + (shake.elapsed / shake.duration) * (shake.to - shake.from);
-        const pick = (): number => {
-          const value = this.rng.u32InRange(3);
-          return value === 0 ? 0 : value === 1 ? mag : -mag;
-        };
         // Scheduler order is allocation order and every instance writes the
         // shared camera fields. The last surviving instance therefore owns
         // the visible offset while all earlier instances still consume RNG.
-        this.shakeX = pick();
-        this.shakeY = pick();
+        const xPick = this.rng.u32InRange(3);
+        const yPick = this.rng.u32InRange(3);
+        this.shakeX = xPick === 0 ? 0 : xPick === 1 ? mag : -mag;
+        this.shakeY = yPick === 0 ? 0 : yPick === 1 ? mag : -mag;
         i++;
       }
     }
@@ -2266,16 +2258,35 @@ export class StageScene implements GameHost {
     // at cast, radius 32→160 at +8/frame over 17 frames. Other characters' activation
     // blasts (different r0/grow) are not yet traced — add per character as converged.
     if (p.character === 'reimuA') {
-      this.bombClearRegions.push({
-        x: Math.fround(p.x), y: Math.fround(p.y), radius: 32, growth: 8, framesLeft: 17
-      });
+      this.allocateBombClearRegion(p.x, p.y, 32, 8, 17);
     }
     this.bombRunner = new BombRunner(this.bombEngine, p.character, p.bombFocused);
-    this.bombRunner.start(this.bombCtx());
+    this.bombRunner.start(this.refreshBombContext());
     this.spawnBombEffects();
   }
 
-  private bombCtx(): BombContext {
+  private allocateBombClearRegion(
+    x: number,
+    y: number,
+    radius: number,
+    growth: number,
+    framesLeft: number
+  ): boolean {
+    // Th07.exe FUN_0043e7e0 scans player+0x17dc from slot zero and writes
+    // the first free entry. Full pools reject the request without allocating.
+    for (const region of this.bombClearRegions) {
+      if (region.framesLeft > 0) continue;
+      region.x = Math.fround(x);
+      region.y = Math.fround(y);
+      region.radius = Math.fround(radius);
+      region.growth = Math.fround(growth);
+      region.framesLeft = framesLeft;
+      return true;
+    }
+    return false;
+  }
+
+  private createBombContext(): BombContext {
     const p = this.playerObj;
     return {
       player: p,
@@ -2296,14 +2307,21 @@ export class StageScene implements GameHost {
         // pool is advanced by FUN_0043d8f0 at the head of the next player
         // tick; a life-0 entry therefore survives only the current bullet
         // manager pass, while life-N entries are observed for N+1 passes.
-        this.bombClearRegions.push({
-          x: Math.fround(x), y: Math.fround(y),
-          radius: Math.fround(radius), growth: Math.fround(growth),
-          framesLeft: frames + 1
-        });
+        this.allocateBombClearRegion(x, y, radius, growth, frames + 1);
       },
       createBombAnmRunner: (scriptId) => new AnmRunner(p.anm, scriptId, { rng: this.rng })
     };
+  }
+
+  private refreshBombContext(): BombContext {
+    const ctx = this.bombContext;
+    const p = this.playerObj;
+    ctx.frame = Math.floor(this.bombFrame);
+    ctx.elapsed = this.bombFrame;
+    ctx.duration = this.bombDuration;
+    ctx.focused = p.bombFocused;
+    ctx.rate = this.slowRate;
+    return ctx;
   }
 
   // Per-frame bomb choreography: the active form's decoded state machine
@@ -2312,7 +2330,7 @@ export class StageScene implements GameHost {
   // sakuya}.md). Slot consumption below is exe-exact.
   private tickBombChoreography(): void {
     if (!this.bombRunner) return;
-    this.bombRunner.tick(this.bombCtx());
+    this.bombRunner.tick(this.refreshBombContext());
   }
 
   // Bomb visuals, per shot type, from the character's own playerXX.anm bomb
@@ -2457,6 +2475,7 @@ export class StageScene implements GameHost {
     // manager ticks (Phantasm native slot 666: PRE10463..PRE10474), moving
     // at half velocity before FUN_00416c90 releases it.
     b.clearFadeFrames = 12;
+    b.clearRunner = this.runtime?.createBulletClearRunner(b.sprite) ?? undefined;
     return true;
   }
 
@@ -2472,6 +2491,7 @@ export class StageScene implements GameHost {
     // every other normal bullet) call it first. Clear regions therefore also
     // consume young or already-grazed bullets; the 16-frame gate is graze-only.
     for (const r of this.bombClearRegions) {
+      if (r.framesLeft <= 0) continue;
       const dx = b.x - r.x;
       const dy = b.y - r.y;
       if (dx * dx + dy * dy < r.radius * r.radius) {
@@ -3699,6 +3719,7 @@ export class StageScene implements GameHost {
         // fixed slot until the ANM removes it.
         b.x = Math.fround(b.x + b.vx / 2);
         b.y = Math.fround(b.y + b.vy / 2);
+        b.clearRunner?.update(this.slowRate);
         b.age += this.slowRate;
         b.clearFadeFrames -= this.slowRate;
         if (b.clearFadeFrames <= 0) this.removeEnemyBullet(b);
@@ -3785,16 +3806,12 @@ export class StageScene implements GameHost {
     // Advance the bomb clear-region blast after this frame's cancellations: the
     // expanding-circle consumer grows the radius by `growth` per frame and retires
     // the region once its lifetime lapses (native: 17 frames, r 32→160).
-    if (this.bombClearRegions.length) {
-      for (const r of this.bombClearRegions) {
-        // FUN_0043d8f0 stores the radius back into the float32 pool entry on
-        // every head-of-player-tick update.
-        r.radius = Math.fround(r.radius + r.growth);
-        r.framesLeft--;
-      }
-      for (let i = this.bombClearRegions.length - 1; i >= 0; i--) {
-        if (this.bombClearRegions[i].framesLeft <= 0) this.bombClearRegions.splice(i, 1);
-      }
+    for (const r of this.bombClearRegions) {
+      if (r.framesLeft <= 0) continue;
+      // FUN_0043d8f0 stores the radius back into the float32 pool entry on
+      // every head-of-player-tick update, then marks the fixed slot free.
+      r.radius = Math.fround(r.radius + r.growth);
+      if (--r.framesLeft <= 0) r.framesLeft = 0;
     }
   }
 
@@ -3900,7 +3917,8 @@ export class StageScene implements GameHost {
         const accelY = Math.fround(rateF32 * Math.fround(ac.vy));
         b.vx = Math.fround(accelX + Math.fround(b.vx));
         b.vy = Math.fround(accelY + Math.fround(b.vy));
-        if (b.vx !== 0 || b.vy !== 0) {
+        if (!(Math.abs(b.vx) <= NATIVE_VELOCITY_EPSILON_F32 &&
+              Math.abs(b.vy) <= NATIVE_VELOCITY_EPSILON_F32)) {
           b.angle = Math.fround(Math.atan2(Math.fround(b.vy), Math.fround(b.vx)));
         }
       }
@@ -4716,11 +4734,11 @@ export class StageScene implements GameHost {
       // whole batch while each draw assigns its own transform/alpha/blend.
       r.ctx.save();
       for (const b of this.enemyBullets) {
-        // State-5 fixed slots are retained for native allocation/manager
-        // timing, but the authored per-template removal ANM is not yet wired
-        // into the manual enemy-bullet renderer. Hide it rather than inventing
-        // a fade; simulation lifetime remains exact.
-        if (b.dead || b.clearFadeFrames != null) continue;
+        if (b.dead) continue;
+        if (b.clearFadeFrames != null) {
+          r.drawAnmFrame(b.clearRunner?.spriteFrame() ?? null, ox + b.x, oy + b.y);
+          continue;
+        }
         // 大玉 (template 10) spawn bloom: the exe's flags-selected intro
         // script (etama2 entry-1 script 2, 24 frames — recon
         // gokushinken-bullets.md) draws the same offset-shifted sprite at
@@ -4777,6 +4795,7 @@ export class StageScene implements GameHost {
       this.markPass('items');
       const p = this.playerObj;
       this.playerEffects.draw(r, ox, oy);
+      this.bombRunner?.draw(r, ox, oy);
       if (this.focusEffectRunner) {
         r.drawAnmFrame(this.focusEffectRunner.spriteFrame(), ox + p.x, oy + p.y);
       }

@@ -140,4 +140,20 @@ test('bomb Cherry drain matches FUN_00407740 form and difficulty staging', () =>
   assert.equal(bombCherryDrainPerFrame('reimuA', false, 1, 432720, 140), 610);
   assert.equal(bombCherryDrainPerFrame('marisaB', true, 4, 200000, 340), 80,
     'Extra MarisaB focused uses 0.41, /3, duration 340, minimum 10000');
+
+  const minimums = [
+    ['reimuA', false, 140, 20], ['reimuA', true, 300, 10],
+    ['reimuB', false, 140, 20], ['reimuB', true, 190, 10],
+    ['marisaA', false, 200, 40], ['marisaA', true, 260, 30],
+    ['marisaB', false, 300, 20], ['marisaB', true, 340, 20],
+    ['sakuyaA', false, 160, 30], ['sakuyaA', true, 250, 20],
+    ['sakuyaB', false, 160, 30], ['sakuyaB', true, 300, 20]
+  ];
+  for (const [character, focused, duration, expected] of minimums) {
+    assert.equal(
+      bombCherryDrainPerFrame(character, focused, 1, 0, duration),
+      expected,
+      `${character} ${focused ? 'focused' : 'unfocused'} EDX minimum`
+    );
+  }
 });

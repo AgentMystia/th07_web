@@ -277,6 +277,25 @@ test('op161 arms the bomb/Border manager pause and retreats only the boss timer'
   assert.ok(Math.abs(e.ecl.bossTimerFrac - Math.fround(2 / 3)) < 1e-7);
 });
 
+test('effect 11 param above one latches the native bit-5 pre-retreat', () => {
+  const sub = [instruction(0, 121, [i32(11), i32(2)]), instruction(999, 0, [])];
+  const stage = { ...TH07_DATA.stages[8], ecl: makeEcl([sub]) };
+  const runtime = new StageRuntime(stage, { etama, enemy: noAnm, effect: noAnm });
+  const host = makeHost();
+  host.slowRate = 0.5;
+  const e = runtime.spawnEclEnemy(host, { subId: 0, x: 0, y: 0, life: 1, item: -1, score: 0 });
+  e.ecl.bossTimer = 10;
+  e.ecl.bossTimerPrevious = 4;
+  e.ecl.bossTimerFrac = 0.75;
+
+  runtime.tickEnemyPausedManagerClock(host, e);
+  assert.deepEqual(
+    [e.ecl.bossTimer, e.ecl.bossTimerPrevious, e.ecl.bossTimerFrac],
+    [8, -999, 0],
+    'bit 5 retreats once and clears the split pair before the normal-rate retreat'
+  );
+});
+
 test('Extra/Phantasm spell ids 118+ suppress boss collisions throughout a bomb plus one release tick', () => {
   const stage = { ...TH07_DATA.stages[8], ecl: makeEcl([[]]) };
   const runtime = new StageRuntime(stage, { etama, enemy: noAnm, effect: noAnm });

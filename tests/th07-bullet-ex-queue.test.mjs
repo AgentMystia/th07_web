@@ -152,6 +152,55 @@ test('spawn lifetime comes from both the selected state and native bullet templa
   assert.equal(largeBall.age, 0, 'transition tick falls through but leaves normal age at zero');
 });
 
+test('state-5 bullet clears use the executable template removal ANMs', () => {
+  const scene = sceneForTest();
+  const expected = [
+    [0, 'etama', 1],
+    [1, 'etama', 1.5],
+    [7, 'etama', 3],
+    [10, 'etama2', 1]
+  ];
+  for (const [sprite, imageKey, scaleX] of expected) {
+    const bullet = fireOne(scene, 0, [null, null, null, null, null], 0, sprite);
+    assert.equal(scene.beginBulletClearFade(bullet), true);
+    const frame = bullet.clearRunner?.spriteFrame();
+    assert.ok(frame, `template ${sprite} has a removal frame`);
+    assert.equal(frame.imageKey, imageKey);
+    assert.equal(frame.scaleX, scaleX);
+    scene.clearEnemyBullets();
+    scene.enemyBulletManagerEntryCount = 0;
+  }
+});
+
+test('bomb clear regions reuse the native fixed 96-slot pool', () => {
+  const scene = sceneForTest();
+  assert.equal(scene.bombClearRegions.length, 96);
+  const first = scene.bombClearRegions[0];
+  assert.equal(scene.allocateBombClearRegion(10.25, 20.5, 32, 8, 17), true);
+  assert.equal(scene.bombClearRegions[0], first, 'allocation rewrites the first free object in place');
+  assert.deepEqual(first, { x: 10.25, y: 20.5, radius: 32, growth: 8, framesLeft: 17 });
+  for (let i = 1; i < 96; i++) {
+    assert.equal(scene.allocateBombClearRegion(i, i, 1, 0, 1), true);
+  }
+  assert.equal(scene.allocateBombClearRegion(999, 999, 1, 0, 1), false,
+    'a full native pool rejects the request without growing the array');
+  assert.equal(scene.bombClearRegions.length, 96);
+});
+
+test('bomb choreography mutates one cached context instead of rebuilding closures per frame', () => {
+  const scene = sceneForTest();
+  const first = scene.refreshBombContext();
+  scene.bombFrame = 12.5;
+  scene.bombDuration = 300;
+  scene.slowRate = 0.5;
+  const second = scene.refreshBombContext();
+  assert.equal(second, first);
+  assert.deepEqual(
+    [second.frame, second.elapsed, second.duration, second.rate],
+    [12, 12.5, 300, 0.5]
+  );
+});
+
 test('spawn ANM lifetime uses a split counter under 1/3 slowmo', () => {
   const scene = sceneForTest();
   scene.slowRate = 1 / 3;
@@ -237,6 +286,26 @@ test('op79 acceleration retains the slow rate from its promotion tick', () => {
     Math.fround(Math.sin(Math.fround(Math.PI / 2)) * bullet.exAccel.mag));
   scene.updateBullets();
   assert.ok(Math.abs(bullet.vy - 0.015) < 1e-8);
+});
+
+test('op79 acceleration preserves heading inside the executable 1e-4 velocity epsilon', () => {
+  const scene = sceneForTest();
+  const bullet = fireOne(scene, 0x10, [
+    slot(0x10, 1, 10, 0, 0, 0),
+    null, null, null, null
+  ], 0);
+  bullet.angle = Math.fround(1.2345);
+  bullet.vx = Math.fround(0.00005);
+  bullet.vy = Math.fround(-0.00005);
+
+  scene.updateBulletMotion(bullet);
+  assert.equal(bullet.angle, Math.fround(1.2345),
+    'FUN_00423910 keeps the prior heading when both velocity components are <= _DAT_0048eb98');
+
+  bullet.vx = Math.fround(0.0002);
+  bullet.vy = 0;
+  scene.updateBulletMotion(bullet);
+  assert.equal(bullet.angle, 0, 'a component outside the epsilon recomputes atan2');
 });
 
 test('op79 angle-change and acceleration store every persistent bullet field as float32', () => {

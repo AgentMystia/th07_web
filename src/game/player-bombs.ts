@@ -3,6 +3,10 @@ import type { Player } from './player';
 import type { Rng } from '../core/rng';
 import type { Enemy, EnemyBullet } from './types';
 import type { AnmRunner } from '../formats/anm';
+import type { Renderer } from '../gfx/renderer';
+import {
+  normalizeNativeAngleF32, NATIVE_PI_F32, NATIVE_TAU_F32, NATIVE_HALF_PI_F32
+} from '../core/util';
 
 // Player bomb attack-slot engine + the twelve decoded per-form state
 // machines (Th07.exe bomb tick functions 0x407840-0x40cbf0; specs:
@@ -46,16 +50,6 @@ export interface BombContext {
 
 const MAX_SLOTS = 112; // exe pool size (0x70)
 const TAU = Math.PI * 2;
-const PI_F32 = Math.fround(Math.PI);
-const TAU_F32 = Math.fround(Math.PI * 2);
-const HALF_PI_F32 = Math.fround(Math.PI / 2);
-
-function wrapNativeAngleF32(value: number): number {
-  let angle = Math.fround(value);
-  while (angle > PI_F32) angle = Math.fround(angle - TAU_F32);
-  while (angle <= -PI_F32) angle = Math.fround(angle + TAU_F32);
-  return angle;
-}
 
 export class BombEngine {
   slots: AttackSlot[] = Array.from({ length: MAX_SLOTS }, (_, poolSlot) => ({
@@ -134,6 +128,8 @@ export class BombRunner {
   private spawnedCount = 0;
   private marisaBBeamVms: AnmRunner[] = [];
   private marisaBBeamAngles: number[] = [];
+  private marisaBBeamOriginX = 0;
+  private marisaBBeamOriginY = 0;
   // SakuyaA focused: per-knife visual handles for the on-hit script swap.
   private knifeFx: (PlayerEffectHandle | null)[] = [];
 
@@ -150,7 +146,9 @@ export class BombRunner {
     if (this.character === 'marisaB' && !this.focused) {
       this.marisaBBeamVms = [12, 13, 14].map((id) => ctx.createBombAnmRunner(id));
       this.marisaBBeamAngles = [0, 1, 2].map((i) =>
-        Math.fround((i * TAU_F32) / 3 - HALF_PI_F32));
+        Math.fround((i * NATIVE_TAU_F32) / 3 - NATIVE_HALF_PI_F32));
+      this.marisaBBeamOriginX = ctx.player.x;
+      this.marisaBBeamOriginY = ctx.player.y;
     }
     // ReimuB both casts open with the building 2->6 shake (spec-bombs-reimu §5/6).
     if (this.character === 'reimuB') ctx.startScreenShake(60, 2, 6);
@@ -164,6 +162,18 @@ export class BombRunner {
       case 'marisaB': this.focused ? this.marisaBFocused(ctx) : this.marisaBUnfocused(ctx); break;
       case 'sakuyaA': this.focused ? this.sakuyaAFocused(ctx) : this.sakuyaAUnfocused(ctx); break;
       case 'sakuyaB': this.focused ? this.sakuyaBFocused(ctx) : this.sakuyaBUnfocused(ctx); break;
+    }
+  }
+
+  draw(r: Renderer, ox: number, oy: number): void {
+    if (this.character !== 'marisaB' || this.focused) return;
+    for (let i = 0; i < this.marisaBBeamVms.length; i++) {
+      r.drawAnmFrame(
+        this.marisaBBeamVms[i].spriteFrame(),
+        ox + this.marisaBBeamOriginX,
+        oy + this.marisaBBeamOriginY,
+        { rotation: normalizeNativeAngleF32(this.marisaBBeamAngles[i], NATIVE_HALF_PI_F32) }
+      );
     }
   }
 
@@ -184,12 +194,12 @@ export class BombRunner {
       //   local_8 = ((float)iVar5 * 2π_f32) / 8_f32 − π/2_f32   (stored float)
       //   local_18[4] = (float) FUN_0042fff0(local_8)           (wrap + store)
       // The previous double-precision form (TAU / Math.PI) left orb.angle off
-      // by sub-ULP, drifting each orb over its ~62 state-1 ticks enough to
-      // flip the r=128 clear boundary 2-3 frames late at Phantasm's second
-      // bomb (collect f51879). Math.fround over the float32 constants matches
-      // the single x87→float32 store; wrapNativeAngleF32 is FUN_0042fff0.
-      const angle = wrapNativeAngleF32(
-        Math.fround(mirror * TAU_F32 / 8 - HALF_PI_F32));
+      // by sub-ULP. Math.fround over the float32 constants matches the single
+      // x87→float32 store; normalizeNativeAngleF32 is FUN_0042fff0. This is a
+      // fidelity correction, but it does not by itself close the later
+      // Phantasm replay divergence.
+      const angle = normalizeNativeAngleF32(
+        Math.fround(mirror * NATIVE_TAU_F32 / 8 - NATIVE_HALF_PI_F32));
       this.actors.push({
         x: ctx.player.x, y: ctx.player.y, vx: 0, vy: 0,
         angle, speed: 15, accel: 0, turnRate: 0, state: 1, age: 0
@@ -398,19 +408,23 @@ export class BombRunner {
     //   local80 ECX kind=1, EDX duration=100, stack from=24,to=0
     if (ctx.frame === 20) ctx.startScreenShake(60, 1, 7);
     if (ctx.frame === 80) ctx.startScreenShake(100, 24, 0);
+    this.marisaBBeamOriginX = ctx.player.x;
+    this.marisaBBeamOriginY = ctx.player.y;
     for (let b = 0; b < 3; b++) {
       const delta = Math.fround(
-        ((Math.fround(ctx.elapsed) * PI_F32) / 30 / ctx.duration) * this.sweepSign
+        ((Math.fround(ctx.elapsed) * NATIVE_PI_F32) / 30 / ctx.duration) * this.sweepSign
       );
-      const angle = wrapNativeAngleF32(this.marisaBBeamAngles[b] + delta);
+      const angle = normalizeNativeAngleF32(this.marisaBBeamAngles[b], delta);
       this.marisaBBeamAngles[b] = angle;
       const vm = this.marisaBBeamVms[b];
-      const spriteHeight = vm.spriteSize()?.h ?? 0;
-      const spacing = Math.fround((spriteHeight * vm.currentScale().y) / 5);
+      const spriteHeight = vm.spriteHeight() ?? 0;
+      const spacing = Math.fround((spriteHeight * vm.currentScaleY()) / 5);
+      const cosA = Math.cos(angle);
+      const sinA = Math.sin(angle);
       let distance = 32;
       for (let k = 0; k < 6; k++) {
-        const x = Math.fround(Math.cos(angle) * distance + ctx.player.x);
-        const y = Math.fround(Math.sin(angle) * distance + ctx.player.y);
+        const x = Math.fround(cosA * distance + ctx.player.x);
+        const y = Math.fround(sinA * distance + ctx.player.y);
         this.engine.set(b * 6 + k, x, y, 128, 128, 10);
         // FUN_0043e7e0(point, 64, 0, 0, 6): the visual sparkle allocation
         // is also the native one-frame circular bullet-clear region.
