@@ -9,10 +9,15 @@
 //   node scripts/perf-probe.mjs --stage 3 --difficulty 3 --until first-wave-clear --runs 3
 //   node scripts/perf-probe.mjs --throttle 2 --runs 3            # half-speed
 //   node scripts/perf-probe.mjs --scenario dense-items --baseline              # writes scripts/perf-baseline.json
-import { chromium } from '@playwright/test';
-import { createServer } from 'node:http';
-import { readFile, writeFile } from 'node:fs/promises';
-import { extname, join } from 'node:path';
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import {
+  attachPageDiagnostics,
+  launchChromium,
+  repoRoot,
+  startStaticServer,
+  uniqueErrors
+} from './lib/browser-harness.mjs';
 
 const FRAME_BUDGET_MS = 1000 / 60; // 16.667 — a logical tick is "dropped" if it exceeds this
 
@@ -38,29 +43,9 @@ const baseline = !!args.baseline;
 const paced = !!args.paced; // rAF-paced: advance(1) per rAF (real-game cadence + idle GC time)
 const warmup = 120; // frames dropped from stats (JIT/decoder warmup)
 
-const MIME = {
-  '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
-  '.png': 'image/png', '.jpg': 'image/jpeg', '.ogg': 'audio/ogg',
-  '.wav': 'audio/wav', '.map': 'application/json'
-};
-const root = new URL('..', import.meta.url).pathname;
-const server = createServer(async (req, res) => {
-  try {
-    let p = decodeURIComponent(new URL(req.url, 'http://x').pathname);
-    if (p === '/') p = '/index.html';
-    const data = await readFile(join(root, p));
-    res.writeHead(200, { 'content-type': MIME[extname(p)] ?? 'application/octet-stream' });
-    res.end(data);
-  } catch {
-    res.writeHead(404);
-    res.end();
-  }
-});
-await new Promise((r) => server.listen(0, r));
-const port = server.address().port;
-const browser = await chromium.launch({
-  executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome'
-});
+const root = repoRoot;
+const server = await startStaticServer(root);
+const browser = await launchChromium();
 
 const pct = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
 const summarize = (arr) => {
@@ -76,14 +61,13 @@ const summarize = (arr) => {
 
 async function runOnce(runIndex, rate) {
   const page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
-  const errors = [];
-  page.on('pageerror', (e) => errors.push(String(e).slice(0, 200)));
+  const errors = attachPageDiagnostics(page);
   // CPU throttle emulates "the machine running at 1/rate of its speed".
   if (rate > 1) {
     const client = await page.context().newCDPSession(page);
     await client.send('Emulation.setCPUThrottlingRate', { rate });
   }
-  await page.goto(`http://127.0.0.1:${port}/index.html?test=1&paused=1&difficulty=${difficulty}&stage=${stage}&power=128`);
+  await page.goto(`${server.baseUrl}/index.html?test=1&perf=1&paused=1&difficulty=${difficulty}&stage=${stage}&power=128`);
   await page.waitForFunction(() => window.__TH07_TEST__?.ready, null, { timeout: 30000 });
 
   const result = await page.evaluate(async ({ scenario, until, warmup, paced }) => {
@@ -148,7 +132,7 @@ async function runOnce(runIndex, rate) {
     total: summarize(total),
     final: result.final,
     checkpoints: result.checkpoints,
-    pageErrors: errors.slice(0, 5)
+    pageErrors: uniqueErrors(errors).slice(0, 5)
   };
   console.log(JSON.stringify(stats));
   return stats;
@@ -181,6 +165,7 @@ if (baseline) {
     for (let i = 0; i < runs; i++) all.push(await runOnce(i, rate));
     rates[rate] = summarizeRuns(all, rate);
     if (!rates[rate].deterministic) ok = false;
+    if (rates[rate].pageErrors > 0) ok = false;
   }
   const out = {
     capturedAt: new Date().toISOString(),
@@ -198,11 +183,12 @@ if (baseline) {
   for (let i = 0; i < runs; i++) all.push(await runOnce(i, throttle));
   const s = summarizeRuns(all, throttle);
   if (!s.deterministic) ok = false;
+  if (s.pageErrors > 0) ok = false;
   console.log('SUMMARY', JSON.stringify({ scenario, stage, difficulty, runs, throttle, ...s }));
 }
 
 await browser.close();
-server.close();
+await server.close();
 // Exit non-zero if any run was non-deterministic (anomaly guard: catches
 // iteration-order / RNG drift introduced by a perf change).
 process.exit(ok ? 0 : 4);

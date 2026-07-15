@@ -20,6 +20,10 @@ export interface DrawOptions {
   project3d?: boolean;
 }
 
+export interface RendererOptions {
+  desynchronized?: boolean;
+}
+
 function colorParts(color: number): { r: number; g: number; b: number } {
   return { r: (color >> 16) & 0xff, g: (color >> 8) & 0xff, b: color & 0xff };
 }
@@ -36,19 +40,31 @@ export class Renderer {
   private tintScratch: { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } | null = null;
   // Whole-image patterns for the clip-free textured-triangle fill.
   private trianglePatterns = new WeakMap<CanvasImageSource, CanvasPattern>();
+  readonly requestedDesynchronized: boolean;
 
-  constructor(canvas: HTMLCanvasElement) {
+  constructor(canvas: HTMLCanvasElement, options: RendererOptions = {}) {
     this.canvas = canvas;
+    this.requestedDesynchronized = options.desynchronized ?? true;
     // desynchronized: let the browser pipeline Canvas 2D to the display
     // compositor with lower latency (Chrome/GL backends) — a direct cut to
     // input-to-photon. alpha:false: the playfield is fully redrawn each frame
     // (clear + draw), so the page-level alpha channel is unused; skipping it
     // saves the per-pixel page blend. Both are hints — unsupported browsers
     // ignore them and behave exactly as before.
-    const ctx = canvas.getContext('2d', { desynchronized: true, alpha: false });
+    const ctx = canvas.getContext('2d', {
+      desynchronized: this.requestedDesynchronized,
+      alpha: false
+    });
     if (!ctx) throw new Error('Canvas 2D context unavailable');
     this.ctx = ctx;
     ctx.imageSmoothingEnabled = false;
+  }
+
+  contextAttributes(): { requestedDesynchronized: boolean; actual: CanvasRenderingContext2DSettings | null } {
+    return {
+      requestedDesynchronized: this.requestedDesynchronized,
+      actual: this.ctx.getContextAttributes?.() ?? null
+    };
   }
 
   clear(color = '#000'): void {

@@ -22,6 +22,16 @@ export interface InputFrame {
   pressed: Set<Button>;
 }
 
+export interface InputEdgeObserver {
+  (timing: {
+    code: string;
+    edge: 'down' | 'up';
+    eventTimestamp: number;
+    handlerStart: number;
+    handlerEnd: number;
+  }): void;
+}
+
 export class Input {
   private held = new Set<Button>();
   private codes = new Set<string>();
@@ -32,7 +42,7 @@ export class Input {
   private framePressed = new Set<Button>();
   private frameState: InputFrame = { held: this.frameHeld, pressed: this.framePressed };
 
-  constructor() {
+  constructor(private readonly edgeObserver?: InputEdgeObserver) {
     addEventListener('keydown', (e) => this.down(e), { passive: false });
     addEventListener('keyup', (e) => this.up(e), { passive: false });
     addEventListener('blur', () => {
@@ -43,6 +53,7 @@ export class Input {
   }
 
   private down(event: KeyboardEvent): void {
+    const handlerStart = this.edgeObserver && !event.repeat ? performance.now() : 0;
     const buttons = KEY_MAP.get(event.code);
     if (!buttons) return;
     event.preventDefault();
@@ -51,9 +62,19 @@ export class Input {
       if (!event.repeat && !this.held.has(button)) this.downEdges.add(button);
       this.held.add(button);
     }
+    if (this.edgeObserver && !event.repeat) {
+      this.edgeObserver({
+        code: event.code,
+        edge: 'down',
+        eventTimestamp: event.timeStamp,
+        handlerStart,
+        handlerEnd: performance.now()
+      });
+    }
   }
 
   private up(event: KeyboardEvent): void {
+    const handlerStart = this.edgeObserver ? performance.now() : 0;
     const buttons = KEY_MAP.get(event.code);
     if (!buttons) return;
     event.preventDefault();
@@ -63,6 +84,13 @@ export class Input {
     for (const code of this.codes) {
       for (const button of KEY_MAP.get(code) ?? []) this.held.add(button);
     }
+    this.edgeObserver?.({
+      code: event.code,
+      edge: 'up',
+      eventTimestamp: event.timeStamp,
+      handlerStart,
+      handlerEnd: performance.now()
+    });
   }
 
   // Test hook: injects synthetic state for one frame.
