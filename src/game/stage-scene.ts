@@ -4681,6 +4681,36 @@ export class StageScene implements GameHost {
       // (only the focus hitbox indicator, drawn later, sits on top).
       this.drawPlayerSprite(r, ox, oy);
       this.drawLasers(r, ox, oy);
+      // Player shots ride under the enemy-bullet danmaku so dense patterns
+      // stay readable (Th07.exe layers player shot/laser below enemy bullets).
+      for (const b of this.playerBullets) {
+        // Script-driven sprite state (alpha/scale/spin/blend all come from
+        // the playerXX.anm shot script). Auto-rotate scripts (op25 — Sakuya
+        // knives, Marisa main star, the impact streaks) orient along the
+        // live velocity +π/2 (sprites point up, exe FUN_0043a630); others
+        // (Reimu's spinning amulets) use the script's own rotation.
+        const frame = b.runner.spriteFrame();
+        if (!frame) continue;
+        const opts: { rotation?: number; scaleY?: number; alpha?: number } = {};
+        if (frame.autoRotate) opts.rotation = Math.atan2(b.vy, b.vx) + Math.PI / 2;
+        // Beam types stretch their 14px segment over the live beam length
+        // (exe writes the VM scaleY each frame: FUN_004396a0/FUN_004398e0).
+        if (b.scaleYOverride != null) opts.scaleY = b.scaleYOverride;
+        r.drawAnmFrame(frame, ox + b.x, oy + b.y, opts);
+        // FUN_00439c50 runs after the primary draw, visits newest-to-oldest
+        // up to the cached SHT interval, and stops at the first -999 slot.
+        if (b.shotType === 5 && b.history) {
+          const depth = Math.min(16, b.historyDepth ?? 0);
+          for (let i = 0; i < depth; i++) {
+            const hpt = b.history[i];
+            if (hpt.x === -999) break;
+            r.drawAnmFrame(frame, ox + hpt.x, oy + hpt.y, {
+              ...opts,
+              alpha: 1 - i / depth
+            });
+          }
+        }
+      }
       // Enemy bullets dominate entity draw counts in dense spells. Their
       // sprites are untinted, so one saved Canvas state can safely cover the
       // whole batch while each draw assigns its own transform/alpha/blend.
@@ -4746,34 +4776,6 @@ export class StageScene implements GameHost {
       r.ctx.restore();
       this.markPass('items');
       const p = this.playerObj;
-      for (const b of this.playerBullets) {
-        // Script-driven sprite state (alpha/scale/spin/blend all come from
-        // the playerXX.anm shot script). Auto-rotate scripts (op25 — Sakuya
-        // knives, Marisa main star, the impact streaks) orient along the
-        // live velocity +π/2 (sprites point up, exe FUN_0043a630); others
-        // (Reimu's spinning amulets) use the script's own rotation.
-        const frame = b.runner.spriteFrame();
-        if (!frame) continue;
-        const opts: { rotation?: number; scaleY?: number; alpha?: number } = {};
-        if (frame.autoRotate) opts.rotation = Math.atan2(b.vy, b.vx) + Math.PI / 2;
-        // Beam types stretch their 14px segment over the live beam length
-        // (exe writes the VM scaleY each frame: FUN_004396a0/FUN_004398e0).
-        if (b.scaleYOverride != null) opts.scaleY = b.scaleYOverride;
-        r.drawAnmFrame(frame, ox + b.x, oy + b.y, opts);
-        // FUN_00439c50 runs after the primary draw, visits newest-to-oldest
-        // up to the cached SHT interval, and stops at the first -999 slot.
-        if (b.shotType === 5 && b.history) {
-          const depth = Math.min(16, b.historyDepth ?? 0);
-          for (let i = 0; i < depth; i++) {
-            const hpt = b.history[i];
-            if (hpt.x === -999) break;
-            r.drawAnmFrame(frame, ox + hpt.x, oy + hpt.y, {
-              ...opts,
-              alpha: 1 - i / depth
-            });
-          }
-        }
-      }
       this.playerEffects.draw(r, ox, oy);
       if (this.focusEffectRunner) {
         r.drawAnmFrame(this.focusEffectRunner.spriteFrame(), ox + p.x, oy + p.y);
