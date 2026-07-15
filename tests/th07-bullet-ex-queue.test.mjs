@@ -231,6 +231,49 @@ test('op79 acceleration retains the slow rate from its promotion tick', () => {
   // FUN_004229f0 first stores a rate-baked acceleration vector. The active
   // FUN_00423910 tick then applies the current rate to that retained vector.
   assert.equal(bullet.exAccel.mag, Math.fround(Math.fround(0.06) * 0.5));
+  assert.equal(bullet.exAccel.vx,
+    Math.fround(Math.cos(Math.fround(Math.PI / 2)) * bullet.exAccel.mag));
+  assert.equal(bullet.exAccel.vy,
+    Math.fround(Math.sin(Math.fround(Math.PI / 2)) * bullet.exAccel.mag));
   scene.updateBullets();
   assert.ok(Math.abs(bullet.vy - 0.015) < 1e-8);
+});
+
+test('op79 angle-change and acceleration store every persistent bullet field as float32', () => {
+  const scene = sceneForTest();
+  const bullet = fireOne(scene, 0x30, [
+    slot(0x20, 1, 180, 0, 0.011111111380159855, -0.01745329238474369),
+    slot(0x10, 0, 120, 0, 0.006666666828095913, -999),
+    null, null, null
+  ], 0);
+
+  let expectedSpeed = Math.fround(bullet.speed);
+  let expectedAngle = Math.fround(bullet.angle);
+  for (let i = 0; i < 180; i++) {
+    expectedAngle = nativeWrapF32(
+      Math.fround(expectedAngle + Math.fround(bullet.exAngle.angleDelta))
+    );
+    expectedSpeed = Math.fround(expectedSpeed + Math.fround(bullet.exAngle.speedDelta));
+    scene.updateBulletMotion(bullet);
+  }
+  assert.equal(bullet.speed, expectedSpeed, 'angle-change speed is fstp-stored each tick');
+  assert.equal(bullet.angle, expectedAngle, 'angle-change heading is fstp-stored each tick');
+
+  // One pass clears the completed behavior; the following pass promotes
+  // acceleration and immediately performs its first active tick. Its vector
+  // is captured once from the retained f32 heading.
+  scene.updateBulletMotion(bullet);
+  scene.updateBulletMotion(bullet);
+  assert.ok(bullet.exAccel, 'the queued acceleration behavior is promoted');
+  let expectedVx = Math.fround(bullet.vx);
+  let expectedVy = Math.fround(bullet.vy);
+  const accelX = Math.fround(bullet.exAccel.vx);
+  const accelY = Math.fround(bullet.exAccel.vy);
+  for (let i = 1; i < 120; i++) {
+    expectedVx = Math.fround(expectedVx + accelX);
+    expectedVy = Math.fround(expectedVy + accelY);
+    scene.updateBulletMotion(bullet);
+  }
+  assert.equal(bullet.vx, expectedVx, 'acceleration X adds and stores through float32');
+  assert.equal(bullet.vy, expectedVy, 'acceleration Y adds and stores through float32');
 });

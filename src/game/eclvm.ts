@@ -45,6 +45,24 @@ function normalizeNativeAngleF32(angle: number, delta = 0): number {
   return value;
 }
 
+// Th07.exe FUN_0043f2b0 @ 0x43f2b0: both deltas are float fields and an
+// exactly coincident source/player pair returns the explicit π/2 constant
+// instead of evaluating atan2(0, 0). Extra spell 122 deliberately reaches
+// that case (boss and player both at 229.5733,74.5199); the fallback turns
+// Sub100's whole volley downward and is therefore collision-visible.
+function nativeAngleTowardPlayer(
+  playerX: number,
+  playerY: number,
+  sourceX: number,
+  sourceY: number
+): number {
+  const dx = Math.fround(playerX - sourceX);
+  const dy = Math.fround(playerY - sourceY);
+  return dx === 0 && dy === 0
+    ? NATIVE_HALF_PI_F32
+    : Math.fround(Math.atan2(dy, dx));
+}
+
 // Advance one fired bullet's copied op-79 queue exactly as FUN_004229f0
 // @ 0x4229f0. Construction calls it once; FUN_004241c0 calls it on every
 // normal-state bullet-manager tick, including the spawn-ANM transition tick.
@@ -75,6 +93,9 @@ export function advanceBulletExBehavior(bullet: EnemyBullet, activationRate = 1)
         break;
       case 0x10:
         bullet.exFlags |= 0x10;
+        {
+          const mag = Math.fround(Math.fround(slot.f0) * Math.fround(activationRate));
+          const angle = Math.fround(slot.f1 <= -990 ? bullet.angle : slot.f1);
         bullet.exAccel = {
           // Th07.exe FUN_004229f0 @ 0x422be9-0x422c0f bakes the CURRENT
           // global slow-rate into the acceleration vector when the queue
@@ -83,10 +104,13 @@ export function advanceBulletExBehavior(bullet: EnemyBullet, activationRate = 1)
           // this slot while rate=1/2, so retaining the nominal magnitude
           // made its three bullet layers accelerate exactly 2x too fast and
           // produced the first false graze at PRE25254.
-          mag: Math.fround(slot.f0 * activationRate),
-          angle: slot.f1 <= -990 ? bullet.angle : slot.f1,
+          mag,
+          angle,
+          vx: Math.fround(Math.cos(angle) * mag),
+          vy: Math.fround(Math.sin(angle) * mag),
           limit: slot.arg3
         };
+        }
         bullet.exAccelElapsed = 0;
         bullet.exAccelFrac = 0;
         break;
@@ -280,6 +304,9 @@ export class StageRuntime {
   // a per-enemy flag, so helpers spawned during a spell fired rank-scaled
   // bullets (e.g. Letty final-spell 1.8 -> 1.3 at rank 0; CADENCE-001).
   spellActive = false;
+  // DAT_012f40b8: current spell id written by op90. It is consulted by the
+  // Stage-7/8 bomb collision guard in the enemy-core tail.
+  private currentSpellId = -1;
   // ECL run-globals, vars 10037-10044 (Th07.exe DAT_0133da80..9c): four int
   // and four float slots shared by every enemy — boss controllers write
   // pattern parameters here and child emitters read them back.
@@ -310,6 +337,7 @@ export class StageRuntime {
     this.bossSlots = [];
     this.bossRegistered = false;
     this.spellActive = false;
+    this.currentSpellId = -1;
     this.lifecycleLog = [];
     this.globalsInt.fill(0);
     this.globalsFloat.fill(0);
@@ -544,6 +572,9 @@ export class StageRuntime {
       collisionEnabled: true,
       interactable: true,
       shotCollision: true, // default bit4=1, Th07.exe FUN_0041d190 @ 0x41d190
+      pauseDuringBombOrBorder: false,
+      bombCollisionSuppressed: false,
+      bombCollisionSuppressionHold: 0,
 
       deathMode: 0,
       deathCallbackSub: -1,
@@ -673,7 +704,7 @@ export class StageRuntime {
       // every snapshot-then-absolute-fan idiom fired 180° away from the
       // player (stage-4 opener subs 9/10/13/14 and dozens of sites across
       // stages 1-8; VM-001).
-      case 10024: return Math.atan2(game.player.y - e.y, game.player.x - e.x);
+      case 10024: return nativeAngleTowardPlayer(game.player.x, game.player.y, e.x, e.y);
       // Th07.exe FUN_0040d750/FUN_0040df90: 10025 = bossTimer (+0x2bcc),
       // 10026 = player-enemy 3D distance (FUN_00403d50). Previously swapped.
       case 10025: return s.bossTimer;
@@ -702,6 +733,13 @@ export class StageRuntime {
       case 10047: return s.speed;                           // +0x2b64 mode-1
       case 10048: return s.acceleration;                    // +0x2b68 mode-1
       case 10049: return s.orbitSpeed;                      // +0x2b6c mode-3 orbit
+      // Shared mode-2 origin / mode-3 orbit target. Extra Sub115 and
+      // Phantasm Sub119 subtract these from the live player position while
+      // their boss is moving; returning the literal var ids here displaced
+      // the spawned corner helpers by roughly ten thousand pixels.
+      case 10050: return s.orbitTarget.x;                    // +0x2b8c
+      case 10051: return s.orbitTarget.y;                    // +0x2b90
+      case 10052: return s.orbitTarget.z;                    // +0x2b94
       case 10053: return s.orbitAngle;                      // +0x2b5c mode-3 orbit
       case 10054: return s.orbitAngularVelocity;            // +0x2b60 mode-3 orbit
       // Random draws (FUN_0040d750/FUN_0040df90 cases 0x2747/0x2748/0x274c):
@@ -802,6 +840,9 @@ export class StageRuntime {
       case 10047: s.speed = f32; return;
       case 10048: s.acceleration = f32; return;
       case 10049: s.orbitSpeed = f32; return;
+      case 10050: s.orbitTarget.x = f32; return;
+      case 10051: s.orbitTarget.y = f32; return;
+      case 10052: s.orbitTarget.z = f32; return;
       case 10053: s.orbitAngle = f32; return;
       // Th07.exe FUN_0040e560 stores special float var 10054 directly into
       // enemy+0x2b60. Stage-4 Sub135 op19 increments this orbit angular
@@ -898,6 +939,28 @@ export class StageRuntime {
       this.tickInterpSlots(game, e);
     }
     if (advanceClock) this.advanceEclClock(s, tailRate);
+    this.updateHighSpellBombCollisionGate(game, e);
+  }
+
+  // Th07.exe (v1.00b) FUN_0040f6c0 @ 0x416933-0x4169c8. For a registered
+  // boss on runtime stage 7/8, an active bomb during spell id >= 118 sets
+  // enemy+0x2e2b bit2 and refreshes i16 +0x2e2c to 1. FUN_0041ed50 then
+  // skips body collision, FUN_0043a980 (shots + attack slots), damage and
+  // homing-target publication. Once the condition ends, one core tick only
+  // decrements the hold; the following core tick clears the bit.
+  private updateHighSpellBombCollisionGate(game: GameHost, e: Enemy): void {
+    const s = e.ecl;
+    if (!s.isBoss || (game.stageNumber ?? 0) <= 6) return;
+    if (game.isBombActive?.() && this.spellActive && this.currentSpellId >= 0x76) {
+      s.bombCollisionSuppressed = true;
+      s.bombCollisionSuppressionHold = 1;
+      return;
+    }
+    if (s.bombCollisionSuppressionHold > 0) {
+      s.bombCollisionSuppressionHold--;
+    } else {
+      s.bombCollisionSuppressed = false;
+    }
   }
 
   private tickPeriodicSub(game: GameHost, e: Enemy): void {
@@ -1091,6 +1154,27 @@ export class StageRuntime {
         s.damageShield = 0;
         s.damageShieldFrac = 0;
       }
+    }
+  }
+
+  // Th07.exe (v1.00b) FUN_0041ed50 @ 0x41ef7f calls
+  // FUN_00436a06(1) with ECX=enemy+0x2bc4 on op161's manager short-circuit.
+  // This is the same {previous,fraction,current} split timer as bossTimer,
+  // but it retreats rather than advances. At normal speed the helper's fast
+  // path changes only current; at slow rates it snapshots current, subtracts
+  // an f32 fraction, and borrows whole ticks after crossing below zero.
+  tickEnemyPausedManagerClock(game: GameHost, e: Enemy): void {
+    const s = e.ecl;
+    const rate = Math.fround(game.slowRate ?? 1);
+    if (rate > 0.99) {
+      s.bossTimer--;
+      return;
+    }
+    s.bossTimerPrevious = s.bossTimer;
+    s.bossTimerFrac = Math.fround((s.bossTimerFrac ?? 0) - rate);
+    while (s.bossTimerFrac < 0) {
+      s.bossTimer--;
+      s.bossTimerFrac = Math.fround(s.bossTimerFrac + 1);
     }
   }
 
@@ -2636,6 +2720,7 @@ export class StageRuntime {
         for (let i = 0; i < decoded.length; i++) decoded[i] = bytes[start + i] ^ 0xaa;
         s.spellName = new TextDecoder('shift_jis').decode(decoded);
         this.spellActive = true; // Th07.exe DAT_012f40a8 = 1 (all.c:6520) — GLOBAL
+        this.currentSpellId = spellId;
         game.startBossSpell?.(spellId, v.i16(a), s.spellName);
         // The declare handler cancels the field's bullets into cherry items
         // with NO score sweep (all.c:6511 = FUN_00422ea0(1)); the scored
@@ -2646,6 +2731,7 @@ export class StageRuntime {
       case 91: {
         s.spellName = '';
         this.spellActive = false; // Th07.exe DAT_012f40a8 = 0 (all.c:6692) — GLOBAL
+        this.currentSpellId = -1;
         // Exe FUN_0040f340: only a spell that is still "live" (DAT_012f40a8
         // == 1 — i.e. it did not time out; a timeout bumps it to 2 and fades
         // the bullets itemlessly at all.c:13831) gets the phase-end sweep:
@@ -3041,7 +3127,11 @@ export class StageRuntime {
         this.varWrite(game, e, Math.trunc(v.f32(a)), (to - from) * t + from);
         return null;
       }
-      case 161: return null; // SetScriptPausesDuringSlowmo — slowmo clock not modeled
+      // Th07.exe dispatcher case 0xa0 writes arg&1 to enemy+0x2e2b bit3.
+      // FUN_0041ed50 checks it before the complete per-enemy manager body
+      // and skips that body while DAT_004ca4d8 (bomb active) or player+0x2408
+      // (Supernatural Border state) is non-zero.
+      case 161: s.pauseDuringBombOrBorder = (gi(0) & 1) !== 0; return null;
       case 152: { // SET_LASER_ANGLE (exe case 0x97, all.c:9813): absolute
         // store, no wrap — scripts track/wrap their own angle vars and
         // blind-write them every frame (stage 6 pentagram spinner).
@@ -3219,11 +3309,7 @@ export class StageRuntime {
     e.ecl.lastFireFrame = game.frame;
     // FUN_0043f2b0 stores both deltas as f32 before FPATAN; FUN_00423480 then
     // stores the returned aim once more as f32 before passing it by value.
-    const aimDx = Math.fround(game.player.x - shootX);
-    const aimDy = Math.fround(game.player.y - shootY);
-    const aim = aimDx === 0 && aimDy === 0
-      ? NATIVE_HALF_PI_F32
-      : Math.fround(Math.atan2(aimDy, aimDx));
+    const aim = nativeAngleTowardPlayer(game.player.x, game.player.y, shootX, shootY);
     // The FIRE template endpoints are raw f32 values.  Do not pre-wrap angle
     // endpoints: random modes 6/8 interpolate the authored interval first,
     // then FUN_0042fff0 wraps only the completed per-bullet angle.
@@ -3497,7 +3583,7 @@ export class StageRuntime {
     if (s.isBoss) this.syncBossPresence(game);
   }
 
-  killEnemy(game: GameHost, e: Enemy): boolean {
+  killEnemy(game: GameHost, e: Enemy, bombContactThisFrame = false): boolean {
     const s = e.ecl;
     // FUN_0041ed50 @ 0x420005 gates death only on hp <= 0 and op116's
     // interactable bit. op132 invisibility has no bearing on lifecycle.
@@ -3533,7 +3619,7 @@ export class StageRuntime {
       // FUN_0041ed50's preburst and item constructor are interleaved before
       // the boss field sweep and before the common death effects. This order
       // is load-bearing because every effect veto shares the gameplay RNG.
-      this.spawnDeathDropAndPreburst(game, e);
+      this.spawnDeathDropAndPreburst(game, e, bombContactThisFrame);
       if (s.isBoss) {
         if (!this.spellActive) {
           let total = game.sweepBulletsToItems();
@@ -3605,13 +3691,23 @@ export class StageRuntime {
     }
   }
 
-  private spawnDeathDropAndPreburst(game: GameHost, e: Enemy): void {
+  private spawnDeathDropAndPreburst(
+    game: GameHost,
+    e: Enemy,
+    bombContactThisFrame: boolean
+  ): void {
+    // Th07.exe (v1.00b) FUN_0041ed50 @ 0x420169/0x4201b4 passes local_18
+    // directly to FUN_00430970 as spawnMode. FUN_0043a980 sets local_18=1
+    // when any live attack slot overlaps while player+0x16a20 is active.
+    // Mode 1 is the native immediately-homing item state; this applies to
+    // both fixed and random death drops (including power->bigCherry).
+    const options = bombContactThisFrame ? { state: 1 } : undefined;
     const itemDrop = e.ecl.itemDrop;
     if (itemDrop === -1 || itemDrop === 0xffff) {
       if (this.randomSpawnIndex % 3 === 0) {
         game.spawnEffectParticles(e.ecl.deathAnm2 + 4, e.x, e.y, 6, 0xffffffff);
         const type = RANDOM_ITEMS[this.randomItemIndex++ % RANDOM_ITEMS.length];
-        game.spawnItem(type, e.x, e.y);
+        game.spawnItem(type, e.x, e.y, options);
       }
       this.randomSpawnIndex++;
       return;
@@ -3619,7 +3715,7 @@ export class StageRuntime {
     if (itemDrop === -2 || itemDrop === 0xfffe) return;
     game.spawnEffectParticles(e.ecl.deathAnm2 + 4, e.x, e.y, 3, 0xffffffff);
     const type = ITEM_TABLE[itemDrop];
-    if (type) game.spawnItem(type, e.x, e.y);
+    if (type) game.spawnItem(type, e.x, e.y, options);
   }
 
 }

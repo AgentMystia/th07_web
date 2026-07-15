@@ -197,6 +197,35 @@ test('world ambient ids 26/27 use the native 100-unit Z spread', () => {
   }
 });
 
+test('world ambient id30 uses the executable frand*100-100 Z band', () => {
+  const scene = sceneFor(0);
+  const camera = scene.runtime.std.camera();
+  const facing = scene.runtime.std.facing();
+  const values = [0.5, 0.5, 0.25, 0.5, 0.5, 0.5, 0.5, 0.5];
+  scene.rng.f = () => values.shift() ?? 0.5;
+
+  scene.spawnEffectParticles(30, 0, 0, 1, 0xffffffff, { x: 0, y: 0, z: 0 });
+  const particle = scene.particles.at(-1);
+  assert.ok(particle?.world);
+  assert.equal(
+    particle.world.z,
+    Math.fround(camera.z + facing.z / 2 - 75),
+    'Th07.exe FUN_0041ab50 @ 0x41aba1-0x41abb0 uses frand*100-100, not 1-frand'
+  );
+});
+
+test('Border break allocates the executable thirty-two-petal id29 burst', () => {
+  const scene = sceneFor(0);
+  const draws = countDraws(scene);
+
+  scene.applyBorderBreakEffects(null, false);
+
+  assert.equal(scene.particles.filter((p) => p.effectId === 29).length, 32);
+  assert.equal(draws(), 32 * 6,
+    'FUN_0043eb00 @ 0x43ed9a-0x43eddf runs 32 id29 initializers at six raw draws each');
+  assert.equal(scene.playerObj.bombCooldown, 40);
+});
+
 test('spell declaration does not synthesize a generic RNG-consuming burst', () => {
   const scene = sceneFor(0);
   const draws = countDraws(scene);
@@ -390,6 +419,23 @@ test('graze effect 8 uses the native Border/focus branch', () => {
   assert.equal(draws(), 20, 'focused Border graze returns to one white particle');
 });
 
+test('an active bomb suppresses only the graze counters', () => {
+  const scene = sceneFor(0);
+  const draws = countDraws(scene);
+  const score = scene.score;
+  const rank = scene.rank;
+  const rankAccumulator = scene.rankAccumulator;
+
+  scene.bombActiveThisFrame = true;
+  scene.onGrazeAward(200, 300);
+
+  assert.equal(scene.graze, 0, 'FUN_0043bb30 skips stage/total graze while DAT_004ca4d8 is active');
+  assert.equal(scene.score, score + 200, 'the graze score still applies');
+  assert.equal(scene.rank * 100 + scene.rankAccumulator,
+    rank * 100 + rankAccumulator + 6, 'the rank award still applies');
+  assert.equal(draws(), 4, 'the normal graze particle still consumes its RNG draws');
+});
+
 test('enemy-body collision samples op138 trail history on the native six-slot stride', () => {
   const scene = sceneFor(0);
   const draws = countDraws(scene);
@@ -479,7 +525,7 @@ test('player-shot impact release is visible to same-frame full-pool firing', () 
   scene.playerObj.prevFireFrame = -999;
   scene.updatePlayerBullets(false);
   assert.equal(scene.playerBulletSlots[69], null, 'impact frees before firing');
-  scene.firePlayerBullets();
+  scene.firePlayerBullets(true);
   assert.equal(scene.playerBullets.length, 96);
   assert.equal(scene.playerBulletSlots[69]?.state, 'fired', 'volley reuses the released slot');
 });

@@ -178,6 +178,14 @@ test('cherry-item amounts follow the exe 4-case table (§3b)', () => {
   assert.equal(small.cherry, 20);
   assert.equal(small.cherryPlus, 20); // dc6f touches cherryPlus too
 
+  const bombEven = new CherrySystem();
+  bombEven.onSmallCherryItem(true, true);
+  assert.deepEqual([bombEven.cherry, bombEven.cherryPlus], [10, 10]);
+
+  const bombOdd = new CherrySystem();
+  bombOdd.onSmallCherryItem(true, false);
+  assert.deepEqual([bombOdd.cherry, bombOdd.cherryPlus], [10, 0]);
+
   const big = new CherrySystem();
   big.onBigCherryItem();
   assert.equal(big.cherry, 100); // 30 (dc6f) + 70 (dd6c, cherry-only)
@@ -200,6 +208,8 @@ test('grazeScaledItemScore matches graze/40*10+300, min 10, /10 (§3b cases 6/9)
   const c = new CherrySystem();
   assert.equal(c.grazeScaledItemScore(0), 30); // max(10, 0+300)/10
   assert.equal(c.grazeScaledItemScore(400), 40); // floor(400/40)*10=100; (100+300)/10
+  assert.equal(c.grazeScaledItemScore(4000, true), 10,
+    'case 6 is flat 100/10 while player+0x23dc marks an active bomb');
 });
 
 test('large-cherry-item score bonus only fires once cherry is saturated (§3b case 7, unspawned)', () => {

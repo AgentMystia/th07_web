@@ -15,9 +15,10 @@
 //   boss-aware), cherry items (§3b, a 4-case table), and border-survive
 //   (§4). Grazes feed cherryMax/cherry only, never cherryPlus. Ordinary
 //   power/star item cases 0/2 are score/combo-only with no cherry effect.
-// - Cherry drops on death (§3d, selected SHT header rate, CONFIRMED) and on
-//   boss timeout (§3e, CONFIRMED exactly 25%). Bombing has NO cherry
-//   penalty (§3 — it only ends an active border).
+// - Cherry drops on death (§3d, selected SHT header rate, CONFIRMED), boss
+//   timeout (§3e, exactly 25%), and progressively while a bomb is active
+//   (FUN_00407740 + FUN_0043d9a0). Bomb drain touches cherry only, never
+//   cherryPlus.
 // - Cherry+ rises only via the same add-helper as cherry (dc6f); at 50,000
 //   the Supernatural Border activates: 540 frames of invincibility with
 //   full-value auto-collection everywhere. Grazing during the border still
@@ -282,11 +283,19 @@ export class CherrySystem {
     this.gain(g);
   }
 
-  // Th07.exe FUN_00430c10 case 6 (spec §3b): small "Cherry" item, +20
-  // cherry (+cherryPlus via dc6f), unconditional. This port's 'cherry'
-  // ItemType maps to this case (see stage-scene.ts collectItem).
-  onSmallCherryItem(): void {
-    this.gain(20);
+  // Th07.exe FUN_00430c10 case 6 (all.c:22191-22204). Outside a bomb this
+  // awards +20 through dc6f. While DAT_004ca4d8 (bomb-active) is set, even
+  // fixed slots award +10 through dc6f and odd slots award +10 through the
+  // cherry-only dd6c helper.
+  onSmallCherryItem(bombActive = false, evenSlot = true): void {
+    if (!bombActive) this.gain(20);
+    else if (evenSlot) this.gain(10);
+    else this.gainCherryOnly(10);
+  }
+
+  drainBomb(amount: number): void {
+    if (amount <= 0) return;
+    this.cherry = Math.max(0, this.cherry - amount);
   }
 
   // Th07.exe FUN_00430c10 case 7 (spec §3b): big "Cherry" item, amount =
@@ -319,15 +328,14 @@ export class CherrySystem {
     this.gain(100);
   }
 
-  // Th07.exe FUN_00430c10 score term shared by cases 6 and 9 (spec §3b):
-  // `score += grazeScaledValue/10` where `grazeScaledValue =
-  // max(10, floor(graze/40)*10 + 300)` (or a min of 100 instead of 10 when
-  // `DAT_004b5e94 != 0` — PROBABLE dead, matching the DAT_004b5eXX/
-  // DAT_004ca4d8 confirmed-dead-flag cluster elsewhere in this pass, spec
-  // §2/§3a, but NOT independently confirmed for this specific address, so
-  // only the min=10 branch is implemented here). Already an exact multiple
-  // of 10, so `/10` is lossless integer division.
-  grazeScaledItemScore(graze: number): number {
+  // Th07.exe FUN_00430c10 case 6 @ 0x4317d7: player+0x23dc
+  // (DAT_004b5e94) is set on the bomb trigger in FUN_0043d9a0 and remains
+  // set through the active bomb. In that state a small Cherry is flat 100/10
+  // = 10 score; otherwise it uses floor(graze/40)*10+300, divided by 10.
+  // Case 9 uses the graze formula unconditionally, so callers leave
+  // bombActive false for that item type.
+  grazeScaledItemScore(graze: number, bombActive = false): number {
+    if (bombActive) return 10;
     const v = Math.max(10, Math.floor(graze / 40) * 10 + 300);
     return Math.trunc(v / 10);
   }

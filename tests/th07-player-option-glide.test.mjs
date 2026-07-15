@@ -121,3 +121,42 @@ test('player movement accumulates through the native float32 position fields', (
   assert.equal(player.x, 317.4002380371094);
   assert.equal(player.y, 384);
 });
+
+test('the bomb-ending tick still uses its frame-entry movement multiplier', () => {
+  const player = Object.create(Player.prototype);
+  player.unfocused = player.focused = {
+    speed: 5,
+    focusedSpeed: 2.5,
+    diagSpeed: Math.fround(5 / Math.sqrt(2)),
+    diagFocusedSpeed: Math.fround(2.5 / Math.sqrt(2))
+  };
+  player.focusHeld = false;
+  player.focusGlideFrame = 8;
+  player.focusTransition = null;
+  player.invulnFrames = 0;
+  player.invulnFrac = 0;
+  player.bombInvuln = 1;
+  player.bombTimer = 1;
+  player.bombSpeedMult = 0.4;
+  player.materializeFrame = -1;
+  player.dyingFrame = -1;
+  player.hitState = false;
+  player.deathbombMeter = 8;
+  player.fireFrame = -1;
+  player.fireFrameFrac = 0;
+  player.orbitAngle = -Math.PI / 2;
+  player.x = 100;
+  player.y = 100;
+  player.runner = { update() {} };
+  player.updatePose = () => {};
+
+  player.update({
+    held: new Set(['right', 'down']), pressed: new Set(), released: new Set()
+  });
+
+  const step = Math.fround(player.unfocused.diagSpeed * 0.4);
+  assert.equal(player.x, Math.fround(100 + step));
+  assert.equal(player.y, Math.fround(100 + step));
+  assert.equal(player.bombTimer, 0);
+  assert.equal(player.bombSpeedMult, 1, 'the reset is visible to the next tick');
+});

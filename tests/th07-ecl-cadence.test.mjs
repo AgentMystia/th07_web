@@ -314,6 +314,21 @@ test('var 10024 is the aim TOWARD the player (snapshot-then-absolute-fan idiom, 
     `fan center aims at the player (${game.enemyBullets[0].angle} vs ${expected})`);
 });
 
+test('var 10024 uses the executable pi/2 fallback at exact player overlap', () => {
+  const snapshotAim = instruction(0, 5, [f32(10004), f32(10024)]);
+  const fireAbs = instruction(0, 65, [
+    i32(6 | (6 << 16)), i32(1), i32(1), f32(4.5), f32(1.0), f32(10004), f32(0), i32(0)
+  ]);
+  const runtime = makeRuntime([[snapshotAim, fireAbs]]);
+  const game = makeHost();
+  runtime.spawnEclEnemy(game, { subId: 0, x: game.player.x, y: game.player.y });
+
+  const bullet = game.enemyBullets[0];
+  assert.equal(bullet.angle, Math.fround(Math.PI / 2));
+  assert.equal(bullet.vx, Math.fround(Math.cos(bullet.angle) * bullet.speed));
+  assert.equal(bullet.vy, bullet.speed);
+});
+
 test('random FIRE interpolates raw angle endpoints before final wrapping', () => {
   // Th07.exe FUN_0040f6c0 -> FUN_00421e90 keeps an endpoint above +pi raw
   // while interpolating aim mode 8, then wraps the constructed result. The

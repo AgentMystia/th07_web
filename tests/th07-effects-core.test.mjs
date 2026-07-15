@@ -238,13 +238,13 @@ test('effect 1 param 2 targets offset 4 with a negative turn; E/N/H use the 60-t
   assert.equal(other.effectState, 0, 'sprite=4 offset=6 not matched by param 2');
 });
 
-test('effect 1 slow-turn: first tick ~0.3+delta, stops exactly at the tick limit (H 1.3 / L ~1.563158)', () => {
+test('effect 1 slow-turn: first tick ~0.3+delta, stops exactly at the tick limit (H 1.3 / L ~1.563162)', () => {
   const scene = Object.create(StageScene.prototype);
   scene.slowRate = 1;
   scene.player = { x: 192, y: 384 };
   for (const [difficulty, delta, limit, endSpeed, firstTick] of [
     [2, 0.01666666753590107, 60, 1.3, 0.31666668],
-    [3, 0.005263158120214939, 240, 1.5631579488515854, 0.30526317]
+    [3, 0.005263158120214939, 240, 1.5631623268127441, 0.30526317]
   ]) {
     const b = makeBullet(0, { speed: 0.3, angle: 0, vx: 0.3, vy: 0 });
     b.exFlags = 0x20;

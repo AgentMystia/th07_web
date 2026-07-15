@@ -253,3 +253,53 @@ test('op142 damage shield countdown retreats on the global split clock', () => {
   runtime.tickEnemyManagerTail(host, e);
   assert.equal(e.ecl.damageShield, 1, 'fourth wall tick begins the next fractional interval');
 });
+
+test('op161 arms the bomb/Border manager pause and retreats only the boss timer', () => {
+  const sub = [instruction(0, 161, [i32(1)]), instruction(999, 0, [])];
+  const stage = { ...TH07_DATA.stages[8], ecl: makeEcl([sub]) };
+  const runtime = new StageRuntime(stage, { etama, enemy: noAnm, effect: noAnm });
+  const host = makeHost();
+  const e = runtime.spawnEclEnemy(host, { subId: 0, x: 0, y: 0, life: 1, item: -1, score: 0 });
+
+  assert.equal(e.ecl.pauseDuringBombOrBorder, true,
+    'dispatcher case 0xa0 stores arg&1 in enemy+0x2e2b bit3');
+  e.ecl.bossTimer = 10;
+  e.ecl.bossTimerPrevious = 4;
+  e.ecl.bossTimerFrac = 0;
+  runtime.tickEnemyPausedManagerClock(host, e);
+  assert.deepEqual([e.ecl.bossTimer, e.ecl.bossTimerPrevious, e.ecl.bossTimerFrac], [9, 4, 0],
+    'normal-rate FUN_00436a06 fast path changes only current');
+
+  host.slowRate = 1 / 3;
+  runtime.tickEnemyPausedManagerClock(host, e);
+  assert.equal(e.ecl.bossTimer, 8, 'slow retreat borrows on its first zero-fraction tick');
+  assert.equal(e.ecl.bossTimerPrevious, 9, 'slow path snapshots current before retreating');
+  assert.ok(Math.abs(e.ecl.bossTimerFrac - Math.fround(2 / 3)) < 1e-7);
+});
+
+test('Extra/Phantasm spell ids 118+ suppress boss collisions throughout a bomb plus one release tick', () => {
+  const stage = { ...TH07_DATA.stages[8], ecl: makeEcl([[]]) };
+  const runtime = new StageRuntime(stage, { etama, enemy: noAnm, effect: noAnm });
+  const host = makeHost();
+  host.stageNumber = 8;
+  let bombActive = true;
+  host.isBombActive = () => bombActive;
+  runtime.spellActive = true;
+  runtime.currentSpellId = 136;
+  const e = runtime.spawnEclEnemy(host, { subId: 0, x: 0, y: 0, life: 1, item: -1, score: 0 });
+  e.ecl.isBoss = true;
+
+  runtime.tickEnemyCore(host, e);
+  assert.deepEqual(
+    [e.ecl.bombCollisionSuppressed, e.ecl.bombCollisionSuppressionHold],
+    [true, 1],
+    'active high-numbered spell refreshes enemy+0x2e2b bit2 and +0x2e2c'
+  );
+  bombActive = false;
+  runtime.tickEnemyCore(host, e);
+  assert.deepEqual([e.ecl.bombCollisionSuppressed, e.ecl.bombCollisionSuppressionHold], [true, 0],
+    'first post-bomb core consumes only the one-tick hold');
+  runtime.tickEnemyCore(host, e);
+  assert.equal(e.ecl.bombCollisionSuppressed, false,
+    'the following core clears the collision-suppression bit');
+});

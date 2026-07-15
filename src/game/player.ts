@@ -11,6 +11,15 @@ import type { InputFrame } from '../core/input';
 
 export type CharacterId = 'reimuA' | 'reimuB' | 'marisaA' | 'marisaB' | 'sakuyaA' | 'sakuyaB';
 
+// Th07.exe FUN_0043a820 @ 0x43a850-0x43a86b gates FUN_0043a100 only when
+// all three predicates hold: bomb-active, character family == Marisa, and
+// shot type == B. DAT_00625625/26 are the family/type bytes, so every other
+// shot continues allocating normally during a bomb (Phantasm native slot 50
+// at PRE10433 is a ReimuA shot born 26 ticks into the active bomb).
+export function playerShotAllocationAllowed(character: CharacterId, bombActive: boolean): boolean {
+  return !bombActive || character !== 'marisaB';
+}
+
 export const CHARACTERS: Record<CharacterId, { family: 0 | 1 | 2; name: string; shtBase: string; anmKey: 'player00' | 'player01' | 'player02' }> = {
   // The deathbomb window (frames you may still bomb after being hit before
   // actually dying) is read from each character's .sht data (deathbombWindow,
@@ -32,10 +41,44 @@ const BOMB_PARAMS: Record<CharacterId, { unfocused: [number, number, number]; fo
   reimuA:  { unfocused: [140, 200, 1.0], focused: [300, 360, 0.6] },
   reimuB:  { unfocused: [140, 200, 1.0], focused: [190, 250, 0.4] },
   marisaA: { unfocused: [200, 250, 1.0], focused: [260, 310, 0.4] },
-  marisaB: { unfocused: [300, 300, 0.2], focused: [340, 390, 0.2] },
+  // Th07.exe (v1.00b) FUN_0040a910 @ 0x40acb2 writes 0.4f for Master
+  // Spark. The focused Final Spark remains 0.2f (FUN_0040af70).
+  marisaB: { unfocused: [300, 300, 0.4], focused: [340, 390, 0.2] },
   sakuyaA: { unfocused: [160, 210, 1.0], focused: [250, 290, 0.3] },
   sakuyaB: { unfocused: [160, 260, 2.0], focused: [300, 420, 1.5] }
 };
+
+// Th07.exe FUN_00407740 @ 0x407740. Each bomb form supplies one float32
+// percentage and a minimum-total Cherry loss; the helper difficulty-scales
+// the cast-time Cherry, divides both candidates by the form duration, floors
+// them to tens, and stores the larger per-frame drain at player+0x16a2c.
+const BOMB_CHERRY_DRAIN: Record<CharacterId, {
+  unfocused: [number, number]; focused: [number, number]
+}> = {
+  reimuA:  { unfocused: [0.20, 4000], focused: [0.22, 5000] },
+  reimuB:  { unfocused: [0.17, 3000], focused: [0.17, 3000] },
+  marisaA: { unfocused: [0.30, 8000], focused: [0.33, 9000] },
+  marisaB: { unfocused: [0.35, 8000], focused: [0.41, 10000] },
+  sakuyaA: { unfocused: [0.28, 6000], focused: [0.29, 6500] },
+  sakuyaB: { unfocused: [0.26, 5500], focused: [0.29, 6000] }
+};
+
+export function bombCherryDrainPerFrame(
+  character: CharacterId,
+  focused: boolean,
+  difficulty: number,
+  cherry: number,
+  duration: number
+): number {
+  const [percent, minimumTotal] = BOMB_CHERRY_DRAIN[character][focused ? 'focused' : 'unfocused'];
+  let scaled = Math.round(cherry * Math.fround(percent));
+  if (difficulty === 2) scaled = Math.trunc(scaled / 2);
+  else if (difficulty === 3) scaled = Math.trunc(scaled / 4);
+  else if (difficulty === 4 || difficulty === 5) scaled = Math.trunc(scaled / 3);
+  const byCherry = Math.trunc(scaled / duration);
+  const byMinimum = Math.trunc(minimumTotal / duration);
+  return Math.max(byCherry - byCherry % 10, byMinimum - byMinimum % 10);
+}
 
 // The game assigns the player ANM a sprite-id base of 1024; SHT sprite
 // fields are global ids (1088+ = local sprite 64+).
@@ -179,7 +222,7 @@ export class Player {
   // 3-entry array, exe-player-shot.md §2.2): at most one live laser bullet
   // per record slot id (the record's `delay` field). timer counts down each
   // frame; release/bomb/dialogue clamp it; <71 arms the ANM fade.
-  laserSlots: ({ bullet: PlayerBullet; timer: number; fading: boolean } | null)[] = [null, null, null];
+  laserSlots: ({ bullet: PlayerBullet; timer: number; fading: boolean; shot: ShtShot } | null)[] = [null, null, null];
   lives = 2;
   bombs = 3;
   power = 0;
@@ -209,7 +252,14 @@ export class Player {
   // Advances on the global split counter like the squish.
   materializeFrame = -1;
   bombTimer = 0;
+  // Th07.exe player+0x23fc: shared 40-frame post-Border cooldown. Both
+  // FUN_0043eb00 (break/cancel) and FUN_0043e620 (natural expiry) write 40;
+  // FUN_0043d9a0 decrements it before accepting a normal held-X bomb.
+  bombCooldown = 0;
   bombInvuln = 0;
+  // Th07.exe player+0x16a2c: fixed Cherry drain applied on each frame that
+  // begins with the bomb already active (the trigger frame itself is free).
+  bombCherryDrain = 0;
   // Latched from BOMB_PARAMS at cast; multiplies move speed while bombTimer>0.
   // SakuyaB legitimately exceeds 1.0. Reset to 1.0 when the bomb ends.
   bombSpeedMult = 1.0;
@@ -285,6 +335,12 @@ export class Player {
   // `rate` = global slow-motion rate: movement/orbit scale directly, the
   // player-side timers accumulate fractionally (spec-slowmo.md §3.1/§3.2).
   update(input: InputFrame, rate = 1, allowShotArm = true): void {
+    // FUN_0043d9a0/bomb VM runs before FUN_0043be00 movement. On the tick
+    // where the bomb clock reaches its duration, movement still observes the
+    // multiplier that was active at frame entry; the reset applies to the
+    // next player tick. Snapshot it before the local countdown retreats.
+    const movementSpeedMult = this.bombTimer > 0 ? this.bombSpeedMult : 1;
+    let bombEndedThisTick = false;
     this.updateFocusGlide(input.held.has('focus'), rate);
     if (this.invulnFrames > 0) {
       const rateF32 = Math.fround(rate);
@@ -307,7 +363,7 @@ export class Player {
     if (this.bombInvuln > 0) this.bombInvuln = Math.max(0, this.bombInvuln - rate);
     if (this.bombTimer > 0) {
       this.bombTimer = Math.max(0, this.bombTimer - rate);
-      if (this.bombTimer === 0) this.bombSpeedMult = 1.0;
+      bombEndedThisTick = this.bombTimer === 0;
     }
     if (this.materializeFrame >= 0) {
       // Respawn materialize (fcn.0043e170): ramp scale/alpha IN PLACE over 30
@@ -324,8 +380,9 @@ export class Player {
         this.deathbombMeter = Math.trunc(this.unfocused.deathbombWindow);
       }
     }
-    if (this.controllable) this.move(input, rate);
+    if (this.controllable) this.move(input, rate, movementSpeedMult);
     else this.lastVx = 0;
+    if (bombEndedThisTick) this.bombSpeedMult = 1.0;
     this.shooting = input.held.has('shoot') && this.controllable;
     // Shot-cycle ARM (exe FUN_0043a930): holding shoot re-arms the counter
     // to 0 only while it is DISARMED (< 0). A re-press mid-cycle does NOT
@@ -385,7 +442,7 @@ export class Player {
     }
   }
 
-  private move(input: InputFrame, rate = 1): void {
+  private move(input: InputFrame, rate = 1, speedMult = this.bombTimer > 0 ? this.bombSpeedMult : 1): void {
     const sht = this.sht;
     // Th07.exe FUN_0043be00 @ all.c:28028-28055 resolves the four direction
     // bits into a direction enum via a PRIORITY chain, not vector addition:
@@ -406,7 +463,7 @@ export class Player {
       : (this.focusHeld ? sht.focusedSpeed : sht.speed);
     // Bombs latch a per-character speed multiplier (BOMB_PARAMS); SakuyaB
     // legitimately exceeds 1.0 — NOT clamped (exe-bombs.md §2).
-    const speed = baseSpeed * (this.bombTimer > 0 ? this.bombSpeedMult : 1);
+    const speed = baseSpeed * speedMult;
     // Th07.exe (v1.00b) Player::Update clamp @ 0x43c3cc-0x43c47c reads
     // DAT_00625854/58/5c/60 = {8,16,368,416}: the player CENTER is limited
     // to x∈[8,376], y∈[16,432], inset from the 384×448 field edges.
@@ -472,7 +529,7 @@ export class Player {
     return { x: orb === 1 ? -xHalf : xHalf, y };
   }
 
-  fire(rate = 1): PlayerBullet[] {
+  fire(rate = 1, allowSpawn = true): PlayerBullet[] {
     // exe FUN_0043a820: runs while the cycle is ARMED, independent of the
     // shoot key — released cycles still fire their remaining phases.
     if (this.fireFrame < 0) return [];
@@ -483,7 +540,10 @@ export class Player {
       return [];
     }
     const out: PlayerBullet[] = [];
-    if (this.fireFrame !== this.prevFireFrame) {
+    // FUN_0043a820 keeps advancing the armed 30-frame counter when its
+    // caller suppresses allocation. Retail uses that suppression only for
+    // MarisaB while a bomb is active; StageScene supplies the exact gate.
+    if (allowSpawn && this.fireFrame !== this.prevFireFrame) {
       for (const shot of this.sht.shotsForPower(this.power)) {
         const isLaser = shot.funcs[0] === 2 || shot.funcs[0] === 3;
         if (isLaser) {
@@ -492,7 +552,23 @@ export class Player {
           // most one live beam, only while the option glide is settled in the
           // record's own focus state (funcs0=2 ⇒ unfocused, 3 ⇒ focused).
           const slotId = shot.delay;
-          if (slotId < 0 || slotId > 2 || this.laserSlots[slotId]) continue;
+          if (slotId < 0 || slotId > 2) continue;
+          const existing = this.laserSlots[slotId];
+          if (existing) {
+            // FUN_00438db0/FUN_00438ef0 cache the exact shooter-record
+            // pointer at player+0x23e0[slotId]. A power-bracket change swaps
+            // that pointer even when the new record describes the same beam;
+            // native then requests interrupt 1 on the old owner, clears the
+            // owner slot, and returns without spawning until the next table
+            // pass. Keeping only "slot occupied" left Extra's pre-power-32
+            // focused beam alive 86 frames too long (native PRE1184 age 21,
+            // web age 107) and flipped its even-frame hit cadence.
+            if (existing.shot !== shot) {
+              existing.bullet.fadePending = true;
+              this.laserSlots[slotId] = null;
+            }
+            continue;
+          }
           const settled = this.focusGlideFrame >= GLIDE_FRAMES;
           const wantFocused = shot.funcs[0] === 3;
           if (!settled || this.focusHeld !== wantFocused) continue;
@@ -508,7 +584,12 @@ export class Player {
           }
           // funcs0=2 seeds the countdown from the record's interval field
           // (130-330 by power); funcs0=3 seeds 999 (held indefinitely).
-          this.laserSlots[slotId] = { bullet: b, timer: wantFocused ? 999 : Math.max(1, shot.interval), fading: false };
+          this.laserSlots[slotId] = {
+            bullet: b,
+            timer: wantFocused ? 999 : Math.max(1, shot.interval),
+            fading: false,
+            shot
+          };
           out.push(b);
           continue;
         }
@@ -621,7 +702,7 @@ export class Player {
     // meter must be nonzero — this single gate is what closes bombing during
     // the squish (meter 0), the materialize (zeroed each frame) and past the
     // end of the deathbomb window.
-    if (this.bombs <= 0 || this.bombTimer > 0 || this.deathbombMeter <= 0) return false;
+    if (this.bombs <= 0 || this.bombTimer > 0 || this.bombCooldown > 0 || this.deathbombMeter <= 0) return false;
     this.bombs--;
     this.hitState = false; // deathbomb rescue
     // Every successful bomb bumps the meter min(N, meter+6) — a no-op at
@@ -632,6 +713,7 @@ export class Player {
     const [duration, invulnTotal, speedMult] = BOMB_PARAMS[this.character][this.focusHeld ? 'focused' : 'unfocused'];
     this.bombTimer = duration;
     this.bombInvuln = invulnTotal;
+    this.bombCherryDrain = 0;
     this.bombSpeedMult = speedMult;
     this.bombFocused = this.focusHeld;
     return true;

@@ -134,6 +134,43 @@ test('Stage 6 entry 22 follows native MSG timestamps while timeline op9 holds', 
     'priority-12 items consume startDialogue forced-collect state on the native AUX-0x40 frame');
 });
 
+test('MSG tail homes dialogue-start late drops only after their first item tick', async () => {
+  const mod = await loadEngine();
+  const scene = new mod.StageScene(
+    makeStubAssets(mod), makeStubAudio(), 5, 'reimuA', 8, null, 1
+  );
+  scene.mode = 'arcade';
+  scene.updateEnemies = () => {};
+  scene.runtime.isTimelineComplete = () => false;
+  scene.playerObj.x = 100;
+  scene.playerObj.y = 400;
+  scene.playerObj.power = 0;
+  scene.playerObj.materializeFrame = -1;
+  scene.dialogue = {
+    blocking: false,
+    resumeTicket: false,
+    done: false,
+    update() {}
+  };
+  scene.spawnItem('power', 200, 100);
+  const item = scene.items[0];
+  const source = new mod.ReplayInputSource();
+
+  scene.update(source.frame(0));
+  assert.deepEqual(
+    [item.x, item.y, item.age, item.state, item.vx, item.vy],
+    [200, Math.fround(100 + Math.fround(-2.2)), 1, 1, 0, Math.fround(-0.5)],
+    'priority-12 applies the state-0 fall before priority-13 FUN_00431d10'
+  );
+
+  const before = Math.hypot(item.x - scene.playerObj.x, item.y - scene.playerObj.y);
+  scene.update(source.frame(0));
+  const after = Math.hypot(item.x - scene.playerObj.x, item.y - scene.playerObj.y);
+  assert.ok(after < before, 'the following item tick consumes the homing latch');
+  assert.deepEqual([item.age, item.state, item.vx, item.vy], [2, 1, 0, Math.fround(-0.5)],
+    'the live MSG tail resets the velocity again after that tick');
+});
+
 test('MSG op4 retains native first-tick, Z-age, and CTRL timestamp semantics', async () => {
   const mod = await loadEngine();
   const rpy = new mod.Rpy(readFileSync('tests/replays/th7_udFe25.rpy'));

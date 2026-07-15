@@ -731,4 +731,11 @@ export class AnmRunner {
   spriteSize(): { w: number; h: number } | null {
     return this.rect ? { w: this.rect.w, h: this.rect.h } : null;
   }
+
+  // Native bomb VMs use the live wrapper scale as gameplay geometry input
+  // (Master Spark point spacing = current sprite height * scaleY / 5).
+  // Keep this read-only so callers cannot bypass authored ANM updates.
+  currentScale(): { x: number; y: number } {
+    return { x: this.scaleX, y: this.scaleY };
+  }
 }
