@@ -44,13 +44,13 @@ export class Renderer {
 
   constructor(canvas: HTMLCanvasElement, options: RendererOptions = {}) {
     this.canvas = canvas;
-    this.requestedDesynchronized = options.desynchronized ?? true;
-    // desynchronized: let the browser pipeline Canvas 2D to the display
-    // compositor with lower latency (Chrome/GL backends) — a direct cut to
-    // input-to-photon. alpha:false: the playfield is fully redrawn each frame
-    // (clear + draw), so the page-level alpha channel is unused; skipping it
-    // saves the per-pixel page blend. Both are hints — unsupported browsers
-    // ignore them and behave exactly as before.
+    // desynchronized defaults OFF: Chrome's low-latency Canvas hint triggers a
+    // compositor failure (Stage-5 spell-card background turns the screen
+    // invisible/flickering). Opt in explicitly (?desync=1) only for the
+    // latency-probe A/B test. alpha:false stays — the playfield is fully
+    // redrawn each frame (clear + draw), so the page alpha channel is unused
+    // and skipping it saves the per-pixel page blend.
+    this.requestedDesynchronized = options.desynchronized ?? false;
     const ctx = canvas.getContext('2d', {
       desynchronized: this.requestedDesynchronized,
       alpha: false

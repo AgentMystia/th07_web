@@ -70,10 +70,12 @@ async function boot(): Promise<void> {
   const isTest = params.get('test') === '1';
   const latencyEnabled = isTest && params.get('latency') === '1';
   const perfEnabled = isTest && params.get('perf') === '1' && !latencyEnabled;
-  // desync=0 is a test-only A/B seam. Retail always requests Chrome's
-  // low-latency desynchronized Canvas path and records whether it was accepted.
+  // desynchronized Canvas (Chrome low-latency hint) causes composition
+  // failures: during a Stage-5 spell card the spell background makes the
+  // whole screen invisible and flicker. Default OFF; opt in with ?desync=1
+  // only for the latency-probe A/B test (recorded via contextAttributes()).
   const renderer = new Renderer(canvas, {
-    desynchronized: !(isTest && params.get('desync') === '0')
+    desynchronized: isTest && params.get('desync') === '1'
   });
   renderer.clear('#000');
   renderer.text('Now Loading...', 270, 230, { size: 16 });
