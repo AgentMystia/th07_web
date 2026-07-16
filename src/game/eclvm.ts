@@ -124,7 +124,10 @@ export function advanceBulletExBehavior(bullet: EnemyBullet, activationRate = 1)
       case 0x800:
         bullet.exFlags |= slot.opcode;
         bullet.exBounce = {
-          speed: slot.f0 <= -999 ? bullet.speed : slot.f0,
+          // Native BulletManager.cpp:396 RunCommands 0x400/0x800: post-bounce
+          // speed uses cmd->speed when >= 0, else preserves current speed (the
+          // -999 sentinel is the DirChange angle convention, not bounce speed).
+          speed: slot.f0 >= 0 ? slot.f0 : bullet.speed,
           maxTimes: slot.arg3
         };
         bullet.exBounceTimes = 0;
@@ -992,7 +995,10 @@ export class StageRuntime {
     const s = e.ecl;
     if (s.moveMode === 2 && s.interp) {
       const m = s.interp;
-      m.left = Math.max(0, m.left - rate);
+      // Native EclManager.cpp:2036 decrements the mode-2 interp timer by a plain
+      // `moveInterpTimer--` once per ECL tick (NOT rate-scaled); only the motion
+      // accumulation is scaled by effectiveFramerateMultiplier (integrateEnemyPosition).
+      m.left = Math.max(0, m.left - 1);
       // Th07.exe FUN_0040f6c0 @ 0x415b7d-0x415ed8 stages progress,
       // eased displacement, absolute target, per-axis delta, and heading
       // through float32 locals/fields.  Keeping the tiny intermediate target
@@ -1019,7 +1025,10 @@ export class StageRuntime {
       // FUN_0048166a consumes the controller vector after the internal
       // mirror flip, before FUN_0041d050 applies the second flip on screen
       // (all.c:7152-7165). Keep this separate from vars 10063..10065.
-      if (vx !== 0 || vy !== 0) s.heading = Math.fround(Math.atan2(vy, vx));
+      // Native EclManager.cpp:2083 writes enemy->angle = atan2f(axisSpeed.y,
+      // axisSpeed.x) unconditionally every mode-2 dispatch frame (atan2(0,0)=0);
+      // do not retain a stale heading on a zero-displacement frame.
+      s.heading = Math.fround(Math.atan2(vy, vx));
       if (m.left <= 0) {
         // Mode-2 completion snaps inside the core even on an allocation-only
         // tick, then clears the velocity before the manager integrator.
@@ -1046,10 +1055,9 @@ export class StageRuntime {
       const orbitY = Math.fround(Math.sin(s.orbitAngle) * s.orbitSpeed);
       s.axisSpeed.x = Math.fround(orbitX + Math.fround(s.orbitTarget.x) - Math.fround(e.x));
       s.axisSpeed.y = Math.fround(orbitY + Math.fround(s.orbitTarget.y) - Math.fround(e.y));
-      if (s.axisSpeed.x !== 0 || s.axisSpeed.y !== 0) {
-        s.heading = Math.fround(Math.atan2(s.axisSpeed.y, s.axisSpeed.x));
-      }
-      if (s.orbitDuration > 0 && (s.orbitLeft -= rate) < 1) s.moveMode = 0;
+      // Native EclManager.cpp:2007: unconditional atan2f (no zero-guard).
+      s.heading = Math.fround(Math.atan2(s.axisSpeed.y, s.axisSpeed.x));
+      if (s.orbitDuration > 0 && (s.orbitLeft -= 1) < 1) s.moveMode = 0;
     } else if (s.moveMode === 1) {
       // Th07.exe FUN_0040f6c0 mode-1 branch (all.c:7111-7122) rounds every
       // store: FUN_0042fff0(angle, rate*angvel) takes its delta as an f32
@@ -1068,7 +1076,7 @@ export class StageRuntime {
         z: 0
       };
       s.heading = s.angle;
-      if (s.orbitDuration > 0 && (s.orbitLeft -= rate) < 1) s.moveMode = 0;
+      if (s.orbitDuration > 0 && (s.orbitLeft -= 1) < 1) s.moveMode = 0;
     }
   }
 

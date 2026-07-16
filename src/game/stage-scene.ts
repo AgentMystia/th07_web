@@ -1053,7 +1053,11 @@ export class StageScene implements GameHost {
     // slowmo advances the fraction only.
     if (this.rankSurvivalAdvanced) {
       const interval = 2400 - Math.trunc(this.playerObj.lives) * 240;
-      if (this.rankSurvivalTicks > 0 && this.rankSurvivalTicks % interval === 0) {
+      // Native EnemyManager.cpp:734 gates the whole survival-rank block
+      // (including IncreaseSubrank(100)) on !g_Gui.HasCurrentMsgIdx(). A boundary
+      // that falls inside a dialogue window is simply missed, not deferred.
+      if (this.rankSurvivalTicks > 0 && this.rankSurvivalTicks % interval === 0 &&
+          !this.isDialogueActive()) {
         this.adjustRank(100);
       }
     }
@@ -1088,9 +1092,18 @@ export class StageScene implements GameHost {
       bombBonus = this.playerObj.bombs * 400000;
       internal += playerBonus + bombBonus;
     }
-    const MULT_BY_DIFFICULTY = [0.5, 1.0, 1.2, 1.5, 2.0, 1.0];
-    const mult = MULT_BY_DIFFICULTY[this.difficulty] ?? 1.0;
-    internal = Math.trunc(internal * mult);
+    // Native Gui.cpp:1374-1391 integer difficulty multipliers: Phantasm <<= 1
+    // (was 1.0 — halving the clear bonus); Hard *12/10 and Lunatic *15/10 are
+    // integer ops, not float 1.2/1.5 (avoids a ±1 round mismatch at scale).
+    let mult = 1.0;
+    switch (this.difficulty) {
+      case 0: internal = Math.trunc(internal / 2); mult = 0.5; break;         // Easy /= 2
+      case 1: break;                                                           // Normal
+      case 2: internal = Math.trunc((internal * 12) / 10); mult = 1.2; break;  // Hard *12/10
+      case 3: internal = Math.trunc((internal * 15) / 10); mult = 1.5; break;  // Lunatic *15/10
+      case 4: internal = internal * 2; mult = 2.0; break;                      // Extra <<= 1
+      case 5: internal = internal * 2; mult = 2.0; break;                      // Phantasm <<= 1
+    }
     // Player Penalty (FUN_00429446 @ all.c:18329-18334): the run-state
     // starting-lives byte scales the whole bonus — 3 -> *5/10, 4 -> (x<<1)/10.
     // This replaced a continues-based guess; the exe reads only this byte.
@@ -3477,7 +3490,7 @@ export class StageScene implements GameHost {
     // particular a contact during invuln must NOT break the border.
     // (Breaking it before this check let one absorbed hit's invulnerability
     // frames chain-eat every subsequent border the instant it started.)
-    if (p.invulnFrames > 0 || p.bombInvuln > 0 || p.hitState) return;
+    if (!p.alive || p.invulnFrames > 0 || p.bombInvuln > 0) return;
     if (this.breakBorder(sourceBullet)) return;
     // Replay-divergence forensics: every committed hit records what struck
     // the player and, for bullets, its spawn provenance. Ring-capped.
@@ -3582,9 +3595,17 @@ export class StageScene implements GameHost {
       // (player+0x2408), the enemy is wholly frozen for this pass except for
       // one reverse tick of its +0x2bc4 boss-timer triple. In particular it
       // publishes no homing target and absorbs no player shot this frame.
+      // Native EnemyManager.cpp:767-773 + 1204-1206: during op161 + (bomb OR
+      // playerState != PLAYER_STATE_ALIVE) the enemy is frozen and the boss/spell
+      // timer is NET-ZERO — `timer--` at :771 then the shared `timer++` at :1206
+      // ⇒ the spell timer FREEZES (not retreats). The engine's per-enemy advance
+      // (tickEnemyManagerTail below) is skipped by this `continue`, so we simply
+      // must not retreat either. Condition widened from bomb/border to also cover
+      // miss/invuln/respawn — native `playerState != ALIVE` includes INVULNERABLE,
+      // BORDER, DEAD, SPAWNING (紫's 「弾幕結界」 etc.).
       if (e.ecl.pauseDuringBombOrBorder &&
-          (this.bombActiveThisFrame || this.cherry.borderActive)) {
-        this.runtime.tickEnemyPausedManagerClock(this, e);
+          (this.bombActiveThisFrame || this.cherry.borderActive ||
+           !this.playerObj.alive || this.playerObj.invulnFrames > 0)) {
         continue;
       }
       e.frame++;
@@ -4018,24 +4039,42 @@ export class StageScene implements GameHost {
     const maxTimes = Math.max(1, d.maxTimes | 0);
     const times = b.dirTimes;
     const elapsed = b.exDirElapsed + b.exDirFrac;
+    const rateF32 = Math.fround(this.slowRate);
     let speed: number;
     if (b.exDirElapsed >= interval) {
       b.dirTimes = times + 1;
       if (b.dirTimes >= maxTimes) {
         b.exFlags &= mode === 'relative' ? ~0x40 : mode === 'absolute' ? ~0x100 : ~0x80;
       }
-      if (mode === 'relative') b.angle = normalizeAngle(b.angle + d.angle);
-      else if (mode === 'absolute') b.angle = d.angle;
-      else b.angle = Math.atan2(this.player.y - b.y, this.player.x - b.x) + d.angle;
+      // Native BulletManager.cpp:763 (relative) is a plain f32 `angle += d.angle`
+      // with NO wrap — the heading accumulates unbounded (matching the f32 LHS
+      // store-back). :780 (absolute) assigns d.angle. :827 (aimed) is
+      // AddNormalizeAngle(AngleToPlayer, d.angle), where AngleToPlayer returns +π/2
+      // for the zero vector (not atan2's 0).
+      if (mode === 'relative') {
+        b.angle = Math.fround(Math.fround(b.angle) + Math.fround(d.angle));
+      } else if (mode === 'absolute') {
+        b.angle = Math.fround(d.angle);
+      } else {
+        const dx = Math.fround(this.player.x - b.x);
+        const dy = Math.fround(this.player.y - b.y);
+        const aim = dx === 0 && dy === 0
+          ? Math.fround(Math.PI / 2)
+          : Math.fround(Math.atan2(dy, dx));
+        b.angle = normalizeNativeAngleF32(aim, Math.fround(d.angle));
+      }
       b.speed = d.newSpeed;
       speed = b.speed;
       b.exDirElapsed = 0;
       b.exDirFrac = 0;
     } else {
-      speed = b.speed - (elapsed * b.speed) / interval;
+      speed = Math.fround(b.speed - (elapsed * b.speed) / interval);
     }
-    b.vx = Math.cos(b.angle) * speed * this.slowRate;
-    b.vy = Math.sin(b.angle) * speed * this.slowRate;
+    // FUN_004074e0 AngleToVector: cos/sin and the rate-scaled speed are f32-staged
+    // before the velocity write (mirrors the speed-ramp path above).
+    const scaledSpeed = Math.fround(Math.fround(speed) * rateF32);
+    b.vx = Math.fround(Math.fround(Math.cos(b.angle)) * scaledSpeed);
+    b.vy = Math.fround(Math.fround(Math.sin(b.angle)) * scaledSpeed);
     b.exDirFrac += this.slowRate;
     while (b.exDirFrac >= 1) {
       b.exDirFrac -= 1;
@@ -4245,6 +4284,11 @@ export class StageScene implements GameHost {
   // a width-sized nub around the midpoint during grow/shrink. Graze pads
   // the box by a flat 48 (DAT_0048eb94).
   private checkLaserCollision(l: EnemyLaser, geometryState = l.state): 'miss' | 'graze' | 'hit' {
+    // Player::CalcLaserHitbox (Player.cpp:1107-1173) returns 0 (no hit, no graze,
+    // no border break) whenever playerState != PLAYER_STATE_ALIVE. In engine terms
+    // that is !alive (deathbomb window / death squish / respawn materialize); the
+    // 240f invuln window is alive and is still gated below via onPlayerHit.
+    if (!this.playerObj.alive) return 'miss';
     const inGrow = l.state === 0;
     if (inGrow && l.phaseFrame < l.telegraphDelay) return 'miss';
     if (l.state === 2 && l.phaseFrame >= l.shrinkCutoff) return 'miss';
@@ -4289,8 +4333,12 @@ export class StageScene implements GameHost {
     // Hoisting the predicate froze it at the frame-entry power and made
     // full-power conversions start homing one frame late (th7_udMt01 st6
     // collect#1, oracle rf919 vs web rf920).
-    const pocActive = () => p.alive
-      && (p.power >= 128 || this.difficulty > 3)
+    // Native ItemManager.cpp:195 has NO playerState gate on the PoC predicate
+    // (state==1 || ((power>=128 || diff>=4) && y<pocY) || hasBorder): items keep
+    // homing during the death/respawn window. Only the collection gate below
+    // (CalcItemBoxCollision, ALIVE/INVULNERABLE/BORDER-only) is state-gated.
+    const pocActive = () =>
+      (p.power >= 128 || this.difficulty > 3)
       && p.y < sht.pocLineY;
     const rate = Math.fround(this.slowRate);
     for (const it of this.items) {

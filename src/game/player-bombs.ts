@@ -308,7 +308,9 @@ export class BombRunner {
           // Persistent detonation landmine (exe §4.4) — set once, then the
           // slot is never revisited; the orb keeps coasting visually.
           this.engine.set(slotId, orb.x, orb.y, 256, 256, 400);
-          ctx.addBulletClearRegion(orb.x, orb.y, 32, Math.fround(10 / 3), 15);
+          // Native BombData.cpp:444 SpawnBombEffect(.., 32.0f, 6.6666665f, 15, ..)
+          // — detonation clear-circle grows at 20/3 per frame (was 10/3, half-rate).
+          ctx.addBulletClearRegion(orb.x, orb.y, 32, Math.fround(20 / 3), 15);
           ctx.playSfx(15);
           ctx.startScreenShake(16, 8, 0);
           ctx.spawnParticles(6, orb.x, orb.y, 12, 0xffffffff);

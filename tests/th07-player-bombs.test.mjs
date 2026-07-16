@@ -101,7 +101,7 @@ test('ReimuA publishes r128 clear circles only while each orb is in state 1', ()
     f.clearRegions.slice(-2).map(({ radius, growth, frames }) => ({ radius, growth, frames })),
     [
       { radius: 128, growth: 0, frames: 0 },
-      { radius: 32, growth: Math.fround(10 / 3), frames: 15 }
+      { radius: 32, growth: Math.fround(20 / 3), frames: 15 }
     ]
   );
   f.frame = 82;
