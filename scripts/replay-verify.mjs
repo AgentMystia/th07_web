@@ -173,6 +173,16 @@ for (let i = 0; i < rpy.stages.length; i++) {
             cherry: scene.cherry.cherry,
             hit: scene.playerObj.hitState,
             invuln: scene.playerObj.invulnFrames
+            ,bossHp: scene.runtime.bossSlots?.[0]?.hp ?? null
+            ,bossTimer: scene.runtime.bossSlots?.[0]?.ecl?.bossTimer ?? null
+            ,bossSub: scene.runtime.bossSlots?.[0]?.ecl?.ctx?.subId ?? null
+            ,bossCtxTime: scene.runtime.bossSlots?.[0]?.ecl?.ctx?.time ?? null
+            ,bossX: scene.runtime.bossSlots?.[0]?.x ?? null
+            ,bossY: scene.runtime.bossSlots?.[0]?.y ?? null
+            ,bossDamage: scene.runtime.bossSlots?.[0]?.damageThisFrame ?? null
+            ,bossTimerThreshold: scene.runtime.bossSlots?.[0]?.ecl?.timerCallbackThreshold ?? null
+            ,bossDeathCallback: scene.runtime.bossSlots?.[0]?.ecl?.deathCallbackSub ?? null
+            ,dialogue: scene.dialogue ? { idx: scene.dialogue.idx ?? null, time: scene.dialogue.time ?? null, waitAge: scene.dialogue.waitAge ?? null, done: scene.dialogue.done } : null
           })
         );
       }
@@ -193,13 +203,29 @@ for (let i = 0; i < rpy.stages.length; i++) {
   // the same kind during one tick collapse to one frame marker. The harness
   // mirrors that per-frame de-duplication. Exact arrays are a PASS condition;
   // the ±3-frame count remains diagnostic context only.
+  //
+  // The aux column's alignment differs per recording environment (aux[i]
+  // describes tick i or i-1 — see detectAuxAlignment in src/formats/rpy.ts);
+  // infer it once per stage before comparing. An ambiguous vote is reported
+  // and falls back to raw indices, which cannot PASS spuriously (exactness
+  // still gates it).
+  let auxAlignment;
+  try {
+    auxAlignment = mod.detectAuxAlignment(stage, [
+      { bit: mod.RPY_AUX_BITS.enemyKill, frames: r.killFrames },
+      { bit: mod.RPY_AUX_BITS.itemCollect, frames: r.collectFrames },
+      { bit: mod.RPY_AUX_BITS.playerHit, frames: r.playerHitFrames }
+    ]);
+  } catch (e) {
+    auxAlignment = { offset: 0, prefixByOffset: null, ambiguous: e.message };
+  }
   const alignment = {};
   for (const [name, bit] of [
     ['kills', mod.RPY_AUX_BITS.enemyKill],
     ['collects', mod.RPY_AUX_BITS.itemCollect],
     ['playerHits', mod.RPY_AUX_BITS.playerHit]
   ]) {
-    const oracle = mod.auxEventFrames(stage, bit);
+    const oracle = mod.auxEventFrames(stage, bit, auxAlignment.offset);
     const ourFrames = name === 'kills'
       ? r.killFrames
       : name === 'collects'
@@ -308,6 +334,7 @@ for (let i = 0; i < rpy.stages.length; i++) {
     deaths: r.deaths,
     bombs: r.bombs,
     hits: r.hits,
+    auxAlignment,
     alignment,
     rngBudget,
     impliedDeaths: implied,
@@ -318,6 +345,13 @@ for (let i = 0; i < rpy.stages.length; i++) {
 
   console.log(`\nstage ${stage.stage}: ${args.ghost ? 'GHOST (diagnostic-only)' : pass ? 'PASS' : 'FAIL'}  ` +
     `(${r.framesRun}/${r.framesAvailable} frames, ${Math.round(r.wallMs)}ms)`);
+  console.log(
+    auxAlignment.ambiguous
+      ? `  aux alignment: AMBIGUOUS (${auxAlignment.ambiguous}) — comparing at raw indices`
+      : `  aux alignment: offset ${auxAlignment.offset} ` +
+        `(${auxAlignment.offset === 1 ? 'recorder-lagged' : 'recorder-synchronous'}; ` +
+        `exact-prefix ${auxAlignment.prefixByOffset[0]}@0 vs ${auxAlignment.prefixByOffset[1]}@1)`
+  );
   for (const [name, a] of Object.entries(alignment)) {
     console.log(
       `  ${name}: oracle ${a.oracle}, ours ${a.ours}, exact ${a.exact ? 'yes' : 'NO'}, ` +

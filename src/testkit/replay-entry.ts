@@ -4,7 +4,7 @@
 // the StageScene bundle sees). Not imported by src/main.ts — ships nothing.
 export { StageScene } from '../game/stage-scene';
 export type { RunCarry } from '../game/stage-scene';
-export { Rpy, RPY_BITS, RPY_CHARACTERS, RPY_AUX_BITS, auxEventFrames } from '../formats/rpy';
+export { Rpy, RPY_BITS, RPY_CHARACTERS, RPY_AUX_BITS, auxEventFrames, detectAuxAlignment } from '../formats/rpy';
 export { ReplayInputSource } from '../core/replay-input';
 export {
   applyReplayStageSnapshot,

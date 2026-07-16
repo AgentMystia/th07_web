@@ -41,7 +41,10 @@ export const RPY_BITS = {
 // 0x8 @28928 (border start, FUN_0043e890 region), 0x10 @28994 (border
 // break/end), 0x20 @13887/14351/14360 (enemy kill, incl. sweeps),
 // 0x40 @22016 (item collected), 0x1 @28486 (border-adjacent, PROBABLE),
-// 0x100 @29442 (DAT_00625620 flag, dialogue-adjacent, PROBABLE).
+// 0x100 @29442 (DAT_00625620, a latched flag consumed each tick at
+// scheduler prio 6; observed as sparse single-tick pulses — 1-3 per stage in
+// the fixture, absent from most files — NOT a dialogue window; setter not
+// visible in the decompile, unidentified).
 export const RPY_AUX_BITS = {
   playerHit: 0x0002,
   bomb: 0x0004,
@@ -51,16 +54,73 @@ export const RPY_AUX_BITS = {
   itemCollect: 0x0040
 };
 
-// Frame indices in a stage's aux stream where the given event bit is set.
-export function auxEventFrames(stage: RpyStage, bit: number): number[] {
+// Engine frames in a stage's aux stream where the given event bit is set.
+//
+// `auxOffset` is the recording environment's aux-column alignment: the aux
+// word at record index i describes engine tick `i - auxOffset`. Two
+// conventions exist in real files (evidence: native Wine+gdb playback traces
+// of the SAME patched Th07.exe v1.00b, 2026-07-16):
+//
+//   offset 1 ("recorder-lagged", the shipped v1.00b loop): the recorder tick
+//     (FUN_0043fc40, scheduler priority 16) advances its pointer then writes
+//     {input, aux}, while the aux word is cleared at priority 6
+//     (FUN_0043fbd0) and event bits are OR'd during world-sim (prio 7-0xf) —
+//     record tick t lands in slot t+1, and the input latched at prio 16
+//     drives the NEXT tick, so input[i] drives tick i but aux[i] holds tick
+//     i-1's events. th7_udYo01: first kill completes during native tick 600
+//     (/tmp/yo-kill-native2.log) with the kill bit at record index 601.
+//   offset 0 ("recorder-synchronous"): files recorded under a loop with no
+//     input latch delay (vpatch-style limiters used by scoreplayers) carry
+//     aux[i] describing tick i. th7_udFe25 (golden fixture): first kill
+//     completes during native tick 610 (/tmp/fe25-spawn.log, hp 2->0 across
+//     frame-BP labels 610->611) with the kill bit at record index 610.
+//
+// The header carries no marker for this (all known files stamp version
+// 0x1100); use detectAuxAlignment() to infer it per stage.
+export function auxEventFrames(stage: RpyStage, bit: number, auxOffset = 0): number[] {
   const out: number[] = [];
   // Frame 0's aux word can hold uninitialized heap garbage (0xCDCD in the
   // shipped demo replays) — the context struct is cleared on the first
   // stage tick, not at allocation.
   for (let f = 1; f < stage.auxFlags.length; f++) {
-    if (stage.auxFlags[f] & bit) out.push(f);
+    if (stage.auxFlags[f] & bit) out.push(f - auxOffset);
   }
   return out;
+}
+
+// Infers a stage's aux-column alignment (see auxEventFrames) by scoring the
+// two candidate offsets against the simulation's own event streams and
+// keeping the one with the longer exact leading agreement, summed across
+// streams. This is metadata inference, not tolerance: the chosen offset must
+// be a single whole-stage constant, the alternative loses by construction on
+// any healthy stream (hundreds of events), and a genuine engine-timing
+// regression cannot hide in it — a global 1-frame shift would flip the
+// detected offset of the committed golden fixture, which the test gate pins
+// to 0 (tests/th07-rpy-aux-alignment.test.mjs). Throws when the vote is not
+// decisive rather than guessing.
+export function detectAuxAlignment(
+  stage: RpyStage,
+  ourEvents: ReadonlyArray<{ bit: number; frames: ReadonlyArray<number> }>
+): { offset: 0 | 1; prefixByOffset: [number, number] } {
+  const prefixFor = (offset: 0 | 1): number => {
+    let total = 0;
+    for (const { bit, frames } of ourEvents) {
+      const oracle = auxEventFrames(stage, bit, offset);
+      const n = Math.min(oracle.length, frames.length);
+      let p = 0;
+      while (p < n && oracle[p] === frames[p]) p++;
+      total += p;
+    }
+    return total;
+  };
+  const prefixByOffset: [number, number] = [prefixFor(0), prefixFor(1)];
+  if (prefixByOffset[0] === prefixByOffset[1]) {
+    throw new Error(
+      `T7RP stage ${stage.stage} aux alignment is ambiguous ` +
+        `(exact-prefix score ${prefixByOffset[0]} at both offsets)`
+    );
+  }
+  return { offset: prefixByOffset[0] > prefixByOffset[1] ? 0 : 1, prefixByOffset };
 }
 
 export interface RpyStage {
