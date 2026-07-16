@@ -496,9 +496,10 @@ export class BombRunner {
     const f = ctx.frame;
     // Fixed 96-slot pool (exe 0x60 slots, stride 0x1428). Knives that fly
     // off-screen FREE their slot, and while the spawn window is open the
-    // 5-per-frame budget refills free slots (all.c:4847-4872) — the vanilla
-    // look is a continuous knife hose replenishing for a full second, not
-    // one 96-knife burst.
+    // 5-per-frame budget refills free slots (BombData.cpp:1225-1247) — the
+    // vanilla look is a continuous knife hose replenishing for a full
+    // second, not one 96-knife burst. Native arming stores every field
+    // through float32 (constants _DAT_0048eab0/ecb4/eab4 family).
     if (this.actors.length === 0) {
       for (let i = 0; i < 96; i++) {
         this.actors.push({ x: 0, y: 0, vx: 0, vy: 0, angle: 0, speed: 0, accel: 0, turnRate: 0, state: 0, age: 0 });
@@ -510,14 +511,17 @@ export class BombRunner {
         const k = this.actors[i];
         if (k.state !== 0) continue;
         budget--;
-        k.angle = ctx.rng.range(TAU) - Math.PI;
-        k.speed = ctx.rng.range(6) + 5.5;
-        k.accel = ctx.rng.range(0.1) + 0.1;
-        k.turnRate = ctx.rng.range(0.0628) - 0.0314;
-        k.x = this.castX + Math.cos(k.angle) * 24;
-        k.y = this.castY + Math.sin(k.angle) * 24;
+        k.angle = Math.fround(ctx.rng.range(NATIVE_TAU_F32) - NATIVE_PI_F32);
+        k.speed = Math.fround(ctx.rng.range(Math.fround(6)) + Math.fround(5.5));
+        k.accel = Math.fround(ctx.rng.range(Math.fround(0.1)) + Math.fround(0.1));
+        k.turnRate = Math.fround(ctx.rng.range(Math.fround(0.06283186)) - Math.fround(0.03141593));
+        const vx0 = Math.fround(Math.cos(k.angle) * 24);
+        const vy0 = Math.fround(Math.sin(k.angle) * 24);
+        k.x = Math.fround(this.castX + vx0);
+        k.y = Math.fround(this.castY + vy0);
         k.vx = k.vy = 0;
         k.state = 1;
+        k.age = 0;
         this.engine.slots[i].hitTally = 0;
         this.knifeFx[i] = ctx.fx.spawnHandle({
           scriptId: 5 + (i & 1),
@@ -530,21 +534,38 @@ export class BombRunner {
     }
     this.actors.forEach((k, i) => {
       if (k.state === 0) return;
+      // Native BombData.cpp:1242-1247: a knife armed this pass hits the
+      // `continue` and performs NO update until the next frame.
+      if (k.age === 0) {
+        k.age = 1;
+        return;
+      }
+      // Native BombData.cpp:1249-1255: curve and accel advance UNSCALED
+      // every frame (only the position add is rate-scaled), and the angle
+      // wraps through AddNormalizeAngle.
+      k.angle = normalizeNativeAngleF32(k.angle, k.turnRate);
+      k.speed = Math.fround(k.speed + k.accel);
+      k.vx = Math.fround(Math.cos(k.angle) * k.speed);
+      k.vy = Math.fround(Math.sin(k.angle) * k.speed);
       const slot = this.engine.slots[i];
-      k.angle += k.turnRate * ctx.rate;
-      k.speed += k.accel * ctx.rate;
       if (slot.hitTally < 30) {
-        k.vx = Math.cos(k.angle) * k.speed;
-        k.vy = Math.sin(k.angle) * k.speed;
-        k.x += k.vx * ctx.rate;
-        k.y += k.vy * ctx.rate;
+        const rateF32 = Math.fround(ctx.rate);
+        k.x = Math.fround(k.x + Math.fround(k.vx * rateF32));
+        k.y = Math.fround(k.y + Math.fround(k.vy * rateF32));
+        // Native BombData.cpp:1260-1262 SpawnBombEffect(pos, 32.0f, 0, 0):
+        // every un-hit knife publishes a one-frame r32 bullet-clear circle
+        // each frame (the port previously had none).
+        ctx.addBulletClearRegion(k.x, k.y, 32, 0, 0);
         this.engine.set(i, k.x, k.y, 24, 24, 10);
       } else if (this.knifeFx[i]) {
         // 30 damage banked: the knife freezes and its ANM swaps to the
-        // impact script 0x460 (all.c:4897-4899), same as the focused form.
+        // impact script 0x460 (BombData.cpp:1268-1271), same as the
+        // focused form (which also emits a single pink burst particle —
+        // the unfocused branch emits none).
         this.knifeFx[i]!.setScript(96);
         this.knifeFx[i] = null;
       }
+      // Native culls on IsInBounds(64,64) == 0 (BombData.cpp:1273-1277).
       if (k.x < -32 || k.x > 416 || k.y < -32 || k.y > 480) {
         k.state = 0; // frees the slot for the spawner (and culls the fx)
         this.knifeFx[i] = null;
@@ -557,79 +578,105 @@ export class BombRunner {
   // 96 knives in a deterministic ring (pairs every 2 frames, frames
   // 20-114) anchored to the LIVE player at spawn; fly 30 frames, spin in
   // place -9°/f for exactly one revolution (ages 30-69), re-aim at the
-  // nearest enemy at age 70 with speed reset to 14, then fly uncapped;
-  // r24/d22 until the slot's first hit (the hitbox then stays, per exe).
+  // enemy-manager aim cache at age 70 with speed reset to 14, then fly
+  // uncapped; r24/d22 until the slot's first hit (the hitbox then stays,
+  // per exe).
   private sakuyaAFocused(ctx: BombContext): void {
     const f = ctx.frame;
     if (f >= 20 && f < 116 && f % 2 === 0 && this.actors.length < 96) {
       for (let n = 0; n < 2 && this.actors.length < 96; n++) {
-        const i = this.actors.length;
-        // Exe FUN_0040bbb0 @ all.c:5007/5016: slots i and i+48 arm on the
-        // same frame ((i % 48)*2 + 20) and BOTH take the same ring angle
-        // (i % 48)*2π/48 − π — the pair separates radially through its two
-        // random speeds, not by sitting on opposite sides.
-        const angle = ((i % 48) * TAU) / 48 - Math.PI;
+        const p = this.actors.length;
+        // Native BombData.cpp:1366-1390 arms the two slots satisfying
+        // HasTickedAndIsEq((i%48)*2+20) per frame — slots k and k+48 — and
+        // gives slot i angle (f32)i * ZUN_2PI/96.0f - ZUN_PI: 96 UNIQUE
+        // directions 3.75° apart, each arming pair DIAMETRIC (Δ=π). The
+        // port's (i%48)*2π/48 produced 48 doubled directions 7.5° apart
+        // with same-angle pairs — a different knife geometry entirely.
+        // Map push-order p to the native slot so pool scan order and the
+        // (i&1) ANM parity match the exe as well.
+        const slotId = (p & 1) === 0 ? p >> 1 : 48 + ((p - 1) >> 1);
+        const angle = Math.fround(Math.fround(Math.fround(slotId * NATIVE_TAU_F32) / 96) - NATIVE_PI_F32);
+        const speed = Math.fround(ctx.rng.range(1) + 0.5);
+        const accel = Math.fround(ctx.rng.range(Math.fround(0.1)) + Math.fround(0.03));
+        // Native BombData.cpp:1383: GetRandomU16InRange(1) ? +0.15707964f :
+        // -0.15707964f — u16 % 1 is ALWAYS 0, so the spin is always NEGATIVE
+        // (ZUN quirk), but the u16 draw still feeds the shared stream. The
+        // port dropped it, leaving every post-bomb RNG consumer 96 draws
+        // early per cast.
+        ctx.rng.u16();
+        const vx0 = Math.fround(Math.cos(angle) * 24);
+        const vy0 = Math.fround(Math.sin(angle) * 24);
         this.actors.push({
-          x: ctx.player.x + Math.cos(angle) * 24,
-          y: ctx.player.y + Math.sin(angle) * 24,
+          x: Math.fround(ctx.player.x + vx0),
+          y: Math.fround(ctx.player.y + vy0),
           vx: 0, vy: 0, angle,
-          speed: ctx.rng.range(1) + 0.5,
-          accel: ctx.rng.range(0.1) + 0.03,
+          speed,
+          accel,
           turnRate: -0.15707964,
           state: 1, age: 0
         });
         // Visual rides the slot (exe FUN_00403f50 attaches script
-        // 0x407/0x408 to the slot; FUN_0044aa20 runs it there each frame).
-        this.knifeFx[i] = ctx.fx.spawnHandle({
-          scriptId: 7 + (i & 1),
-          x: this.actors[i].x,
-          y: this.actors[i].y,
-          follow: this.actors[i],
+        // 0x407/0x408 by slot parity; FUN_0044aa20 runs it there).
+        this.knifeFx[slotId] = ctx.fx.spawnHandle({
+          scriptId: 7 + (slotId & 1),
+          x: this.actors[p].x,
+          y: this.actors[p].y,
+          follow: this.actors[p],
           followRotate: true
         });
       }
     }
-    // Shared nearest-enemy metric: horizontally closest to the player
-    // (the exe reads the same player+0x2428 cache the homing shots use).
-    let target: Enemy | null = null;
-    let bestDx = Infinity;
-    for (const e of ctx.enemies) {
-      if (!e.ecl.interactable || e.ecl.invisible || e.dead || !e.ecl.canTakeDamage || !e.ecl.shotCollision) continue;
-      const dx = Math.abs(e.x - ctx.player.x);
-      if (dx < bestDx) {
-        bestDx = dx;
-        target = e;
-      }
-    }
-    this.actors.forEach((k, i) => {
+    // Native BombData.cpp:1405-1411: at HasTickedAndIsEq(70) each knife
+    // re-aims at player->positionOfLastEnemyHit while its x sentinel is
+    // valid (> -100) — the enemy-manager aim cache (boss: smallest |dx|,
+    // else largest y), NOT a nearest-to-player scan; an invalid cache keeps
+    // the spun angle. speed = 14 either way.
+    const aim = ctx.aimTarget && ctx.aimTarget.x > -100 ? ctx.aimTarget : null;
+    this.actors.forEach((k, p) => {
       if (k.state === 0) return;
-      k.age++;
+      const slotId = (p & 1) === 0 ? p >> 1 : 48 + ((p - 1) >> 1);
+      // Native timer semantics: subInfo->timer reads 0 on the arming frame's
+      // first update and increments at the loop TAIL, so the age tests below
+      // see the pre-increment value (age 70 = the 71st update).
       if (k.age < 30 || k.age >= 70) {
         if (k.age === 70) {
-          if (target) k.angle = Math.atan2(target.y - k.y, target.x - k.x);
+          if (aim) {
+            const dx = Math.fround(aim.x - k.x);
+            const dy = Math.fround(aim.y - k.y);
+            k.angle = normalizeNativeAngleF32(Math.fround(Math.atan2(dy, dx)), 0);
+          }
           k.speed = 14;
         }
-        k.speed += k.accel * ctx.rate;
-        k.vx = Math.cos(k.angle) * k.speed;
-        k.vy = Math.sin(k.angle) * k.speed;
+        // Native BombData.cpp:1417-1421: speed/velocity advance UNSCALED
+        // every frame; only the position add is rate-scaled.
+        k.speed = Math.fround(k.speed + k.accel);
+        k.vx = Math.fround(Math.cos(k.angle) * k.speed);
+        k.vy = Math.fround(Math.sin(k.angle) * k.speed);
       } else {
-        // Spin phase: hold position, rotate -9°/frame (one full turn).
-        k.angle += k.turnRate * ctx.rate;
+        // Spin phase: hold position, AddNormalizeAngle(angle, -0.15707964f)
+        // every frame — one full revolution over ages 30-69.
+        k.angle = normalizeNativeAngleF32(k.angle, k.turnRate);
         k.vx = k.vy = 0;
       }
-      const slot = this.engine.slots[i];
+      const slot = this.engine.slots[slotId];
       if (slot.hitTally === 0) {
-        k.x += k.vx * ctx.rate;
-        k.y += k.vy * ctx.rate;
-        this.engine.set(i, k.x, k.y, 24, 24, 22);
-      } else if (this.knifeFx[i]) {
-        // First hit (exe all.c:5089-5092): the knife stops and its ANM
-        // swaps to the impact script 0x460 (player-anm id 96, a sparse
-        // declared id in player02.anm), with a pink burst particle.
-        this.knifeFx[i]!.setScript(96);
-        this.knifeFx[i] = null;
-        ctx.spawnParticles(0, k.x, k.y, 4, 0xffff80ff);
+        const rateF32 = Math.fround(ctx.rate);
+        k.x = Math.fround(k.x + Math.fround(k.vx * rateF32));
+        k.y = Math.fround(k.y + Math.fround(k.vy * rateF32));
+        // Native BombData.cpp:1434-1436 SpawnBombEffect(pos, 32.0f, 0, 0):
+        // every un-hit knife publishes a one-frame r32 bullet-clear circle
+        // each frame (the port previously had none).
+        ctx.addBulletClearRegion(k.x, k.y, 32, 0, 0);
+        this.engine.set(slotId, k.x, k.y, 24, 24, 22);
+      } else if (this.knifeFx[slotId]) {
+        // First hit (BombData.cpp:1445-1450): the knife stops, its ANM swaps
+        // to the impact script 0x460 (player-anm id 96), and exactly ONE
+        // pink burst particle spawns (effect 0 = zero RNG draws).
+        this.knifeFx[slotId]!.setScript(96);
+        this.knifeFx[slotId] = null;
+        ctx.spawnParticles(0, k.x, k.y, 1, 0xffff80ff);
       }
+      k.age++;
     });
   }
 
