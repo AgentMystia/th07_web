@@ -208,6 +208,11 @@ export class Player {
   // idle returns at 2*PI/100 per frame with snap inside PI/100; clamped to
   // [-7*PI/10, -3*PI/10] (±36° around straight up).
   orbitAngle = -Math.PI / 2;
+  // Previous-frame snapshot of orbitAngle: the exe computes option render
+  // positions (= orb-shot fire origins) BEFORE advancing the angle each
+  // frame (FUN_0043be00 tail, 0x43d6d5-0x43d880) — same-tick consumers must
+  // read this, not the freshly-mutated orbitAngle.
+  renderOrbitAngle = -Math.PI / 2;
   // This frame's horizontal displacement (dx*speed from move()); 0 when not
   // strafing. Feeds the SakuyaB orbit steer.
   private lastVx = 0;
@@ -383,6 +388,15 @@ export class Player {
         this.deathbombMeter = Math.trunc(this.unfocused.deathbombWindow);
       }
     }
+    // Th07.exe FUN_0043be00: the option render positions (player+0x9b4/0x9c0,
+    // the fire origins for orb shots) are computed from the orbit angle
+    // (player+0xb7e58) AS IT STOOD AT THE END OF THE PREVIOUS FRAME; the
+    // angle-update block sits at the TAIL of the function (0x43d6d5-0x43d880),
+    // advancing it with this frame's vx only for NEXT frame's layout. Reading
+    // the freshly-mutated angle for this tick's spawns put SakuyaB's knife
+    // origins one 3.6° step (1.5077px, simulation-exact) ahead of native and
+    // flipped marginal kill frames (Mt01 st1 kill#86: 1982 vs native 1981).
+    this.renderOrbitAngle = this.orbitAngle;
     if (this.controllable) this.move(input, rate, movementSpeedMult);
     else this.lastVx = 0;
     if (bombEndedThisTick) this.bombSpeedMult = 1.0;
@@ -509,7 +523,8 @@ export class Player {
     if (this.character === 'sakuyaB') {
       // exe: unfocused = diametric pair on r=24 at φ=orbitAngle+π/2;
       // focused = tight cluster at orbitAngle ∓ π/14; 8f linear glide between.
-      const a = this.orbitAngle;
+      // Uses the PREVIOUS frame's angle (see renderOrbitAngle).
+      const a = this.renderOrbitAngle;
       const unf = orb === 1
         ? { x: -24 * Math.cos(a + Math.PI / 2), y: -24 * Math.sin(a + Math.PI / 2) }
         : { x: 24 * Math.cos(a + Math.PI / 2), y: 24 * Math.sin(a + Math.PI / 2) };

@@ -2909,6 +2909,10 @@ export class StageScene implements GameHost {
       if (b.behaviorFunc === 4) this.aimBulletAtSpawn(b);
       else if (b.behaviorFunc === 5) {
         const spread = b.angle - -Math.PI / 2;
+        // The spread angle reads the LIVE angle (player+0xb7e58, already
+        // advanced by this tick's tail update) — unlike the spawn POSITION,
+        // which comes from the option fields computed pre-advance
+        // (renderOrbitAngle). Shot fns run after FUN_0043be00 returns.
         b.angle = Math.fround(this.playerObj.orbitAngle + spread);
         b.vx = Math.fround(Math.cos(b.angle) * b.speed);
         b.vy = Math.fround(Math.sin(b.angle) * b.speed);
