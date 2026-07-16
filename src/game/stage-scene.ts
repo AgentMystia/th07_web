@@ -4603,9 +4603,11 @@ export class StageScene implements GameHost {
         // by itself does not affect value/color.
         const yellow = !!it.guaranteedMax || it.y < p.sht.pocLineY;
         this.spawnScorePopup(pts * 10, it.x, it.y, yellow ? 0xffffff00 : 0xffffffff);
-        // FUN_00430c10 @ 0x43151f-0x43154f: position alone selects the
-        // award. Strictly above the PoC line is +10; on/below it is +3.
-        this.adjustRank(it.y < p.sht.pocLineY ? 10 : 3);
+        // Native ItemManager.cpp:320-327: the rank award keys on the LITERAL
+        // y < 128.0f, not pocY — Marisa's pocY is 156, so her 128..156 band
+        // pays +3 natively, not +10. (The score and popup-color tests above
+        // do use pocY, matching native.) Strictly above 128 is +10; else +3.
+        this.adjustRank(it.y < 128 ? 10 : 3);
         // Extend ladder (exe item-collect case 1 @ all.c:22099-22125).
         while (this.pointItems >= this.extendThreshold) {
           this.awardExtend();
