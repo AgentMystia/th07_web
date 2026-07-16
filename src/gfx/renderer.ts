@@ -90,6 +90,20 @@ export class Renderer {
       this.backbuffer = null;
       this.ctx = displayCtx;
     }
+    // GPU-reset resilience (UNVERIFIED-BY-AUTOMATION: real device resets
+    // can't be triggered from the harness). After a reset the browser
+    // restores contexts BLANK — the per-frame scene redraw recovers on its
+    // own, but the tint cache holds now-blank canvases that would keep
+    // serving invisible sprites from cache hits forever. Drop every raster
+    // cache when the display context comes back. No-op on browsers that
+    // never fire the event.
+    canvas.addEventListener('contextrestored', () => {
+      this.tintCache.clear();
+      this.tintCacheOrder.length = 0;
+      this.tintScratch = null;
+      this.trianglePatterns = new WeakMap();
+      this.present();
+    });
   }
 
   contextAttributes(): {
