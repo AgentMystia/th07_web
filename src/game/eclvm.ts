@@ -1051,9 +1051,22 @@ export class StageRuntime {
       }
       if (s.orbitDuration > 0 && (s.orbitLeft -= rate) < 1) s.moveMode = 0;
     } else if (s.moveMode === 1) {
-      s.angle = normalizeAngle(s.angle + s.angularVelocity * rate);
-      s.speed += s.acceleration * rate;
-      s.axisSpeed = { x: Math.cos(s.angle) * s.speed, y: Math.sin(s.angle) * s.speed, z: 0 };
+      // Th07.exe FUN_0040f6c0 mode-1 branch (all.c:7111-7122) rounds every
+      // store: FUN_0042fff0(angle, rate*angvel) takes its delta as an f32
+      // call argument and wraps through per-step f32 stores; the speed
+      // accumulator and FUN_004074e0's sincos products land in f32 fields.
+      // Modes 2/3 already had this discipline; mode 1 was still double.
+      const rateF32 = Math.fround(rate);
+      s.angle = normalizeNativeAngleF32(
+        s.angle,
+        Math.fround(rateF32 * Math.fround(s.angularVelocity))
+      );
+      s.speed = Math.fround(rateF32 * Math.fround(s.acceleration) + Math.fround(s.speed));
+      s.axisSpeed = {
+        x: Math.fround(Math.cos(s.angle) * s.speed),
+        y: Math.fround(Math.sin(s.angle) * s.speed),
+        z: 0
+      };
       s.heading = s.angle;
       if (s.orbitDuration > 0 && (s.orbitLeft -= rate) < 1) s.moveMode = 0;
     }
