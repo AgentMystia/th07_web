@@ -387,6 +387,11 @@ export class StageScene implements GameHost {
   onStageComplete: ((carry: RunCarry) => void) | null = null;
   continueScreen: { cursor: number } | null = null;
   continuesUsed = 0;
+  // Config starting-lives (run-state byte DAT_0061c254+0x1c, replay header
+  // +0x38). FUN_00429446 scales every stage-clear bonus by the "Player
+  // Penalty" tier: 3 -> x0.5, 4 -> x0.2 (results text @ all.c:17114-17123).
+  // Default config records 2; replays carry the recorder's value.
+  startingLives = 2;
   private gameOverTimer = 0;
   // Post-respawn continuous silent field clear (exe player+0x2400, 60f).
   private respawnClearFrames = 0;
@@ -1082,7 +1087,11 @@ export class StageScene implements GameHost {
     const MULT_BY_DIFFICULTY = [0.5, 1.0, 1.2, 1.5, 2.0, 1.0];
     const mult = MULT_BY_DIFFICULTY[this.difficulty] ?? 1.0;
     internal = Math.trunc(internal * mult);
-    if (this.continuesUsed > 0) internal = Math.trunc((internal * 5) / 10);
+    // Player Penalty (FUN_00429446 @ all.c:18329-18334): the run-state
+    // starting-lives byte scales the whole bonus — 3 -> *5/10, 4 -> (x<<1)/10.
+    // This replaced a continues-based guess; the exe reads only this byte.
+    if (this.startingLives === 3) internal = Math.trunc((internal * 5) / 10);
+    else if (this.startingLives === 4) internal = Math.trunc((internal * 2) / 10);
     this.clearBonus = {
       clear: this.stageNumber * 1000000,
       point: stagePointItems * 50000,

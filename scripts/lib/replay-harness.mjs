@@ -73,6 +73,9 @@ export function applySnapshot(scene, rpy, stageIndex, opts = {}) {
   // Recorded rank (DAT_00625884). The port's rank dynamics are under review;
   // seeding the recorded stage-entry value keeps the entry state faithful.
   scene.rank = s.rankByte;
+  // Config starting-lives from the replay header (run-state +0x1c) — drives
+  // the FUN_00429446 Player Penalty on every stage-clear bonus.
+  scene.startingLives = rpy.initialLives;
   if (opts.restoreRng !== false) {
     scene.rng.seed = s.rngSeed;
     scene.runtime.initializeRandomCounters(scene.rng);

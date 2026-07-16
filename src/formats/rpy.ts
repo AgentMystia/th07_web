@@ -172,6 +172,12 @@ export class Rpy {
   readonly date: string; // "MM/DD"
   readonly name: string;
   readonly score: number; // raw internal units; displayed value is ×10
+  // Config starting-lives at record time (global header +0x38, the 8th int of
+  // the 14-int run-state block FUN_00440480 restores to DAT_0061c254 at
+  // playback start; low byte 2-5). Drives the results-screen "Player
+  // Penalty" clear-bonus scaling (FUN_00429446: 3 -> x5/10, 4 -> x2/10) and
+  // matches the first stage sub-header's lives field in every known file.
+  readonly initialLives: number;
   readonly stages: RpyStage[] = [];
   readonly image: BinaryView; // decrypted+decompressed full image (debugging)
 
@@ -209,6 +215,7 @@ export class Rpy {
     this.date = v.cstring(HEADER_SIZE + 0x04);
     this.name = v.cstring(HEADER_SIZE + 0x0a).trim();
     this.score = v.u32(HEADER_SIZE + 0x18);
+    this.initialLives = v.u8(HEADER_SIZE + 0x38);
 
     const inputOffsets: number[] = [];
     const trailerOffsets: number[] = [];

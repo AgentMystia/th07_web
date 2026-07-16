@@ -73,4 +73,7 @@ export function applyReplayStageSnapshot(scene: StageScene, rpy: Rpy, stageIndex
     );
   }
   scene.rank = stage.rankByte;
+  // Config starting-lives from the replay header (run-state +0x1c) — drives
+  // the FUN_00429446 Player Penalty on every stage-clear bonus.
+  scene.startingLives = rpy.initialLives;
 }
