@@ -1338,15 +1338,23 @@ export class StageRuntime {
       if (!slot) continue;
       slot.elapsed += game.slowRate ?? 1;
       const done = slot.elapsed >= slot.duration;
-      const t = applyEclEase(done ? 1 : slot.elapsed / Math.max(1, slot.duration), slot.ease);
+      // Native EclManager.cpp:618-652: op27 runs the SAME staged-float ease
+      // as the mode-2 movement controller (FUN_0040f6c0's float locals), not
+      // the double-precision polynomial — sub-ULP t differences accumulate
+      // into visible drift over long interpolations.
+      const t = applyEclEaseNativeF32(done ? 1 : slot.elapsed / Math.max(1, slot.duration), slot.ease);
       let value: number;
       if (slot.mode === 7) {
-        const h00 = (1 + 2 * t) * (1 - t) * (1 - t);
-        const h10 = t * (1 - t) * (1 - t);
-        const h01 = t * t * (3 - 2 * t);
-        const h11 = t * t * (t - 1);
-        value = h00 * slot.f0 + h10 * slot.f2 + h01 * slot.f1 + h11 * slot.f3;
+        // MathCubicInterp (EclManager.cpp:626-652): each Hermite basis is a
+        // float local (single f32 store per basis), and the exe sums in the
+        // order h00*p0 + h01*p1 + h10*m0 + h11*m1.
+        const h00 = Math.fround((t - 1) * (t - 1) * (2 * t + 1));
+        const h01 = Math.fround(t * t * (3 - 2 * t));
+        const h10 = Math.fround((1 - t) * (1 - t) * t);
+        const h11 = Math.fround((t - 1) * t * t);
+        value = h00 * slot.f0 + h01 * slot.f1 + h10 * slot.f2 + h11 * slot.f3;
       } else {
+        // MathLerp (EclManager.cpp:618-624): (b - a) * t + a.
         value = (slot.f1 - slot.f0) * t + slot.f0;
       }
       this.interpWrite(game, e, slot.target, value);
@@ -1371,12 +1379,14 @@ export class StageRuntime {
   // which CAN write own-position (unlike the int path our varWrite
   // models). Position writes are temporary; tickInterpSlots rolls them back
   // and transfers their combined displacement to axisSpeed after all slots.
+  // Position and heading targets are f32 fields natively (enemy+0x2c/30/34
+  // and +0x2b54), so the write stores through Math.fround.
   private interpWrite(game: GameHost, e: Enemy, id: number, value: number): void {
     switch (id) {
-      case 10018: e.x = value; return;
-      case 10019: e.y = value; return;
-      case 10020: e.z = value; return;
-      case 10045: e.ecl.heading = value; e.ecl.angle = value; return;
+      case 10018: e.x = Math.fround(value); return;
+      case 10019: e.y = Math.fround(value); return;
+      case 10020: e.z = Math.fround(value); return;
+      case 10045: e.ecl.heading = Math.fround(value); e.ecl.angle = Math.fround(value); return;
       default: this.varWrite(game, e, id, value);
     }
   }
