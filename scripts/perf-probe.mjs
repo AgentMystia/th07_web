@@ -67,7 +67,13 @@ async function runOnce(runIndex, rate) {
     const client = await page.context().newCDPSession(page);
     await client.send('Emulation.setCPUThrottlingRate', { rate });
   }
-  await page.goto(`${server.baseUrl}/index.html?test=1&perf=1&paused=1&difficulty=${difficulty}&stage=${stage}&power=128`);
+  // desync=0: cost rings profile GAME CODE against perf-baseline.json
+  // history. On a backbuffered (desync-granted) canvas, present() forces the
+  // scene's batched raster to flush synchronously inside the timed draw
+  // callback — work that otherwise runs after the callback — inflating draw
+  // numbers without changing real frame delivery (rAF cadence stays flat;
+  // see perf-smoke's cadence arm, which owns presentation-path health).
+  await page.goto(`${server.baseUrl}/index.html?test=1&perf=1&paused=1&desync=0&difficulty=${difficulty}&stage=${stage}&power=128`);
   await page.waitForFunction(() => window.__TH07_TEST__?.ready, null, { timeout: 30000 });
 
   const result = await page.evaluate(async ({ scenario, until, warmup, paced }) => {

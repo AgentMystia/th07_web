@@ -22,6 +22,11 @@ export interface DrawOptions {
 
 export interface RendererOptions {
   desynchronized?: boolean;
+  // Test-only: allocate the backbuffer + present() path even when the
+  // browser did not grant `desynchronized` (Firefox/WebKit never do).
+  // Lets cross-engine smokes exercise the exact presentation code Chrome
+  // players run, on rasterizers that would otherwise skip it.
+  forceBackbuffer?: boolean;
 }
 
 function colorParts(color: number): { r: number; g: number; b: number } {
@@ -46,13 +51,19 @@ export class Renderer {
 
   constructor(canvas: HTMLCanvasElement, options: RendererOptions = {}) {
     this.canvas = canvas;
-    // desynchronized defaults OFF: Chrome's low-latency Canvas hint triggers a
-    // compositor failure (Stage-5 spell-card background turns the screen
-    // invisible/flickering). Opt in explicitly (?desync=1) only for the
-    // latency-probe A/B test. alpha:false stays — the playfield is fully
-    // redrawn each frame (clear + draw), so the page alpha channel is unused
-    // and skipping it saves the per-pixel page blend.
-    this.requestedDesynchronized = options.desynchronized ?? false;
+    // desynchronized ON by default: on granting browsers (Chromium) it
+    // pipelines the canvas past the display compositor, cutting
+    // input-to-photon latency by 1-2 vsyncs. It is safe by construction
+    // now: a granted context is NEVER drawn incrementally — frames finish
+    // on an offscreen backbuffer and present() copies them in one op (the
+    // 8552afe-era spell-card flicker came from incremental front-buffer
+    // draws, before the backbuffer existed). Non-granting browsers
+    // (Firefox/Safari) feature-detect below and keep the direct path,
+    // byte-identical to the old default. Player kill switch: ?desync=0.
+    // alpha:false stays — the playfield is fully redrawn each frame
+    // (clear + draw), so the page alpha channel is unused and skipping it
+    // saves the per-pixel page blend.
+    this.requestedDesynchronized = options.desynchronized ?? true;
     const displayCtx = canvas.getContext('2d', {
       desynchronized: this.requestedDesynchronized,
       alpha: false
@@ -61,12 +72,12 @@ export class Renderer {
     this.displayCtx = displayCtx;
     displayCtx.imageSmoothingEnabled = false;
     const actualDesynchronized = displayCtx.getContextAttributes?.().desynchronized ?? false;
-    if (actualDesynchronized) {
+    if (actualDesynchronized || options.forceBackbuffer === true) {
       // Chrome's low-latency path may expose the front buffer while drawing.
       // Its own guidance says not to clear that visible context incrementally:
       // finish the frame offscreen, then copy it in one operation to avoid
-      // flicker/blank scans. This path is opt-in only; normal rendering stays
-      // direct and pays no extra full-canvas copy.
+      // flicker/blank scans. Browsers that ignore the hint keep rendering
+      // direct and pay no extra full-canvas copy.
       const backbuffer = document.createElement('canvas');
       backbuffer.width = SCREEN_W;
       backbuffer.height = SCREEN_H;
@@ -93,15 +104,22 @@ export class Renderer {
     };
   }
 
+  // Test-only readback of the PRESENTED canvas (post-present() pixels),
+  // as opposed to pixelAt/this.ctx which read the backbuffer when one is
+  // active. Probes use it to assert present() actually delivered a frame.
+  displayPixel(x: number, y: number): number[] {
+    return Array.from(this.displayCtx.getImageData(x, y, 1, 1).data);
+  }
+
   present(): void {
     if (!this.backbuffer) return;
-    const ctx = this.displayCtx;
-    ctx.save();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.globalAlpha = 1;
-    ctx.globalCompositeOperation = 'copy';
-    ctx.drawImage(this.backbuffer, 0, 0);
-    ctx.restore();
+    // Plain source-over drawImage: both canvases are opaque (alpha:false),
+    // so it produces the same pixels as a 'copy' blit while staying on the
+    // rasterizer's fastest path ('copy' was measured 2.6× slower at p99 on
+    // headless SwiftShader: perf:smoke draw p99 17.2ms vs 6.5ms control).
+    // present() is the sole writer to displayCtx and never changes its
+    // transform/alpha/composite state, so no save/restore is needed.
+    this.displayCtx.drawImage(this.backbuffer, 0, 0);
   }
 
   clear(color = '#000'): void {

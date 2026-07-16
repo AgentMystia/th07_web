@@ -54,6 +54,21 @@ otherwise, the implementation is wrong.
   frames (input/firing locked, invulnerable), then hand off to that
   240-frame invuln. Respawn after death is unchanged. Player-only visual;
   no gameplay, timing, or collision semantics change once landed.
+- Low-latency canvas presentation, ON by default: the display context is
+  requested with `desynchronized: true` (+ `alpha: false`). Browsers that
+  grant it (Chromium) skip 1–2 compositor vsyncs; the renderer then draws
+  every frame to an offscreen backbuffer and `present()` copies it in one
+  op — a granted context is never drawn incrementally (that incremental
+  front-buffer drawing was the 8552afe Stage-5 spell-card flicker, before
+  the backbuffer existed). Non-granting browsers feature-detect (context
+  attribute readback, no UA sniffing) to the direct path, byte-identical
+  to the old behavior. Output pixels are identical either way; sim/replay
+  untouched. Kill switches: `?desync=0` (player-facing), `?backbuffer=1`
+  (test-only, forces the present() path on engines that never grant).
+  Note: headless Chromium GRANTS desynchronized, so every headless harness
+  exercises the backbuffer path; readback/screenshots cannot prove scanout
+  flicker absent — a manual Stage-5 spell-card eyeball on real desktop
+  Chrome stays part of acceptance for presentation-layer changes.
 
 Nothing else. In particular: **no invented visual content**. If the data
 has no moon, there is no moon. Absence of data gets a flagged fallback and
@@ -159,6 +174,26 @@ Chromium at `/opt/pw-browsers/chromium-*/chrome-linux/chrome`; run
 - `node scripts/audit-th07-player.mjs`
   Dumps all 12 `.sht` files through the real parser (header + every
   shooter record per power bracket) for regression diffing.
+- `node scripts/desync-stage5-probe.mjs --require-desync`
+  Presentation gate for the default-on desynchronized canvas (also run by
+  `verify:full`). Reaches a real Stage-5 spell card, resumes the live rAF
+  loop, and samples the PRESENTED canvas (`displayPixelAt`) for 3s plus
+  first/last screenshots. Pass = exit 0 with `granted:true`,
+  `blackPresents:0`, spell held all samples. Exit 3 = grant lost in this
+  environment (investigate before trusting other headless results).
+- `node scripts/browser-matrix-smoke.mjs --browser firefox|webkit|chromium`
+  Cross-engine boot smoke (local-only; `npx playwright install firefox
+  webkit` once). Pass 1 asserts shipped defaults (Firefox/WebKit must
+  read back `granted:false, backBuffered:false` — the unchanged direct
+  path); pass 2 forces `&backbuffer=1` to prove `present()` parity on
+  non-Chromium rasterizers.
+- `npm run latency:trace` — Chrome event-to-present latency proxy
+  (headed). A/B the low-latency canvas with the default arm vs
+  `-- --no-desync` (`?desync=0` control); read the grant from the
+  report's `canvas.actual.desynchronized` / `desynchronizedGranted`
+  fields, never from the CLI flags. `--chrome-major` pins the expected
+  browser (148); `--allow-invalid-refresh` for non-144Hz rigs/Xvfb.
+  `npm run perf:smoke -- desync=0` is the matching throughput control arm.
 
 Standard stage checkpoints (dev-shot frame → machine-checkable criteria):
 
@@ -536,6 +571,15 @@ comparisons against real play).
   op 4; anything keyed to raw stage frame instead of the STD clock drifts.
 - **Menu navigation skipping steps** → held-vs-pressed key edges; menus
   are edge-triggered with 20-frame delay/6-frame repeat.
+- **Draw cost ring suddenly ~10ms fatter (p50 1→6.6ms) with no code
+  change** → the backbuffered (desync-granted) canvas. present()'s
+  drawImage uses the backbuffer as a source, which forces the scene's
+  batched raster to FLUSH synchronously inside the timed draw callback —
+  work that on the direct path runs after the callback, invisible to the
+  ring. Real frame delivery is unchanged (rAF cadence flat 16.7ms,
+  measured). Do NOT "optimize" the number away: profile game-code cost on
+  the `desync=0` arm (perf-probe does this; perf-smoke gates cadence on
+  the default arm and cost on the control arm).
 - **A magic constant "fixes" positioning** → your decode is wrong. Delete
   the constant, re-read the disassembly. Every compensating hack we ever
   added (scroll speed, camera lift, ground mirroring, procedural moon) was

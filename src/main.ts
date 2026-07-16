@@ -21,11 +21,18 @@ import {
 interface TestHook {
   ready: boolean;
   pause(): void;
+  // Restart the real rAF loop after pause() — for probes that must watch
+  // live presentation (e.g. the desync stage-5 flicker probe) instead of
+  // stepping frames synchronously.
+  resume(): void;
   advance(n: number): void;
   setLives(n: number): void;
   setInvuln(frames: number): void;
   snapshot(): Record<string, unknown>;
   pixelAt(x: number, y: number): number[];
+  // Reads the PRESENTED display canvas (post-present()); pixelAt reads the
+  // draw target, which is the backbuffer when desync/backbuffer is active.
+  displayPixelAt(x: number, y: number): number[];
   capturePixel(x: number, y: number): number[];
   setPlayer(x: number, y: number): void;
   setPower(v: number): void;
@@ -75,12 +82,20 @@ async function boot(): Promise<void> {
   const isTest = params.get('test') === '1';
   const latencyEnabled = isTest && params.get('latency') === '1';
   const perfEnabled = isTest && params.get('perf') === '1' && !latencyEnabled;
-  // desynchronized Canvas (Chrome low-latency hint) causes composition
-  // failures: during a Stage-5 spell card the spell background makes the
-  // whole screen invisible and flicker. Default OFF; opt in with ?desync=1
-  // only for the latency-probe A/B test (recorded via contextAttributes()).
+  // Low-latency canvas is ON by default for everyone (players and tests):
+  // granting browsers (Chromium) skip 1-2 compositor vsyncs; the renderer
+  // then draws to a backbuffer and present() copies it in one op, which is
+  // what makes the grant safe (the old Stage-5 spell-card flicker came
+  // from incremental front-buffer draws, before the backbuffer existed).
+  // Non-granting browsers (Firefox/Safari) feature-detect to the direct
+  // path unchanged. ?desync=0 is the player-facing kill switch and the
+  // latency-probe control arm; ?desync=1 stays valid for explicit A/B
+  // URLs. ?backbuffer=1 (test-only) forces the backbuffer/present() path
+  // on engines that never grant desync, for cross-engine present parity.
+  const desyncParam = params.get('desync');
   const renderer = new Renderer(canvas, {
-    desynchronized: isTest && params.get('desync') === '1'
+    desynchronized: desyncParam !== '0',
+    forceBackbuffer: isTest && params.get('backbuffer') === '1'
   });
   renderer.clear('#000');
   renderer.text('Now Loading...', 270, 230, { size: 16 });
@@ -492,6 +507,7 @@ async function boot(): Promise<void> {
     window.__TH07_TEST__ = {
       ready: true,
       pause: () => loop.stop(),
+      resume: () => loop.start(),
       advance: (n: number) => loop.advance(n),
       snapshot: () => {
         if (menu) return menu.snapshot();
@@ -511,6 +527,7 @@ async function boot(): Promise<void> {
         };
       },
       pixelAt: (x: number, y: number) => Array.from(renderer.ctx.getImageData(x, y, 1, 1).data),
+      displayPixelAt: (x: number, y: number) => renderer.displayPixel(x, y),
       capturePixel: (x: number, y: number) => {
         const surface = renderer.image('capture:@');
         if (!(surface instanceof HTMLCanvasElement)) return [0, 0, 0, 0];

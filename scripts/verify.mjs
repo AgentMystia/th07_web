@@ -73,6 +73,11 @@ async function full() {
   await npm('replay:browser', ['tests/replays/th7_udFe25.rpy', '1', '300', '/tmp/th07-full-replay.png', '0']);
   await npm('prepare-pages');
   await run('node', ['scripts/browser-boot.mjs', 'dist/pages', '300'], 'static Pages boot');
+  // Headless Chromium grants `desynchronized` here, so this exercises the
+  // real default-on backbuffer presentation against a Stage-5 spell card
+  // (the 8552afe flicker scenario). --require-desync makes a lost grant a
+  // hard failure instead of a silently weaker test.
+  await run('node', ['scripts/desync-stage5-probe.mjs', '--require-desync'], 'stage-5 desync presentation probe');
 }
 
 try {

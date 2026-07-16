@@ -53,6 +53,11 @@
 - `Ctrl`：快进对话
 - `Esc`：暂停
 
+低延迟画面输出默认开启：支持的浏览器（Chrome/Edge）会绕过合成器队列，
+输入到上屏的延迟减少 1–2 个垂直同步周期；Firefox/Safari 自动走标准
+路径，行为不变。若遇到画面异常（闪烁、黑屏），在地址栏加 `?desync=0`
+即可关闭。
+
 ### 本地运行
 
 ```sh
@@ -184,6 +189,12 @@ only the TH07 browser application and its runtime assets.
 - `X`: bomb / back
 - `Ctrl`: fast-forward dialogue
 - `Esc`: pause
+
+Low-latency presentation is on by default: browsers that support it
+(Chrome/Edge) bypass the compositor queue, cutting input-to-photon latency
+by 1–2 vsyncs; Firefox/Safari automatically use the standard path,
+unchanged. If you ever see rendering artifacts (flicker, black screen),
+append `?desync=0` to the URL to turn it off.
 
 ### Run locally
 

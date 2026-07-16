@@ -22,13 +22,21 @@ const scenario = args.scenario ?? 'light';
 const runs = Number(args.runs ?? 5);
 const samplesPerRun = Number(args.samples ?? 250);
 const headless = !!args.headless;
-const desynchronized = !!args.desync;
+// Desync is ON by default in the app now. Default = no param (the shipped
+// behavior); --desync forces the explicit opt-in URL; --no-desync is the
+// control arm (?desync=0). Grant truth comes from the page's context
+// attributes, never from these flags.
+if (args.desync && args['no-desync']) {
+  console.error('pass at most one of --desync / --no-desync');
+  process.exit(2);
+}
+const desyncQuery = args['no-desync'] ? '&desync=0' : args.desync ? '&desync=1' : '';
 const allowInvalidRefresh = !!args['allow-invalid-refresh'];
 const expectedChromeMajor = Number(args['chrome-major'] ?? 148);
 const validInputs = new Set(['direction', 'shoot', 'focus', 'bomb']);
 const validScenarios = new Set(['light', 'lunatic', 'dense-items']);
 if (!validInputs.has(inputKind) || !validScenarios.has(scenario)) {
-  console.error('usage: node scripts/latency-probe.mjs --input direction|shoot|focus|bomb --scenario light|lunatic|dense-items [--runs 5 --samples 250]');
+  console.error('usage: node scripts/latency-probe.mjs --input direction|shoot|focus|bomb --scenario light|lunatic|dense-items [--runs 5 --samples 250] [--desync|--no-desync]');
   process.exit(2);
 }
 
@@ -122,8 +130,7 @@ const readTrace = async (stream) => {
 
 try {
   await page.goto(
-    `${server.baseUrl}/index.html?test=1&latency=1&difficulty=${difficulty}&power=128` +
-    (desynchronized ? '&desync=1' : '')
+    `${server.baseUrl}/index.html?test=1&latency=1&difficulty=${difficulty}&power=128${desyncQuery}`
   );
   await page.waitForFunction(() => window.__TH07_TEST__?.ready, null, { timeout: 30000 });
   const userAgent = await page.evaluate(() => navigator.userAgent);
@@ -199,13 +206,16 @@ try {
   }
 
   const metric = (name, filter = () => true) => rows.filter(filter).map((row) => row[name]).filter(Number.isFinite);
+  const canvasAttributes = await page.evaluate(() => window.__TH07_TEST__.canvasContextAttributes());
   const report = {
     metric: 'event-to-present proxy',
     claim: 'software proxy only; excludes keyboard scan/USB/display scanout/panel response',
     chromeMajor: major,
     scenario,
     input: inputKind,
-    desynchronized,
+    // Which arm was REQUESTED via CLI; the grant truth is canvas.actual
+    // below and is duplicated here for at-a-glance A/B reading.
+    desyncArm: desyncQuery || '(default: on)',
     runs,
     samplesPerRun,
     refresh: {
@@ -214,7 +224,8 @@ try {
       valid144Hz: refreshValid,
       requiredRangeMs: [6.5, 7.4]
     },
-    canvas: await page.evaluate(() => window.__TH07_TEST__.canvasContextAttributes()),
+    canvas: canvasAttributes,
+    desynchronizedGranted: canvasAttributes?.actual?.desynchronized ?? false,
     all: {
       eventToHandler: summarize(metric('eventToHandler')),
       handlerToSample: summarize(metric('handlerToSample')),
