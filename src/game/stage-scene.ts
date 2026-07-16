@@ -2891,12 +2891,16 @@ export class StageScene implements GameHost {
       if (b.runner.removed) {
         b.dead = true;
       } else if (b.shotType !== 4 && b.shotType !== 5) {
-        // FUN_0043a290 calls FUN_0042bdc7 with the live shot sprite's exact
-        // width/height. A flat 32px margin kept tall Sakuya knives alive one
-        // extra frame above the field, letting them hit newly spawned enemies
-        // after their authored sprite had already left the playfield.
-        const halfW = b.rect.w / 2;
-        const halfH = b.rect.h / 2;
+        // Player::UpdateShots (0x0043d2f0) culls with the shot VM's LIVE
+        // sprite pointer (vm.sprite->widthPx/heightPx into
+        // GameManager::IsInBounds @ 0x42bdc7); render visibility is never
+        // consulted. ReimuB's orb bullet script (0x442) selects its real
+        // 14x46 sprite at time zero, so the engine's 32x32 spawn-template
+        // rect culled it above the field one frame before a native f2131
+        // hit. spriteSize() exposes the wrapper's current pointer.
+        const size = b.runner.spriteSize?.() ?? b.rect;
+        const halfW = size.w / 2;
+        const halfH = size.h / 2;
         const onscreen = b.x + halfW >= 0 && b.x - halfW <= 384 &&
           b.y + halfH >= 0 && b.y - halfH <= 448;
         if (!onscreen) b.dead = true;

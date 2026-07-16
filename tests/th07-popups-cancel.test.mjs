@@ -405,6 +405,55 @@ test('focused-beam teardown skips its same-frame history-helper callback', () =>
   assert.equal(anchors, 0);
 });
 
+test('player-shot culling uses the ANM VM live sprite instead of its spawn frame', () => {
+  const scene = Object.create(StageScene.prototype);
+  const makeBullet = (slot, liveHeight) => ({
+    poolSlot: slot,
+    dead: false,
+    state: 'fired',
+    shotType: 0,
+    behaviorFunc: 0,
+    x: 283.2225341796875,
+    y: 4.07342529296875,
+    vx: 0,
+    vy: -22,
+    age: 17,
+    hitAge: 0,
+    rect: { w: 32, h: 32 },
+    runner: {
+      removed: false,
+      update() {},
+      spriteSize: () => ({ w: 14, h: liveHeight })
+    }
+  });
+  const nativeAlive = makeBullet(11, 46);
+  const staleSpawnFrame = makeBullet(12, 32);
+  scene.slowRate = 1;
+  scene.homingAim = null;
+  scene.playerObj = {
+    laserSlots: [null, null, null],
+    focusHeld: false,
+    shooting: true,
+    bombTimer: 0
+  };
+  scene.playerBulletSlots = new Array(96).fill(null);
+  scene.playerBulletSlots[11] = nativeAlive;
+  scene.playerBulletSlots[12] = staleSpawnFrame;
+  scene.playerBullets = [nativeAlive, staleSpawnFrame];
+  scene.syncPlayerBulletSlots = () => {};
+  scene.isDialogueBlocking = () => false;
+  scene.compactLive = () => {};
+  scene.refreshActiveAttackSlots = () => {};
+
+  scene.updatePlayerBullets(false);
+
+  assert.equal(nativeAlive.y, -17.92657470703125);
+  assert.equal(nativeAlive.dead, false, 'live 46px frame still overlaps the top edge');
+  assert.equal(scene.playerBulletSlots[11], nativeAlive);
+  assert.equal(staleSpawnFrame.dead, true, 'the old 32px spawn frame would be out of bounds');
+  assert.equal(scene.playerBulletSlots[12], null);
+});
+
 test('bomb clear regions consume young bullets and state 5 releases after 12 half-speed ticks', () => {
   const scene = cancelScene();
   scene.playerObj = { power: 0, character: 'reimuA' };
