@@ -15,3 +15,4 @@ export {
 export { Anm } from '../formats/anm';
 export { TH07_DATA } from '../data/th07-data';
 export { stageSnapshot } from '../game/snapshot';
+export { DialogueRunner } from '../game/dialogue';

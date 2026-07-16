@@ -103,7 +103,12 @@ export class DialogueRunner {
           this.waitTimer = Math.max(0, duration - this.waitAge);
           return;
         }
-        this.waitAge = 0;
+        // Native case 4 only `break`s here (FUN_00428392 @ all.c:17859-17867):
+        // the break falls into the instruction-pointer advance and does NOT
+        // touch +0x1fbbc. Only case 3 (text, all.c:17857) and case 8 (boss
+        // intro, all.c:17906) zero waitAge. Carrying a >=12 waitAge across an
+        // adjacent same-timestamp op4 lets a single fresh Z edge clear both
+        // waits in one manager tick instead of re-accumulating 12 frames.
         this.waitTimer = 0;
         this.idx++;
         continue;

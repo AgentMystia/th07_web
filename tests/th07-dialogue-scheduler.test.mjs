@@ -203,6 +203,47 @@ test('MSG op4 retains native first-tick, Z-age, and CTRL timestamp semantics', a
   assert.deepEqual([ctrl.idx, ctrl.time, ctrl.waitTimer], [5, 61, 0]);
 });
 
+test('MSG op4 waitAge carries across adjacent waits (native case4 break never zeros)', async () => {
+  const mod = await loadEngine();
+  // FUN_00428392 case 4 (all.c:17859-17867) only `break`s on completion; the
+  // break falls into the instruction-pointer advance and never touches
+  // +0x1fbbc. Only case 3 (all.c:17857) and case 8 (all.c:17906) zero
+  // waitAge. Two op4 waits at the same timestamp, separated only by an op13,
+  // therefore let ONE fresh Z edge (once waitAge >= 12) clear BOTH in a single
+  // manager tick — the second wait must not re-accumulate 12 frames. This is
+  // the root cause of the Yo01 Normal ~13-frame pre-boss dialogue lag.
+  const makeRunner = (instrs) => new mod.DialogueRunner({ message: () => instrs }, 0);
+
+  // Z-edge carry across two adjacent same-timestamp waits.
+  const z = makeRunner([
+    { time: 0, op: 4, size: 4, arg: 30 },
+    { time: 0, op: 13, size: 4, arg: 1 },
+    { time: 0, op: 4, size: 4, arg: 300 },
+    { time: 0, op: 0, size: 0 }
+  ]);
+  for (let i = 0; i < 12; i++) z.update(false, false);   // waitAge 0 -> 12, still on idx0
+  assert.equal(z.idx, 0);
+  assert.equal(z.waitAge, 12);
+  assert.equal(z.waitTimer, 18);
+  z.update(true, false);                                  // one fresh Z clears both waits
+  assert.equal(z.idx, 4, 'a single Z edge consumes both adjacent op4 waits');
+  assert.equal(z.done, true);
+  assert.equal(z.waitAge, 12, 'case4 break carries waitAge; it is not zeroed');
+
+  // Timeout carry: a wait that times out (no Z) seeds the next wait with the
+  // carried waitAge, so the second wait counts down from there, not from 0.
+  const t = makeRunner([
+    { time: 0, op: 4, size: 4, arg: 30 },
+    { time: 0, op: 4, size: 4, arg: 300 }
+  ]);
+  for (let i = 0; i < 30; i++) t.update(false, false);    // waitAge reaches duration, still held
+  assert.equal(t.idx, 0);
+  assert.equal(t.waitAge, 30);
+  t.update(false, false);                                 // first wait breaks; second inherits 30
+  assert.equal(t.idx, 1);
+  assert.equal(t.waitAge, 31, 'carried timeout waitAge seeds the next wait');
+});
+
 test('op-4 story dialogue leaves gameplay managers live while MSG input gates remain active', async () => {
   const mod = await loadEngine();
   const rpy = new mod.Rpy(readFileSync('tests/replays/th7_udFe25.rpy'));
