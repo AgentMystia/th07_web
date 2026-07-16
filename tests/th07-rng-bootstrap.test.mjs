@@ -30,6 +30,21 @@ function countDraws(scene) {
   return () => draws;
 }
 
+test('RNG float APIs round at their native f32 boundaries', () => {
+  const scene = sceneFor(0);
+  scene.rng.seed = 0x1527;
+  const draws = countDraws(scene);
+
+  assert.equal(scene.rng.f(), 0.4651021361351013);
+  assert.equal(scene.rng.seed, 0xef35);
+  assert.equal(draws(), 2, 'GetRandomFloat consumes one u32');
+
+  scene.rng.seed = 0x1527;
+  assert.equal(scene.rng.range(Math.PI * 2), 2.922322988510132);
+  assert.equal(scene.rng.seed, 0xef35);
+  assert.equal(draws(), 4, 'GetRandomFloatInRange consumes one additional u32');
+});
+
 test('replay stage seeds initialize the native death/item global counters', () => {
   const expected = [
     [0, 2], [2, 5], [1, 4], [2, 1], [1, 7], [2, 1]

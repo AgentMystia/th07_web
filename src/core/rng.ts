@@ -27,12 +27,14 @@ export class Rng {
   }
 
   f(): number {
-    // Th07.exe FUN_0042ffc0 divides by the float constant 4294967296.0
-    // (@ 0x48eb88), so the generated interval is [0, 1), never exactly 1.
-    return this.u32() / 0x100000000;
+    // Rng::GetRandomFloat returns f32. The divisor is an exact power of two,
+    // so one store at the return boundary reproduces the native conversion.
+    return Math.fround(this.u32() / 0x100000000);
   }
 
   range(v: number): number {
-    return this.f() * v;
+    // GetRandomFloatInRange takes and returns f32, including both call
+    // boundaries even when the JavaScript caller supplied a double constant.
+    return Math.fround(this.f() * Math.fround(v));
   }
 }
