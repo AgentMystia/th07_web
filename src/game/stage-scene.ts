@@ -39,6 +39,7 @@ export interface RunCarry {
   extendLevel: number;
   rank: number;
   rankAccumulator?: number;
+  powerItemCountForScore?: number;
 }
 
 // Item sprites live in etama.anm entry 1 (the etama2.png sheet), addressed
@@ -61,6 +62,17 @@ const ITEM_SPRITES: Record<ItemType, number> = {
 // Per-type offscreen indicator arrows sit 10 embedded ids after their item
 // (emb14-21, same order) — drawn while an item is still above the top edge.
 const ITEM_ARROW_OFFSET = 10;
+// Native g_FullPowerScoreBonus (ItemManager.cpp:17, TH07 0x0049ecf8): the
+// score paid by the Nth power item collected at full power. The counter
+// increments BEFORE indexing and clamps at 30 (ItemManager.cpp:247-251), so
+// the first pickup pays table[1]=20 — table[0]=10 is unreachable (ZUN quirk),
+// and the 31st+ pays 12000 forever.
+const FULL_POWER_SCORE_BONUS: readonly number[] = [
+  10, 20, 30, 40, 50, 60, 70, 80,
+  90, 100, 200, 300, 400, 500, 600, 700,
+  800, 900, 1000, 2000, 3000, 4000, 5000,
+  6000, 7000, 8000, 9000, 10000, 11000, 12000
+];
 // exe-exact RNG draw cost (raw u16) per particle for the ambient effect types
 // ECL op117/118 spawn, = the DAT_00494fb0 spawnVetoFn's draw count (binary-read
 // confirmed; the paired perFrameGateFns draw ZERO). Only the effectIds stage 1
@@ -349,6 +361,13 @@ export class StageScene implements GameHost {
   private readonly playerBulletSlots: (PlayerBullet | null)[] = new Array(PLAYER_BULLET_POOL_CAP).fill(null);
   graze = 0;
   pointItems = 0;
+  // Native GameManager.powerItemCountForScore (GameManager.hpp:223; i8, replay
+  // stage data +0x26 u8): index into g_FullPowerScoreBonus advanced by each
+  // power item collected at full power. Reset at run start, on the miss
+  // commit (Player.cpp:1781), and by every below-cap SMALL-power pickup
+  // (ItemManager.cpp:264 — bigPower does NOT reset it). Persisted across
+  // stages via RunCarry; seeded from the replay snapshot on playback.
+  powerItemCountForScore = 0;
   // The run-global counters persist across stages, but FUN_00427269 captures
   // stage-clear Point/Graze as per-stage deltas. Replay snapshots restore the
   // cumulative totals, so retain the entry baselines separately.
@@ -761,6 +780,7 @@ export class StageScene implements GameHost {
       this.extendLevel = carry.extendLevel;
       this.rank = carry.rank;
       this.rankAccumulator = carry.rankAccumulator ?? 0;
+      this.powerItemCountForScore = carry.powerItemCountForScore ?? 0;
       this.startStageTransition();
     }
     this.captureStageEntryTotals();
@@ -1142,7 +1162,8 @@ export class StageScene implements GameHost {
       spellsCaptured: this.cherry.spellsCaptured,
       extendLevel: this.extendLevel,
       rank: this.rank,
-      rankAccumulator: this.rankAccumulator
+      rankAccumulator: this.rankAccumulator,
+      powerItemCountForScore: this.powerItemCountForScore
     };
   }
 
@@ -2588,6 +2609,10 @@ export class StageScene implements GameHost {
     // FUN_0043dca0 @ 0x43df6a-0x43df79: the miss penalty lands after the
     // power/cherry/drop bookkeeping, on the death-commit frame.
     this.adjustRank(-0x640);
+    // Native Player.cpp:1781: the miss commit also zeroes the full-power
+    // P-item score-ladder counter (redundant with the below-cap pickup reset
+    // after the power penalty, but written there by the exe).
+    this.powerItemCountForScore = 0;
     // The exe does NOT clear the field at the miss — the respawn arms a
     // 60-frame continuous silent cancel instead (see onPlayerRespawn).
     this.playerEffects.clear();
@@ -4495,10 +4520,13 @@ export class StageScene implements GameHost {
         // Item-collect cases 0/2 (spec-popups.md §4.1): below max power a
         // plain white "10" popup, or — when the pickup crosses a power
         // bracket (8/16/32/48/64/80/96/128) — a salmon sentinel glyph and
-        // the power-up chime. Case 0 at max power pays the escalating
-        // combo score (flat 12800 here — combo ladder unported, AGENTS §7).
+        // the power-up chime. Case 0 at max power pays the native
+        // g_FullPowerScoreBonus ladder (ItemManager.cpp:245-253).
         const add = it.type === 'power' ? 1 : 8;
         if (p.power < 128) {
+          // Native ItemManager.cpp:264: a below-cap SMALL-power pickup zeroes
+          // the score-ladder counter (the bigPower case has no reset).
+          if (it.type === 'power') this.powerItemCountForScore = 0;
           const before = this.powerTier(p.power);
           p.power = Math.min(128, p.power + add);
           // Th07.exe (v1.00b) FUN_00430860 @ 0x43089b calls
@@ -4529,8 +4557,16 @@ export class StageScene implements GameHost {
           // says 10 because popup values use display×10 units.
           this.addScore(1);
         } else if (it.type === 'power') {
-          this.addScore(12800);
-          this.spawnScorePopup(128000, it.x, it.y, 0xffffff00);
+          // Native ItemManager.cpp:245-253: full-power P pickups pay the
+          // g_FullPowerScoreBonus ladder — increment-then-index, clamped at
+          // 30 (the 31st+ pays 12000). The native yellow threshold is
+          // itemScore >= 12800 — above the 12000 ladder peak, so the popup
+          // is in practice always white; the comparison is kept verbatim.
+          this.powerItemCountForScore++;
+          if (this.powerItemCountForScore >= 31) this.powerItemCountForScore = 30;
+          const itemScore = FULL_POWER_SCORE_BONUS[this.powerItemCountForScore];
+          this.addScore(itemScore);
+          this.spawnScorePopup(itemScore * 10, it.x, it.y, itemScore >= 12800 ? 0xffffff00 : 0xffffffff);
         }
         // Collect case 0 calls FUN_0042db77(1) after both the below-cap and
         // max-power branches. Case 2 (bigPower) has no rank call.

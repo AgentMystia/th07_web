@@ -65,6 +65,7 @@ export function applyReplayStageSnapshot(scene: StageScene, rpy: Rpy, stageIndex
   scene.cherry.cherryPlus = stage.cherryPlus;
   scene.cherry.spellsCaptured = stage.spellsCaptured;
   scene.extendLevel = stage.extendLevel;
+  scene.powerItemCountForScore = stage.powerItemCountForScore;
   scene.captureStageEntryTotals();
   if (scene.extendThreshold !== stage.extendThreshold) {
     throw new Error(

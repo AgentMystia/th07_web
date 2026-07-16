@@ -84,7 +84,8 @@ function expectedEnd(rpy, i) {
     cherryMax: next.cherryMax,
     cherryPlus: next.cherryPlus,
     extendLevel: next.extendLevel,
-    spellsCaptured: next.spellsCaptured
+    spellsCaptured: next.spellsCaptured,
+    powerItemCountForScore: next.powerItemCountForScore
   };
 }
 
@@ -100,7 +101,8 @@ function actualEnd(scene) {
     cherryMax: scene.cherry.cherryMax,
     cherryPlus: scene.cherry.cherryPlus,
     extendLevel: scene.extendLevel,
-    spellsCaptured: scene.cherry.spellsCaptured
+    spellsCaptured: scene.cherry.spellsCaptured,
+    powerItemCountForScore: scene.powerItemCountForScore
   };
 }
 

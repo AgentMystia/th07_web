@@ -150,7 +150,11 @@ export interface RpyStage {
   bombs: number; // +0x24 u8
   rankByte: number; // +0x25 u8 = DAT_00625884 (16 at run start, climbs; the
   // port's rank model is under review against this evidence)
-  b26: number; // +0x26 u8 — unidentified (0 in a no-miss run; likely misses)
+  powerItemCountForScore: number; // +0x26 u8 — GameManager
+  // powerItemCountForScore (ReplayManager.hpp:28), the full-power P-item
+  // score-ladder index. 0 in a no-miss run: at full power power drops spawn
+  // as cherry items, so the ladder only advances on the rare post-crossing
+  // pickup of a pre-conversion power item (or after a miss rebuild).
   spellsCaptured: number; // +0x27 u8 (provisional — trajectory 0/3/7/12/16/21
   // over a Lunatic clear fits captures)
   inputs: Uint16Array; // per-frame input word (first u16 of each 4-byte record)
@@ -281,7 +285,7 @@ function parseStage(v: BinaryView, stage: number, offset: number, end: number): 
     lives: v.u8(offset + 0x23),
     bombs: v.u8(offset + 0x24),
     rankByte: v.u8(offset + 0x25),
-    b26: v.u8(offset + 0x26),
+    powerItemCountForScore: v.u8(offset + 0x26),
     spellsCaptured: v.u8(offset + 0x27),
     inputs,
     auxFlags,
