@@ -151,6 +151,27 @@ test('ECL op119 reads the live player power field', () => {
   assert.deepEqual(scene.items.map((it) => it.type), ['point', 'point', 'point']);
 });
 
+test('effect 12 spawns draw nothing (0x2bb has no ANM random ops)', () => {
+  const scene = sceneFor(0);
+  const draws = countDraws(scene);
+
+  scene.spawnEffectParticles(12, 0, 0, 1, 0xff4040ff);
+  assert.equal(draws(), 0);
+});
+
+test('a committed player hit advances the RNG by the native 84 raw u16s', () => {
+  // CalcKillboxCollision RerollRng (5 ranged u32 + 3 ranged f32 = 16) +
+  // Die()'s RegenerateGameIntegrityCsum (2 ranged u32 = 4) + the 16-particle
+  // type-6 burst (InitDeceleratingBurstFast, 2 ranged f32 each = 64).
+  const scene = sceneFor(0);
+  scene.playerObj.invulnFrames = 0;
+  const draws = countDraws(scene);
+
+  scene.onPlayerHit(null, 'bullet');
+  assert.equal(scene.playerObj.hitState, true, 'the hit committed');
+  assert.equal(draws(), 84);
+});
+
 test('generic effect costs include authored ANM time-0 RNG and veto RNG', () => {
   const scene = sceneFor(0);
   const draws = countDraws(scene);

@@ -78,6 +78,10 @@ const EFFECT_DRAW_COST: Record<number, number> = {
   // Th07.exe v1.00b effect table + etama.anm entry-scoped scripts.
   0: 0, 1: 0, 2: 0,
   3: 4, 4: 4, 5: 4, 6: 4, 7: 4, 8: 4, 9: 4, 10: 4, 11: 4,
+  // Effect 12 (g_EffectMapping[12] = {0x2bb, NULL, NULL}) has no callbacks
+  // and its ANM script contains no random ops: zero draws. The four raw
+  // u16s observed on the death frame are Die()'s RegenerateGameIntegrityCsum,
+  // not this effect (see onPlayerHit).
   12: 0, 13: 0, 14: 0, 15: 0,
   17: 6, 18: 6, 20: 22, 22: 6, 23: 0,
   26: 14, 27: 12, 29: 6, 30: 16, 31: 16, 32: 6, 33: 6
@@ -3486,13 +3490,23 @@ export class StageScene implements GameHost {
         : null
     });
     if (this.hitLog.length > 64) this.hitLog.shift();
+    // Player::CalcKillboxCollision / CalcLaserCollision call
+    // GameManager::RerollRng immediately before Die(): five ranged u32 values
+    // followed by three ranged f32 values. They feed integrity-only fields in
+    // retail, but still advance the shared gameplay RNG by sixteen raw u16s.
+    for (let i = 0; i < 5; i++) this.rng.u32InRange(100000);
+    for (let i = 0; i < 3; i++) this.rng.range(100000);
     const result = p.hit();
     if (result === 'deathbomb-window') {
-      // Th07.exe FUN_0043bd60 @ 0x43bd75-0x43bdeb — the hit frame itself
-      // plays the death SE (id 4) and both hit-effect groups: a single
-      // dedicated-slot flash (type 0xc, color 0xff4040ff) and a 16-particle
-      // white scattering burst (type 6). The miss commit later spawns
-      // nothing new.
+      // Player::Die (0x0043edc0) — the hit frame itself runs the whole death
+      // entry: RegenerateGameIntegrityCsum, then both hit-effect groups (a
+      // dedicated-slot flash type 0xc color 0xff4040ff and a 16-particle
+      // white scattering burst type 6), then the death SE. The later miss
+      // commit spawns nothing new.
+      // GameManager::RegenerateGameIntegrityCsum (0x004012b0): two ranged
+      // u32 draws feeding integrity-only fields — four raw u16s.
+      this.rng.u32InRange(100000);
+      this.rng.u32InRange(100000);
       this.playSfx(4);
       this.spawnEffectParticles(12, p.x, p.y, 1, 0xff4040ff);
       this.spawnEffectParticles(6, p.x, p.y, 16, 0xffffffff);
