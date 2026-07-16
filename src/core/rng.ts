@@ -27,14 +27,16 @@ export class Rng {
   }
 
   f(): number {
-    // Rng::GetRandomFloat returns f32. The divisor is an exact power of two,
-    // so one store at the return boundary reproduces the native conversion.
-    return Math.fround(this.u32() / 0x100000000);
+    // Th07.exe FUN_0042ffc0 disassembly: fild qword; fdiv dword [0x48eb88]
+    // (=2^32f); ret — the quotient RETURNS UNROUNDED in st0. u32/2^32 is
+    // exact in double, so no fround here; each caller rounds at its own
+    // f32 store site, mirroring the x87 convention used across the engine.
+    return this.u32() / 0x100000000;
   }
 
   range(v: number): number {
-    // GetRandomFloatInRange takes and returns f32, including both call
-    // boundaries even when the JavaScript caller supplied a double constant.
-    return Math.fround(this.f() * Math.fround(v));
+    // Rng.hpp inlines GetRandomFloatInRange as GetRandomFloat()*range; the
+    // product also stays in x87 until the consumer stores it.
+    return this.f() * v;
   }
 }

@@ -30,17 +30,19 @@ function countDraws(scene) {
   return () => draws;
 }
 
-test('RNG float APIs round at their native f32 boundaries', () => {
+test('RNG float APIs return x87-unrounded quotients', () => {
+  // FUN_0042ffc0 = fild; fdiv 2^32f; ret — the float RETURNS unrounded in
+  // st0. Callers round at their own f32 stores, never at this boundary.
   const scene = sceneFor(0);
   scene.rng.seed = 0x1527;
   const draws = countDraws(scene);
 
-  assert.equal(scene.rng.f(), 0.4651021361351013);
+  assert.equal(scene.rng.f(), 0.46510214847512543);
   assert.equal(scene.rng.seed, 0xef35);
   assert.equal(draws(), 2, 'GetRandomFloat consumes one u32');
 
   scene.rng.seed = 0x1527;
-  assert.equal(scene.rng.range(Math.PI * 2), 2.922322988510132);
+  assert.equal(scene.rng.range(Math.PI * 2), 2.9223229856365665);
   assert.equal(scene.rng.seed, 0xef35);
   assert.equal(draws(), 4, 'GetRandomFloatInRange consumes one additional u32');
 });
