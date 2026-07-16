@@ -44,6 +44,12 @@ export interface BombContext {
   // during slow-motion the integer current advances only on carried frames).
   // Optional so bare unit-test contexts default to the rate-1 semantics.
   hasTicked?: boolean;
+  // Native player->positionOfLastEnemyHit (Player.hpp:289): the enemy
+  // manager's per-frame aim cache (boss: smallest |dx|; else: largest y),
+  // accumulated after the player tick and consumed by the NEXT tick's bomb
+  // and homing shots. The ReimuA focused orbs steer toward it while valid
+  // (x > -100 sentinel), else toward the player center (BombData.cpp:391).
+  aimTarget?: { x: number; y: number } | null;
   enemies: Enemy[];
   enemyBullets: EnemyBullet[];
   playSfx(id: number): void;
@@ -307,8 +313,17 @@ export class BombRunner {
       // `if (bombTimer.HasTicked())`; only the rate-scaled position add and
       // the ANM tick run every frame. State 2's counter is gated too.
       if (orb.state === 1 && (ctx.hasTicked ?? true)) {
-        const dx = ctx.player.x - orb.x;
-        const dy = ctx.player.y - orb.y;
+        // Native BombData.cpp:391-397: the seek target is the enemy
+        // manager's positionOfLastEnemyHit cache while its x sentinel is
+        // valid (> -100 — an empty cache reads (-999,-999), and a cached
+        // enemy parked off-field left is likewise rejected), else the
+        // player center. The port previously chased the live player
+        // position unconditionally, flying all 7 orbs (and their detonation
+        // landmines/clear circles) to the wrong endpoint whenever an enemy
+        // was on field.
+        const aim = ctx.aimTarget && ctx.aimTarget.x > -100 ? ctx.aimTarget : null;
+        const dx = (aim ? aim.x : ctx.player.x) - orb.x;
+        const dy = (aim ? aim.y : ctx.player.y) - orb.y;
         const dist = Math.sqrt(dx * dx + dy * dy);
         let div = Math.fround(dist / (orb.speed / 8));
         if (div < 1) div = 1;

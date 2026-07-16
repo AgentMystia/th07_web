@@ -2395,6 +2395,13 @@ export class StageScene implements GameHost {
     // advanced after this tick runs, so compare against one rate step back.
     // Frame 0 (fresh cast) reads true, matching the native timer-init state.
     ctx.hasTicked = Math.floor(this.bombFrame) !== Math.floor(this.bombFrame - this.slowRate);
+    // Native Player::OnUpdate runs UpdateBombProjectiles at the HEAD of the
+    // player callback and clears positionOfLastEnemyHit at its TAIL
+    // (UpdateUI, Player.cpp:2199), so the bomb reads the cache accumulated
+    // by the PREVIOUS frame's enemy-manager pass. The port's bomb tick sits
+    // before this frame's clearPlayerAimCaches for the same reason: homingAim
+    // still holds last frame's accumulation here.
+    ctx.aimTarget = this.homingAim;
     return ctx;
   }
 
