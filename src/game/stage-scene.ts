@@ -2390,6 +2390,11 @@ export class StageScene implements GameHost {
     ctx.duration = this.bombDuration;
     ctx.focused = p.bombFocused;
     ctx.rate = this.slowRate;
+    // ZunTimer::HasTicked: true when the LAST bombFrame advance (the tail of
+    // the previous player tick) carried the integer current. bombFrame is
+    // advanced after this tick runs, so compare against one rate step back.
+    // Frame 0 (fresh cast) reads true, matching the native timer-init state.
+    ctx.hasTicked = Math.floor(this.bombFrame) !== Math.floor(this.bombFrame - this.slowRate);
     return ctx;
   }
 

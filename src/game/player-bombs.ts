@@ -39,6 +39,11 @@ export interface BombContext {
   duration: number;
   focused: boolean; // latched at cast (exe 16a24)
   rate: number; // global slow-motion rate
+  // ZunTimer::HasTicked equivalent for the shared bomb timer (native
+  // BombData gates each form's per-tick writes on bombTimer.HasTicked() —
+  // during slow-motion the integer current advances only on carried frames).
+  // Optional so bare unit-test contexts default to the rate-1 semantics.
+  hasTicked?: boolean;
   enemies: Enemy[];
   enemyBullets: EnemyBullet[];
   playSfx(id: number): void;
@@ -238,13 +243,23 @@ export class BombRunner {
           // update 10541.
           ctx.addBulletClearRegion(orb.x, orb.y, 64, Math.fround(64 / 15), 30);
         }
-        this.engine.set(i, orb.x, orb.y, 48, 48, 8);
-        // FUN_0043e7e0 writes a circle into player+0x17dc after the attack
-        // slot write on every state-1 tick. With life=0, FUN_0043d8f0
-        // retires it at the head of the next player tick: it is a one-frame
-        // r128 bullet-clear zone, including the state-1 -> state-2 tick.
-        ctx.addBulletClearRegion(orb.x, orb.y, 128, 0, 0);
-      } else if (orb.state === 2) {
+        if (ctx.hasTicked ?? true) {
+          // Native BombData.cpp:231-239: the state-1 damage-row refresh and
+          // the r128 clear circle are gated on bombTimer.HasTicked() — during
+          // slow-motion they publish only on frames whose timer increment
+          // carried. (The speed decrement and the speed<-10 detonation above
+          // are NOT gated; they run every frame, rate-scaled.)
+          this.engine.set(i, orb.x, orb.y, 48, 48, 8);
+          // FUN_0043e7e0 writes a circle into player+0x17dc after the attack
+          // slot write on every state-1 tick. With life=0, FUN_0043d8f0
+          // retires it at the head of the next player tick: it is a one-frame
+          // r128 bullet-clear zone, including the state-1 -> state-2 tick.
+          ctx.addBulletClearRegion(orb.x, orb.y, 128, 0, 0);
+        }
+      } else if (orb.state === 2 && (ctx.hasTicked ?? true)) {
+        // Native BombData.cpp:241-251: the state-2 box refresh and counter
+        // advance sit in the same HasTicked gate (`else if (state != 0 &&
+        // bombTimer.HasTicked())`).
         this.engine.set(i, orb.x, orb.y, 256, 256, 2);
         if (++orb.age > 29) orb.state = 0; // slot stays frozen (exe quirk)
       }
@@ -286,7 +301,12 @@ export class BombRunner {
     }
     this.actors.forEach((orb, i) => {
       const slotId = i + 1;
-      if (orb.state === 1) {
+      // Native BombData.cpp:388-446: the focused form's ENTIRE state-1 block
+      // — target selection, steering, the 48x48 damage row, the r128 clear
+      // circle, and the detonation test — sits inside
+      // `if (bombTimer.HasTicked())`; only the rate-scaled position add and
+      // the ANM tick run every frame. State 2's counter is gated too.
+      if (orb.state === 1 && (ctx.hasTicked ?? true)) {
         const dx = ctx.player.x - orb.x;
         const dy = ctx.player.y - orb.y;
         const dist = Math.sqrt(dx * dx + dy * dy);
@@ -319,7 +339,7 @@ export class BombRunner {
       if (orb.state !== 0) {
         orb.x = Math.fround(orb.vx * ctx.rate + orb.x);
         orb.y = Math.fround(orb.vy * ctx.rate + orb.y);
-        if (orb.state === 2 && ++orb.age > 29) orb.state = 0;
+        if (orb.state === 2 && (ctx.hasTicked ?? true) && ++orb.age > 29) orb.state = 0;
       }
     });
   }
