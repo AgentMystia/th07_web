@@ -1,18 +1,16 @@
-const STEP_MS = 1000 / 60;
-const MAX_FRAME_DELTA_MS = 250;
+import { pace } from './pacing';
 
 export interface LoopClient {
   update(): void;
   draw(): void;
 }
 
-// Fixed 60 FPS timestep with bounded catch-up: when rAF ticks arrive slower
-// than 60 Hz (throttling, 48/50 Hz displays, jitter), up to CATCHUP_STEPS
-// sim steps run per tick so game speed stays 60 steps/second — the previous
-// one-step-per-rAF loop silently ran the whole game slow on any sub-60Hz
-// delivery (reported as "player feels too slow"). Draws are skipped on rAF
-// ticks that ran no simulation step.
-const CATCHUP_STEPS = 3;
+// Fixed 60 FPS timestep with bounded catch-up and a vsync snap — the
+// pacing policy itself (step counts, accumulator, snap band) is the pure
+// function in pacing.ts, unit-tested in tests/th07-pacing.test.mjs. The
+// previous one-step-per-rAF loop silently ran the whole game slow on any
+// sub-60Hz delivery (reported as "player feels too slow"). Draws are
+// skipped on rAF ticks that ran no simulation step.
 
 export class Loop {
   private last = 0;
@@ -28,7 +26,13 @@ export class Loop {
   private drawCostCursor = 0;
   private drawCostCount = 0;
 
-  constructor(private client: LoopClient, private readonly measureCosts = false) {
+  constructor(
+    private client: LoopClient,
+    private readonly measureCosts = false,
+    // ?pace=raw sets false: exact accumulator with no vsync snap, the
+    // pre-snap behavior, kept as a player-facing kill switch.
+    private readonly snap = true
+  ) {
     this.updateCosts = measureCosts ? new Float64Array(Loop.COST_RING) : null;
     this.drawCosts = measureCosts ? new Float64Array(Loop.COST_RING) : null;
   }
@@ -97,19 +101,11 @@ export class Loop {
 
   private tick(now: number): void {
     if (!this.running) return;
-    const delta = Math.min(MAX_FRAME_DELTA_MS, now - this.last);
+    const paced = pace(this.acc, now - this.last, this.snap);
     this.last = now;
-    this.acc += delta;
-    let steps = 0;
-    while (this.acc >= STEP_MS && steps < CATCHUP_STEPS) {
-      this.timedUpdate();
-      steps++;
-      this.acc -= STEP_MS;
-    }
-    // Never bank more than one step of debt — avoids a catch-up spiral
-    // after long stalls (tab switch etc).
-    if (this.acc > STEP_MS) this.acc = STEP_MS;
-    if (steps > 0) this.timedDraw();
+    this.acc = paced.acc;
+    for (let i = 0; i < paced.steps; i++) this.timedUpdate();
+    if (paced.steps > 0) this.timedDraw();
     requestAnimationFrame((t) => this.tick(t));
   }
 

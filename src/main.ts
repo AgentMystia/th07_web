@@ -497,7 +497,9 @@ async function boot(): Promise<void> {
         renderer.present();
       }
     }
-  }, perfEnabled);
+    // Third arg: ?pace=raw disables the near-60Hz vsync snap (kill switch;
+    // see src/core/pacing.ts for what the snap fixes).
+  }, perfEnabled, params.get('pace') !== 'raw');
 
   // ?paused=1 (test-only): do not start the rAF loop — the page renders
   // nothing until the probe's first advance(). Removes the boot-frame
