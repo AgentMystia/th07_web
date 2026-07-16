@@ -122,6 +122,55 @@ test('player movement accumulates through the native float32 position fields', (
   assert.equal(player.y, 384);
 });
 
+test('SakuyaB option angle advances only while firing unfocused outside messages', () => {
+  const makePlayer = () => {
+    const player = Object.create(Player.prototype);
+    player.character = 'sakuyaB';
+    player.unfocused = player.focused = {
+      speed: 4,
+      focusedSpeed: 2,
+      diagSpeed: 3,
+      diagFocusedSpeed: 1.5
+    };
+    player.focusHeld = false;
+    player.focusGlideFrame = 8;
+    player.focusTransition = null;
+    player.invulnFrames = 0;
+    player.invulnFrac = 0;
+    player.bombInvuln = 0;
+    player.bombTimer = 0;
+    player.bombSpeedMult = 1;
+    player.materializeFrame = -1;
+    player.dyingFrame = -1;
+    player.hitState = false;
+    player.deathbombMeter = 8;
+    player.fireFrame = -1;
+    player.fireFrameFrac = 0;
+    player.orbitAngle = -1.8;
+    player.x = 100;
+    player.y = 100;
+    player.runner = { update() {} };
+    player.updatePose = () => {};
+    return player;
+  };
+
+  const released = makePlayer();
+  released.update({ held: new Set(['right']), pressed: new Set(), released: new Set() });
+  assert.equal(released.orbitAngle, -1.8, 'released Z freezes the option angle');
+
+  const focused = makePlayer();
+  focused.update({ held: new Set(['shoot', 'focus', 'right']), pressed: new Set(), released: new Set() });
+  assert.equal(focused.orbitAngle, -1.8, 'focused firing freezes the option angle');
+
+  const message = makePlayer();
+  message.update({ held: new Set(['shoot', 'right']), pressed: new Set(), released: new Set() }, 1, false);
+  assert.equal(message.orbitAngle, -1.8, 'an active message freezes the option angle');
+
+  const active = makePlayer();
+  active.update({ held: new Set(['shoot', 'right']), pressed: new Set(), released: new Set() });
+  assert.equal(active.orbitAngle, -1.8 + 4 * Math.PI / 200);
+});
+
 test('the bomb-ending tick still uses its frame-entry movement multiplier', () => {
   const player = Object.create(Player.prototype);
   player.unfocused = player.focused = {

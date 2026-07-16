@@ -422,13 +422,18 @@ export class Player {
     }
     this.updatePose(input);
     this.runner.update(rate);
-    const vx = this.lastVx;
-    if (vx === 0) {
-      if (Math.abs(this.orbitAngle - -Math.PI / 2) <= Math.PI / 100) this.orbitAngle = -Math.PI / 2;
-      else this.orbitAngle += (this.orbitAngle < -Math.PI / 2 ? 1 : -1) * (2 * Math.PI / 100) * rate;
-    } else {
-      this.orbitAngle += vx * Math.PI / 200;
-      this.orbitAngle = Math.min(-3 * Math.PI / 10, Math.max(-7 * Math.PI / 10, this.orbitAngle));
+    // FUN_0043be00 nests SakuyaB's option-angle controller under held Z,
+    // message-inactive, and unfocused. Releasing fire or holding focus freezes
+    // the angle; the option layout still reads the frozen value every tick.
+    if (allowShotArm && this.shooting && !this.focusHeld) {
+      const vx = this.lastVx;
+      if (vx === 0) {
+        if (Math.abs(this.orbitAngle - -Math.PI / 2) <= Math.PI / 100) this.orbitAngle = -Math.PI / 2;
+        else this.orbitAngle += (this.orbitAngle < -Math.PI / 2 ? 1 : -1) * (2 * Math.PI / 100) * rate;
+      } else {
+        this.orbitAngle += vx * Math.PI / 200;
+        this.orbitAngle = Math.min(-3 * Math.PI / 10, Math.max(-7 * Math.PI / 10, this.orbitAngle));
+      }
     }
   }
 
