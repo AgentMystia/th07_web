@@ -2078,7 +2078,15 @@ export class StageScene implements GameHost {
       // last invulnerability tick, matching the native state dispatcher.
       this.tickPlayerShotCollisionClock(p.invulnFrames > 0 || this.cherry.borderActive);
       p.update(input, this.slowRate, !messageActive);
-      if (bombActiveAtFrameStart && p.bombTimer === 0) this.bombCleanupPending = true;
+      if (bombActiveAtFrameStart && p.bombTimer === 0) {
+        this.bombCleanupPending = true;
+        // FUN_0040c620 / FUN_0040cbf0 detonation else-branch (all.c:5288 /
+        // 5453): both SakuyaB casts end by restoring the speed multiplier
+        // and publishing a one-pass r800 clear circle at the player
+        // position into the +0x17dc pool (FUN_0043e7e0(player+0x930,
+        // 800.0, 0, 0, 6)). This is the cast's only full-field cancel.
+        if (p.character === 'sakuyaB') this.allocateBombClearRegion(p.x, p.y, 800, 0, 1);
+      }
       this.focusHeld = p.focusHeld;
       if (p.focusTransition === 'in') {
         const entryIndex = 1;
@@ -2515,7 +2523,12 @@ export class StageScene implements GameHost {
     // bomb VM into bombClearRegions above. Do not infer them from attack
     // slots: the state-2/landmine r256 damage slots have no matching
     // FUN_0043e7e0 call and must not clear bullets (Phantasm PRE10470).
+    // SakuyaB likewise: the focused cast publishes its own r96 one-pass
+    // circle each frame (FUN_0040cbf0 -> FUN_0043e7e0) and the unfocused
+    // cast clears no bullets at all (freeze-only), so neither may fall
+    // back to the damage-slot boxes.
     if (this.playerObj.character === 'reimuA' ||
+        this.playerObj.character === 'sakuyaB' ||
         (this.playerObj.character === 'marisaB' && !this.playerObj.bombFocused)) return false;
     for (const s of this.activeBombSlots) {
       // The attack-slot pool also carries MarisaB's persistent player-shot
@@ -4343,9 +4356,9 @@ export class StageScene implements GameHost {
         it.y = Math.fround(it.y + dy);
         if (it.vy >= 3) it.vy = 3;
         else it.vy = Math.fround(it.vy + Math.fround(Math.fround(0.03) * rate));
-        // Th07.exe FUN_00430c10 @ 0x431098 compares against
-        // DAT_00625850(448) + DAT_0048ead0(16), in playfield coordinates.
-        if (it.y > 464) {
+        // ItemManager::OnUpdate: `arcadeRegionSize.y + 16.0f <= y` — the
+        // 448+16 boundary despawns INCLUSIVELY at exactly 464.
+        if (it.y >= 464) {
           it.dead = true;
           // FUN_00430c10 clears +0x27d immediately on this branch, so a
           // later item in the same ascending manager pass may reuse the
@@ -4357,17 +4370,27 @@ export class StageScene implements GameHost {
           this.adjustRank(-3);
         }
       }
-      // Th07.exe FUN_0043b480 (item pickup, all.c:27842-27863): AABB of the
-      // item box against the player grab box (+0x978..+0x988 = player ±12).
-      // FUN_00430c10 passes &local_20 where Ghidra locals are:
-      //   local_20 / local_1c = SHT itemRadius (DAT_0056b928+0x18) for X and Y
-      //   local_18 = 16.0 (unused by the pickup test; separate stack slot)
-      // Scale DAT_0048eaa4/DAT_0048eac0 = 1/2, so half-extents are
-      // itemRadius/2 on both axes. Combined with player ±12 → effective
-      // ±(itemRadius/2+12). Only player states 0/3/4 (normal/invuln/bomb —
-      // not materialize/dying) may collect.
-      const grab = sht.itemRadius / 2 + 12;
-      if (p.alive && !it.dead && Math.abs(it.x - p.x) <= grab && Math.abs(it.y - p.y) <= grab) {
+      // Player::CalcItemBoxCollision (0x0043b480): inclusive AABB of the
+      // item box (item ± f32(itemRadius/2), from ItemManager's local size
+      // vector) against the player's PRECOMPUTED grab corners
+      // (grabItemTopLeft/BottomRight = positionCenter ± grabItemSize, with
+      // grabItemSize fixed (12,12,5) — Player.cpp:1419/2444). Both sides
+      // round each corner through f32 before the comparisons; the
+      // algebraically equal center-distance form |Δ| <= r/2+12 rounds in
+      // different places and flipped marginal collects by one frame
+      // (th7_udMt01 stage 4 collect#161, oracle 4224 vs web 4225).
+      const itemHalf = Math.fround(sht.itemRadius * 0.5);
+      const itemMinX = Math.fround(Math.fround(it.x) - itemHalf);
+      const itemMaxX = Math.fround(Math.fround(it.x) + itemHalf);
+      const itemMinY = Math.fround(Math.fround(it.y) - itemHalf);
+      const itemMaxY = Math.fround(Math.fround(it.y) + itemHalf);
+      const grabMinX = Math.fround(Math.fround(p.x) - 12);
+      const grabMaxX = Math.fround(Math.fround(p.x) + 12);
+      const grabMinY = Math.fround(Math.fround(p.y) - 12);
+      const grabMaxY = Math.fround(Math.fround(p.y) + 12);
+      if (p.alive && !it.dead &&
+          !(grabMinX > itemMaxX || grabMaxX < itemMinX ||
+            grabMinY > itemMaxY || grabMaxY < itemMinY)) {
         this.collectItem(it);
         // The native pickup switch keeps the current slot occupied while its
         // nested item/effect spawns run, then clears +0x27d before advancing

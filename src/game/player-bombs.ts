@@ -602,6 +602,12 @@ export class BombRunner {
   // center (352×416, d3) on every fourth frame from frame 32.
   private sakuyaBUnfocused(ctx: BombContext): void {
     if (ctx.frame === 0 || ctx.frame === 60 || ctx.frame === 120) this.freezeBullets(ctx);
+    // FUN_0040c620 stamps damage row 0 only on %4 frames past 29, and
+    // Player::UpdateBombProjectiles zeroes every damage row's size at the
+    // head of EACH player tick — so the 352x416/d3 box really is live one
+    // frame in four (spec-bombs-sakuya §4.2's "always-on" reading missed
+    // the per-tick zeroing). The unfocused cast publishes NO bullet-clear
+    // regions: its only bullet interaction is the three freezes above.
     if (ctx.frame >= 32 && ctx.frame % 4 === 0) this.engine.set(0, 192, 224, 352, 416, 3);
     else this.engine.clear(0);
   }
@@ -619,11 +625,19 @@ export class BombRunner {
       });
     }
     const head = this.actors[0];
+    // FUN_0040cbf0 per-frame order (all.c:5382-5443): the hitbox block runs
+    // FIRST with the trail head's PRE-step position — FUN_0043e7e0(head,
+    // 96.0, 0, 0, 6) publishes a one-pass r96 bullet-clear circle into the
+    // player+0x17dc pool, then damage row 0 gets the 160x160/d1 box at the
+    // same point. Only afterwards does the spring integrate toward the
+    // player. (FUN_0043e7e0 is the clear-region allocator, not a particle
+    // spawner — the bullet cancel comes from THIS call, not the damage box.)
+    ctx.addBulletClearRegion(head.x, head.y, 96, 0, 0);
+    this.engine.set(0, head.x, head.y, 160, 160, 1);
     head.vx += ((ctx.player.x - head.x) / 1700) * ctx.rate * ctx.rate;
     head.vy += ((ctx.player.y - head.y) / 1700) * ctx.rate * ctx.rate;
     head.x += head.vx * ctx.rate;
     head.y += head.vy * ctx.rate;
-    this.engine.set(0, head.x, head.y, 160, 160, 1);
   }
 
   // FUN_00425f10: SakuyaB's time-stop pulse — zero every live enemy
