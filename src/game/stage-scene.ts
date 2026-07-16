@@ -2,7 +2,7 @@ import { advanceBulletExBehavior, StageRuntime, type StageData } from './eclvm';
 import type { GameHost, Enemy, EnemyBullet, EnemyLaser, ItemEntity, ItemType, EffectParticle } from './types';
 import { Rng } from '../core/rng';
 import {
-  normalizeAngle, normalizeNativeAngleF32, clamp, NATIVE_HALF_PI_F32
+  normalizeAngle, normalizeNativeAngleF32, clamp, NATIVE_HALF_PI_F32, NATIVE_PI_F32
 } from '../core/util';
 import type { InputFrame } from '../core/input';
 import { Renderer, PLAYFIELD, SCREEN_W } from '../gfx/renderer';
@@ -4122,11 +4122,24 @@ export class StageScene implements GameHost {
   }
 
   private bounceBullet(b: EnemyBullet, includeBottom: boolean): void {
-    if (b.x >= 0 && b.x < 384 && b.y >= 0 && (includeBottom ? b.y < 448 : true)) return;
+    // Native UpdateBulletBounce (BulletManager.cpp:846-852) gates the whole
+    // branch on GameManager::IsInBounds(pos, sprite widthPx/heightPx) == 0
+    // (GameManager.cpp:92-110): the bullet's own sprite HALF-extents against
+    // all four field edges — the same rect test the offscreen cull runs —
+    // not the center point. A bounce now fires half a sprite earlier, and
+    // the bottom edge participates regardless of the 0x400 includeBottom
+    // flag (that flag only arms the bottom REFLECTION below).
+    const halfW = b.rect.w / 2;
+    const halfH = b.rect.h / 2;
+    if (b.x + halfW >= 0 && b.x - halfW <= 384 && b.y + halfH >= 0 && b.y - halfH <= 448) return;
     const bo = b.exBounce!;
     const maxTimes = Math.max(1, bo.maxTimes | 0);
-    if (b.x < 0 || b.x >= 384) b.angle = normalizeAngle(-b.angle - Math.PI);
-    if (b.y < 0 || (includeBottom && b.y >= 448)) b.angle = -b.angle;
+    // The reflection axes still test the CENTER (BulletManager.cpp:857-866).
+    // The x flip is angle = AddNormalizeAngle(-angle - ZUN_PI, 0) in f32;
+    // the y flip is a plain negation store. Even with no axis firing, the
+    // velocity re-arm and counter below still run (native fallthrough).
+    if (b.x < 0 || b.x >= 384) b.angle = normalizeNativeAngleF32(-b.angle, -NATIVE_PI_F32);
+    if (b.y < 0 || (includeBottom && b.y >= 448)) b.angle = Math.fround(-b.angle);
     b.speed = bo.speed;
     // Native BulletManager.cpp:870-871 AngleToVector(&velocity, angle,
     // speed * effectiveFramerateMultiplier): the rate-scaled speed and each
@@ -4136,7 +4149,7 @@ export class StageScene implements GameHost {
     b.vx = Math.fround(Math.fround(Math.cos(b.angle)) * scaledSpeed);
     b.vy = Math.fround(Math.fround(Math.sin(b.angle)) * scaledSpeed);
     b.exBounceTimes++;
-    if (b.exBounceTimes >= maxTimes) b.exFlags &= 0xf3ff;
+    if (b.exBounceTimes >= maxTimes) b.exFlags &= ~0xc00;
   }
 
   // Additive two-pass beam: a soft colored outer quad at displayWidth plus
