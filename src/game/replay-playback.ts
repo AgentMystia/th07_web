@@ -66,6 +66,9 @@ export function applyReplayStageSnapshot(scene: StageScene, rpy: Rpy, stageIndex
   scene.cherry.spellsCaptured = stage.spellsCaptured;
   scene.extendLevel = stage.extendLevel;
   scene.powerItemCountForScore = stage.powerItemCountForScore;
+  // Gui.cpp:1365's stage-6 clear-bonus arm reads stageReplayData[4] — slot
+  // [4] is stage 5 (ReplayManager saves stage N to slot N-1).
+  scene.replayHasStage5Data = rpy.stages.some((st) => st.stage === 5);
   scene.captureStageEntryTotals();
   if (scene.extendThreshold !== stage.extendThreshold) {
     throw new Error(

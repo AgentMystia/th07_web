@@ -377,6 +377,12 @@ export class StageScene implements GameHost {
   // all.c:19744/22099-22125): main game 50/125/200/300/450/800+200n;
   // Extra+Phantasm 200/500/800+500n. Persists across stages in a credit.
   extendLevel = 0;
+  // Native Gui.cpp:1365 pays the clear-bonus lives/bombs arm on stage >= 7,
+  // or on stage 6 only when NOT practice AND (NOT replay playback OR the
+  // replay carries a stage-5 block — i.e. the run reached the finale
+  // continuously; ReplayManager saves stage N to slot N-1, so slot [4] is
+  // stage 5). applyReplayStageSnapshot sets this from the parsed rpy.
+  replayHasStage5Data = false;
   // Th07.exe DAT_012f40bc: latched to the spell-active state at each bomb
   // trigger — bomb damage during a spell card is 0 until a bomb has been
   // triggered during that spell (anti pre-bomb rule, disasm @ 0x41faeb).
@@ -1093,14 +1099,22 @@ export class StageScene implements GameHost {
   // Stage-clear bonus, exe-exact (FUN_00429446's credit block @
   // all.c:18308-18337, display strings @ all.c:17038-17120):
   //   internal = stage*100000 + stageGraze*50 + stagePointItems*5000 + cherryMax
-  //   [+ lives*2,000,000 + bombs*400,000 on route-final clears (stage>5)]
+  //   [+ lives*2,000,000 + bombs*400,000 on route-final clears — stage>=7,
+  //    or stage==6 passing the Gui.cpp:1365 practice/replay gate below]
   //   Easy /2, Hard *12/10, Lunatic *15/10, Extra <<1; Normal AND Phantasm
   //   have no arm (x1.0 — the Phantasm screen prints no Rank line at all).
   //   Continue penalty: x0.5 / x0.2 tiers.
   // The tally rows display internal*10 (the exe's "%8d0" appended-zero
   // trick); the score field gains the internal total via ten +=/10 ticks.
   private computeClearBonus(): void {
-    const finalClear = this.stageNumber >= 6;
+    // Native Gui.cpp:1363-1370: the lives/bombs arm is stage>=7, or stage==6
+    // gated on !practice && (!replay || stageReplayData[4].data). The
+    // replay-verify harness runs arcade mode (both flags false), so this
+    // changes nothing there; it only bites real replay/practice sessions.
+    const finalClear =
+      this.stageNumber >= 7 ||
+      (this.stageNumber === 6 && this.mode !== 'practice' &&
+        (this.mode !== 'replay' || this.replayHasStage5Data));
     const stageGraze = this.graze - this.stageEntryGraze;
     const stagePointItems = this.pointItems - this.stageEntryPointItems;
     let internal =
