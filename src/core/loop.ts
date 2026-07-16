@@ -15,6 +15,7 @@ export interface LoopClient {
 export class Loop {
   private last = 0;
   private acc = 0;
+  private drift = 0;
   private running = false;
   private static readonly COST_RING = 600;
   // Perf-only observability. Production and latency runs leave these null,
@@ -101,9 +102,10 @@ export class Loop {
 
   private tick(now: number): void {
     if (!this.running) return;
-    const paced = pace(this.acc, now - this.last, this.snap);
+    const paced = pace(this.acc, now - this.last, this.snap, this.drift);
     this.last = now;
     this.acc = paced.acc;
+    this.drift = paced.drift;
     for (let i = 0; i < paced.steps; i++) this.timedUpdate();
     if (paced.steps > 0) this.timedDraw();
     requestAnimationFrame((t) => this.tick(t));

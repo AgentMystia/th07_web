@@ -29,9 +29,10 @@ interface TestHook {
   setLives(n: number): void;
   setInvuln(frames: number): void;
   snapshot(): Record<string, unknown>;
+  // Both read the PRESENTED display canvas (post-present()). pixelAt is the
+  // historical name every probe uses; displayPixelAt exists so new probes
+  // can be explicit about presented-vs-drawn semantics.
   pixelAt(x: number, y: number): number[];
-  // Reads the PRESENTED display canvas (post-present()); pixelAt reads the
-  // draw target, which is the backbuffer when desync/backbuffer is active.
   displayPixelAt(x: number, y: number): number[];
   capturePixel(x: number, y: number): number[];
   setPlayer(x: number, y: number): void;
@@ -528,7 +529,11 @@ async function boot(): Promise<void> {
           }
         };
       },
-      pixelAt: (x: number, y: number) => Array.from(renderer.ctx.getImageData(x, y, 1, 1).data),
+      // Reads the PRESENTED display canvas — the pre-backbuffer historical
+      // semantics every existing pixel probe was written against. advance()
+      // ends in draw()+present(), so values match the backbuffer when
+      // present() works and expose it when it doesn't (the 8552afe class).
+      pixelAt: (x: number, y: number) => renderer.displayPixel(x, y),
       displayPixelAt: (x: number, y: number) => renderer.displayPixel(x, y),
       capturePixel: (x: number, y: number) => {
         const surface = renderer.image('capture:@');

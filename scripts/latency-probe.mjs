@@ -23,14 +23,18 @@ const runs = Number(args.runs ?? 5);
 const samplesPerRun = Number(args.samples ?? 250);
 const headless = !!args.headless;
 // Desync is ON by default in the app now. Default = no param (the shipped
-// behavior); --desync forces the explicit opt-in URL; --no-desync is the
-// control arm (?desync=0). Grant truth comes from the page's context
-// attributes, never from these flags.
-if (args.desync && args['no-desync']) {
+// behavior); --desync (or --desync 1) forces the explicit opt-in URL;
+// --no-desync or --desync 0 is the control arm (?desync=0). Grant truth
+// comes from the page's context attributes, never from these flags.
+if (args.desync != null && args['no-desync']) {
   console.error('pass at most one of --desync / --no-desync');
   process.exit(2);
 }
-const desyncQuery = args['no-desync'] ? '&desync=0' : args.desync ? '&desync=1' : '';
+// parseArgs captures the next token as a value, so `--desync 0` arrives as
+// the truthy string '0' — treat explicit off-values as the control arm
+// instead of silently inverting the requested measurement.
+const desyncOff = !!args['no-desync'] || args.desync === '0' || args.desync === 'false' || args.desync === 'off';
+const desyncQuery = desyncOff ? '&desync=0' : args.desync ? '&desync=1' : '';
 const allowInvalidRefresh = !!args['allow-invalid-refresh'];
 const expectedChromeMajor = Number(args['chrome-major'] ?? 148);
 const validInputs = new Set(['direction', 'shoot', 'focus', 'bomb']);

@@ -91,19 +91,28 @@ export class Renderer {
       this.ctx = displayCtx;
     }
     // GPU-reset resilience (UNVERIFIED-BY-AUTOMATION: real device resets
-    // can't be triggered from the harness). After a reset the browser
-    // restores contexts BLANK — the per-frame scene redraw recovers on its
-    // own, but the tint cache holds now-blank canvases that would keep
-    // serving invisible sprites from cache hits forever. Drop every raster
-    // cache when the display context comes back. No-op on browsers that
-    // never fire the event.
-    canvas.addEventListener('contextrestored', () => {
+    // can't be triggered from the harness). Per the HTML spec a restored 2D
+    // context comes back in its DEFAULT state (blank, smoothing back ON),
+    // so: re-pin imageSmoothingEnabled=false on both contexts (else every
+    // scaled sprite renders bilinear-blurred until reload), and drop every
+    // raster cache — the tint cache holds now-blank canvases that would
+    // keep serving invisible sprites from cache hits forever. The
+    // per-frame scene redraw recovers everything else on its own, except
+    // capturePlayfield's 'capture:@' surface, which is unrecoverable (its
+    // source pixels died with the reset) and stays blank until the next
+    // stage clear recaptures it. Listeners sit on both the display canvas
+    // and the backbuffer; no-op on browsers that never fire the event.
+    const restoreRasterState = (): void => {
+      displayCtx.imageSmoothingEnabled = false;
+      this.ctx.imageSmoothingEnabled = false;
       this.tintCache.clear();
       this.tintCacheOrder.length = 0;
       this.tintScratch = null;
       this.trianglePatterns = new WeakMap();
       this.present();
-    });
+    };
+    canvas.addEventListener('contextrestored', restoreRasterState);
+    this.backbuffer?.addEventListener('contextrestored', restoreRasterState);
   }
 
   contextAttributes(): {

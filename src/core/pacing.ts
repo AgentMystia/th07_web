@@ -16,10 +16,14 @@ export const SNAP_TOLERANCE_MS = 1.0;
 export interface PaceResult {
   steps: number;
   acc: number;
+  // Wall-clock time (ms) the snap has pretended away so far; carried
+  // across ticks and repaid in whole steps (see below).
+  drift: number;
 }
 
-// Pure fixed-timestep pacer: given the accumulator and a raw rAF delta,
-// decide how many 60Hz sim steps to run and the new accumulator value.
+// Pure fixed-timestep pacer: given the accumulator, a raw rAF delta and the
+// carried snap drift, decide how many 60Hz sim steps to run and the new
+// accumulator/drift values.
 //
 // The snap kills the accumulator beat against near-vsync-multiple deltas:
 // an unsnapped 16.683ms (59.94 Hz) or quantized 16/17ms delta drifts the
@@ -27,15 +31,34 @@ export interface PaceResult {
 // stutter and a 16.7ms input-latency spike) or 2 steps (doubled motion).
 // Snapping deltas within SNAP_TOLERANCE_MS of k*STEP_MS (k=1..CATCHUP_STEPS)
 // to exactly k*STEP_MS makes in-band displays release exactly k steps per
-// tick, forever; k=2/3 likewise stabilizes 30 Hz delivery and missed-vsync
-// double periods. Out-of-band deltas (high-refresh displays, stalls) use
-// the exact accumulator, byte-identical to the pre-snap loop.
-export function pace(acc: number, rawDeltaMs: number, snap = true): PaceResult {
+// tick; k=2/3 likewise stabilizes 30 Hz delivery and missed-vsync double
+// periods. Out-of-band deltas (high-refresh displays, stalls) use the
+// exact accumulator, byte-identical to the pre-snap loop.
+//
+// The DRIFT ledger preserves the old loop's hard invariant that long-run
+// sim rate converges to exactly 60 steps per wall-clock second even when
+// the display sustains an in-band off-rate (a ~58Hz panel mode or
+// battery-saver rAF throttling at ~17.2ms would otherwise run the game
+// permanently ~3% slow — the "player feels too slow" class again). Every
+// snap banks the pretended-away time; once a whole step of it accumulates,
+// one tick repays it (a single 2-step or 0-step tick). On real near-60Hz
+// panels that's one correction per ~17s instead of the raw accumulator's
+// once per second, and browser 16/17ms timestamp quantization cancels to
+// zero net drift — no corrections at all.
+export function pace(acc: number, rawDeltaMs: number, snap = true, drift = 0): PaceResult {
   let delta = Math.min(MAX_FRAME_DELTA_MS, rawDeltaMs);
   if (snap) {
     const k = Math.round(delta / STEP_MS);
     if (k >= 1 && k <= CATCHUP_STEPS && Math.abs(delta - k * STEP_MS) <= SNAP_TOLERANCE_MS) {
+      drift += delta - k * STEP_MS;
       delta = k * STEP_MS;
+      if (drift >= STEP_MS) {
+        delta += STEP_MS;
+        drift -= STEP_MS;
+      } else if (drift <= -STEP_MS) {
+        delta -= STEP_MS;
+        drift += STEP_MS;
+      }
     }
   }
   acc += delta;
@@ -47,5 +70,5 @@ export function pace(acc: number, rawDeltaMs: number, snap = true): PaceResult {
   // Never bank more than one step of debt — avoids a catch-up spiral after
   // long stalls (tab switch etc).
   if (acc > STEP_MS) acc = STEP_MS;
-  return { steps, acc };
+  return { steps, acc, drift };
 }

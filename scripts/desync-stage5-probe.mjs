@@ -100,7 +100,16 @@ try {
     t.resume();
   });
 
+  // A persistent all-black presented canvas is the real failure class; a
+  // single transient dark frame (spell-portrait fade, a dark band of the
+  // scrolling sheet) is normal. So require a RUN of consecutive fully-blank
+  // samples (both static frame-art points AND all playfield points dark) to
+  // count as black — a momentary dark frame resets the run.
+  const PERSISTENT_BLACK_RUN = 3; // ~300ms of solid black = persistent
   let blackPresents = 0;
+  let consecutiveBlack = 0;
+  let maxBlackRun = 0;
+  let persistent = false;
   let spellHeld = 0;
   const screenshots = [];
   for (let i = 0; i < SAMPLES; i++) {
@@ -115,11 +124,19 @@ try {
       };
     }, { framePoints: FRAME_POINTS, playfieldPoints: PLAYFIELD_POINTS });
     const sum = (px) => px[0] + px[1] + px[2];
-    const framesBlack = sample.framePixels.every((px) => sum(px) <= NEAR_BLACK);
-    const playfieldBlack = sample.playfieldPixels.every((px) => sum(px) <= NEAR_BLACK);
-    if (framesBlack || playfieldBlack) {
+    // Fully blank: static frame art is dark too (≈ #400e20 → 0x40=64 > NEAR_BLACK
+    // when healthy), so its presence rules out a merely-dark playfield.
+    const fullyBlank =
+      sample.framePixels.every((px) => sum(px) <= NEAR_BLACK) &&
+      sample.playfieldPixels.every((px) => sum(px) <= NEAR_BLACK);
+    if (fullyBlank) {
+      consecutiveBlack++;
       blackPresents++;
-      console.error(`sample ${i}: black presented frame`, JSON.stringify(sample));
+      maxBlackRun = Math.max(maxBlackRun, consecutiveBlack);
+      if (consecutiveBlack >= PERSISTENT_BLACK_RUN) persistent = true;
+      console.error(`sample ${i}: black presented frame (run ${consecutiveBlack})`);
+    } else {
+      consecutiveBlack = 0;
     }
     if (sample.spellName) spellHeld++;
     if (i === 0 || i === SAMPLES - 1) {
@@ -148,13 +165,15 @@ try {
     backBuffered: canvas?.backBuffered ?? false,
     spellFrames: `${spellHeld}/${SAMPLES}`,
     blackPresents,
+    maxBlackRun,
+    persistentBlack: persistent,
     shotsBlack,
     pageErrors: errors
   };
   console.log(JSON.stringify(report));
 
   if (errors.length) process.exitCode = 4;
-  else if (blackPresents > 0) process.exitCode = 5;
+  else if (persistent) process.exitCode = 5;
   else if (shotsBlack && !granted) process.exitCode = 5;
   else if (shotsBlack && granted) {
     console.warn('WARNING: screenshots read black while presented pixels are healthy — headless capture may bypass the compositor on a desynchronized canvas; manual eyeball required.');
