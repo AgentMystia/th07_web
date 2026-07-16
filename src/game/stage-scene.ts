@@ -4302,6 +4302,13 @@ export class StageScene implements GameHost {
             it.vx = 0;
             it.vy = 0;
             it.state = 0;
+            // ItemManager::OnUpdate's timer==60 branch does NOT jump to
+            // check_collision: it falls through to the shared move (zero
+            // velocity, no-op) and the gravity tail, so the fall arms
+            // 0.03 on this very tick. Skipping that left every death-drop
+            // item one gravity step behind native forever (th7_udYo01
+            // stage 2, post-death collects 3 frames late).
+            it.vy = Math.fround(Math.fround(0.03) * rate);
           }
         } else {
           const t = (tw.elapsed + tw.frac) / 60;

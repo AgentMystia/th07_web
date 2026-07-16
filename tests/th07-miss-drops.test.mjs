@@ -105,18 +105,23 @@ test('death drops fly a 60-frame positional tween to the rand target, then fall 
   assert.ok(Math.abs(it.x - ex) < 1e-6 && Math.abs(it.y - ey) < 1e-6, `frame 60: t=59/60 — the lerp never reaches the target`);
   assert.equal(it.state, 2, 'still mode 2 on the last lerp frame');
 
-  scene.updateItems(); // elapsed 60: velocity zeroed, state -> 0, no move
+  scene.updateItems(); // elapsed 60: velocity zeroes, state -> 0, and the
+  // native timer==60 branch falls through to the shared move (no-op at zero
+  // velocity) and gravity tail — vy leaves this tick already armed at 0.03
+  // (ItemManager::OnUpdate; the old all.c reading that kept vy at 0 for one
+  // extra frame left every death drop a gravity step behind native).
   assert.equal(it.state, 0, 'frame 61: tween over, normal item');
-  assert.deepEqual([it.vx, it.vy], [0, 0], 'frame 61: velocity zeroed');
+  assert.deepEqual([it.vx, it.vy], [0, Math.fround(0.03)], 'frame 61: gravity armed on the handoff tick');
   assert.ok(Math.abs(it.x - ex) < 1e-6 && Math.abs(it.y - ey) < 1e-6, 'frame 61: position holds');
 
-  scene.updateItems(); // first normal-fall frame: integrate zero, then arm gravity
-  assert.ok(Math.abs(it.y - ey) < 1e-6, `frame 62: zero velocity holds position (${it.y})`);
-  assert.ok(Math.abs(it.vy - 0.03) < 1e-9, 'frame 62: gravity is stored for the next frame');
+  scene.updateItems(); // first normal-fall frame integrates the armed 0.03
+  const fall1 = Math.fround(ey + Math.fround(Math.fround(0.03) * 1));
+  assert.equal(it.y, fall1, `frame 62: float32 fall by 0.03 (${it.y})`);
+  assert.ok(Math.abs(it.vy - 0.06) < 1e-6, 'frame 62: gravity accumulates to 0.06');
   assert.equal(it.x, ex, 'frame 62: no horizontal drift after the tween');
   scene.updateItems();
-  const afterGravity = Math.fround(ey + Math.fround(0.03));
-  assert.equal(it.y, afterGravity, `frame 63: float32 fall by 0.03 (${it.y})`);
+  const fall2 = Math.fround(fall1 + Math.fround(0.06));
+  assert.ok(Math.abs(it.y - fall2) < 1e-6, `frame 63: float32 fall by 0.06 (${it.y})`);
 });
 
 test('a top-of-field target rises during the tween but falls back after it ends', () => {
