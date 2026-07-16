@@ -3406,9 +3406,24 @@ export class StageScene implements GameHost {
 
   private checkEnemyBulletCollision(b: EnemyBullet): void {
     const p = this.playerObj;
-    if (b.dead || this.gameOver || !p.alive) return;
+    if (b.dead || this.gameOver) return;
     const dx = Math.abs(b.x - p.x);
     const dy = Math.abs(b.y - p.y);
+    if (!p.alive) {
+      // Native Player.cpp:1032 CalcKillboxCollision: playerState != ALIVE
+      // (deathbomb window, death squish, or respawn materialize) returns 1 —
+      // a SILENT despawn: no RerollRng, no Die. CheckGraze (Player.cpp:1061)
+      // returns 0 for DEAD/SPAWNING, and an ungrazed bullet old enough to
+      // graze-test takes that result-0 branch and never reaches the killbox
+      // (BulletManager.cpp:995-1016 call flow) — only already-grazed or
+      // young bullets despawn. The despawn is NOT a contact event: firing
+      // onPlayerContact here inflated Mt01 playerHits 18 -> 58 in the
+      // reverted first attempt at this fix.
+      if (!b.grazed && b.age > 15) return;
+      if (dx > b.grazeW / 2 + p.hitboxHalf || dy > b.grazeH / 2 + p.hitboxHalf) return;
+      this.removeEnemyBullet(b);
+      return;
+    }
     if (!b.grazed && b.age > 15 &&
         dx <= b.grazeW / 2 + p.grazeboxHalf + 20 &&
         dy <= b.grazeH / 2 + p.grazeboxHalf + 20) {
@@ -3418,7 +3433,7 @@ export class StageScene implements GameHost {
     if (dx > b.grazeW / 2 + p.hitboxHalf || dy > b.grazeH / 2 + p.hitboxHalf) return;
     this.onPlayerContact?.('bullet');
     // FUN_0043b200 result 1 consumes the touching bullet while the player is
-    // materializing, invulnerable, bombing, or already in the deathbomb state.
+    // invulnerable, bombing, or already in the deathbomb state.
     if (p.invulnFrames > 0 || p.bombInvuln > 0 || p.hitState) {
       this.removeEnemyBullet(b);
       return;
