@@ -4283,7 +4283,13 @@ export class StageScene implements GameHost {
     // character/shot selector; treating it as Sakuya made Lunatic drops home
     // eleven to twenty-four frames too early in the replay oracle.
     // On success the item's state byte (+0x27f) is permanently latched to 1.
-    const pocActive = p.alive
+    // ItemManager::OnUpdate re-reads currentPower / hasBorder LIVE for every
+    // item: a power pickup that crosses 128 (or a border activation) inside
+    // this very pass immediately latches the LATER slots of the same pass.
+    // Hoisting the predicate froze it at the frame-entry power and made
+    // full-power conversions start homing one frame late (th7_udMt01 st6
+    // collect#1, oracle rf919 vs web rf920).
+    const pocActive = () => p.alive
       && (p.power >= 128 || this.difficulty > 3)
       && p.y < sht.pocLineY;
     const rate = Math.fround(this.slowRate);
@@ -4329,7 +4335,7 @@ export class StageScene implements GameHost {
           // this latch while the border timer is active — do not drop it.)
           it.state = 1;
           it.guaranteedMax = true;
-        } else if (pocActive) {
+        } else if (pocActive()) {
           it.state = 1;
         }
         if (it.state === 1) {
