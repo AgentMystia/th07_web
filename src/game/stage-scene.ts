@@ -4128,8 +4128,13 @@ export class StageScene implements GameHost {
     if (b.x < 0 || b.x >= 384) b.angle = normalizeAngle(-b.angle - Math.PI);
     if (b.y < 0 || (includeBottom && b.y >= 448)) b.angle = -b.angle;
     b.speed = bo.speed;
-    b.vx = Math.cos(b.angle) * b.speed * this.slowRate;
-    b.vy = Math.sin(b.angle) * b.speed * this.slowRate;
+    // Native BulletManager.cpp:870-871 AngleToVector(&velocity, angle,
+    // speed * effectiveFramerateMultiplier): the rate-scaled speed and each
+    // cos/sin product store through float32 (same FUN_004074e0 staging as
+    // dirChangeBullet above).
+    const scaledSpeed = Math.fround(Math.fround(b.speed) * Math.fround(this.slowRate));
+    b.vx = Math.fround(Math.fround(Math.cos(b.angle)) * scaledSpeed);
+    b.vy = Math.fround(Math.fround(Math.sin(b.angle)) * scaledSpeed);
     b.exBounceTimes++;
     if (b.exBounceTimes >= maxTimes) b.exFlags &= 0xf3ff;
   }
