@@ -1509,10 +1509,12 @@ export class StageScene implements GameHost {
     color: number,
     seed?: { x: number; y: number; z: number },
     ownerEnemyId?: number,
-    // Border break only: fixed per-petal directions assigned positionally to
-    // each *successfully allocated* particle (skipped allocations skip an
-    // angle, exactly like the exe's per-returned-effect loop). Never feeds
-    // back into spawn order or RNG.
+    // Border break only: the 32 fixed petal directions, assigned to the 32
+    // BreakBorder SpawnEffect calls in order. Native loops 32× unconditionally
+    // and each SpawnEffect always allocates (a full pool writes dummy slot
+    // 408 rather than returning null), so allocation index == call index is
+    // 1:1 with these directions. Indexed by (requested - remaining), the
+    // successful-allocation count. Never feeds back into spawn order or RNG.
     burstDirs?: readonly { x: number; y: number }[]
   ): void {
     // The whole engine draws from ONE RNG stream (all 147 exe call sites share
@@ -4887,7 +4889,12 @@ export class StageScene implements GameHost {
             p.y = projected.y;
           }
         }
-      } else {
+      } else if (!p.burstDir) {
+        // Border-break petals (effectId 29 with a burstDir) are positioned
+        // exclusively by UpdateBurst30Frames — pos = emitter + dir·(age·256/30)
+        // (EffectManager.cpp:232-237). Hold their spawn point (the break
+        // emitter) steady instead of integrating the legacy random velocity,
+        // which native discards for these. Other particles keep their walk.
         p.x += p.vx;
         p.y += p.vy;
       }

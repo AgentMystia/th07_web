@@ -141,7 +141,7 @@ tolerances ±12 on color channels, ±10 on texture % unless noted):
 | region | healthy reading | failure signature |
 |---|---|---|
 | `sky` | lavender-grey avg (≈`#acaacd`), texture ≤3% | high texture = geometry leaking above fog |
-| `ground-left/center/right` | texture ≥10% all three (13–60%) | any side flat at fog color (≈`#8080c0`, texture ≤3%) = missing geometry / corner-vs-center bug |
+| `ground-left/center/right` | texture ≥6% all three (7–60%; ground-right runs 7–8% under the upright-billboard tree renderer — `pixel-gate.mjs` enforces ≥6) | any side flat at fog color (≈`#8080c0`, texture ≤3%) = missing geometry / instance-culling void |
 | `frame-left/right` | avg ≈`#400e20`, texture 0% | near-black = frame tiles not drawn; shifted avg = wrong tile rect |
 | `hud-labels` | texture ≈30–45%, ≥100 colors | texture ≤5% = labels missing/misanchored |
 | `hud-digits` | texture ≥20% | 0% = digit font not rendering |
@@ -240,10 +240,13 @@ semantics. HUD/menu layout coordinates from ANM scripts are top-left
 HUD reworks shipped half-a-sprite off before this was written down.
 
 **STD** (`src/formats/std.ts`): world axes x lateral, y forward depth,
-z height with **negative z = up**. **Quads extend from their position
-corner by width/height** — position is NOT a center. (Center semantics
-leaves the road's right half ungeometried wherever rows have single
-instances — most of the stage and the whole boss loop.) Script ops:
+z height with **negative z = up**. **Quad anchoring is per-script
+(AnmManager::Draw3 anchor bits):** op22/anchorTL scripts extend from
+their position CORNER by width/height (stage ground tiles, the stage-5
+staircase treads/risers); unanchored scripts are CENTERED on position
+(stage-5 balustrades, the billboards). autoRotate=2 (ANM op25 arg 2)
+scripts are camera-facing billboards (Stage.cpp:1032-1103 →
+DrawFacingCamera), not flat slabs. Script ops:
 5 camera-position keyframe (args are float bit-patterns even when the
 disassembly prints ints), 6 interpolate camera to next keyframe
 (duration, easing mode — same formula table as ANM), 7 facing as a
@@ -252,8 +255,9 @@ near, far), 2 fog interp duration, 4 jump (loops the script clock;
 stage 1 loops frames 5510→6022, a one-tile-exact seamless dolly),
 11 FOV (30°). The sky IS the current fog color; cells ≥98% fogged are
 skipped (the slack-expanded texture edges otherwise peek past the fog
-overlay as streaks). Trees are ZUN sprite-stacking: flat stacked layers,
-never billboards.
+overlay as streaks). Roadside trees (stage 1/2) and stage-5/7/8 scenery
+are autoRotate=2 billboards (see the anchor note above) — drawn
+camera-facing with manual euclidean-distance fog, matching the exe.
 
 **ECL** (`src/game/eclvm.ts`, `src/formats/ecl.ts`): header
 `{u16 subCount, u16 timelineCount, u32 offsets[16+subs]}`; sub instruction
