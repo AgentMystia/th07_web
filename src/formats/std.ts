@@ -571,38 +571,213 @@ export class Std {
     };
   }
 
-  // Perspective projection of a world-space point into playfield coordinates,
-  // using the full camera position + orientation (see cameraFrame). World
-  // axes: x lateral, y forward depth, z height (negative = up); the camera's
-  // own facing vector lives in the same axes and may carry a downward tilt
-  // (stage 1 settles at atan(400/500) ≈ 38.7° once the intro pan finishes),
-  // so the view-space depth/vertical used here are proper rotated
-  // projections, not the raw world y/z.
+  // Perspective projection of a world-space point into playfield coordinates
+  // (see projectPoint below — kept as a method for the existing call sites).
   project(x: number, y: number, z: number, cam: CameraFrame, playfield: { x: number; y: number; width: number; height: number }): { x: number; y: number; scale: number } | null {
-    const relX = x - cam.x;
-    const relY = y - cam.y;
-    const relZ = z - cam.z;
-    const viewX = relX * cam.rightX + relY * cam.rightY + relZ * cam.rightZ;
-    const viewY = relX * cam.upX + relY * cam.upY + relZ * cam.upZ;
-    const viewZ = relX * cam.fwdX + relY * cam.fwdY + relZ * cam.fwdZ;
-    if (viewZ <= 40) return null;
-    const halfH = playfield.height / 2;
-    const aspect = playfield.width / playfield.height;
-    const yScale = 1 / Math.tan(cam.fov / 2);
-    const xScale = yScale / aspect;
-    const nx = (viewX * xScale) / viewZ;
-    const ny = (viewY * yScale) / viewZ;
-    return {
-      x: playfield.x + playfield.width * (0.5 + nx * 0.5),
-      y: playfield.y + playfield.height * (0.5 - ny * 0.5),
-      scale: (halfH * yScale) / viewZ
-    };
+    return projectPoint(x, y, z, cam, playfield);
   }
 
-  // View-space depth of a world point — the D3D linear vertex-fog distance
-  // metric (FOGVERTEXMODE=D3DFOG_LINEAR, GameWindow.cpp:748-749), used for
-  // both per-cell fog and the native painter-sort key.
+  // View-space depth of a world point (see viewDepthOf below).
   viewDepth(x: number, y: number, z: number, cam: CameraFrame): number {
-    return (x - cam.x) * cam.fwdX + (y - cam.y) * cam.fwdY + (z - cam.z) * cam.fwdZ;
+    return viewDepthOf(x, y, z, cam);
   }
+}
+
+// Perspective projection of a world-space point into playfield coordinates,
+// using the full camera position + orientation (see Std#cameraFrame). World
+// axes: x lateral, y forward depth, z height (negative = up); the camera's
+// own facing vector lives in the same axes and may carry a downward tilt
+// (stage 1 settles at atan(400/500) ≈ 38.7° once the intro pan finishes),
+// so the view-space depth/vertical used here are proper rotated
+// projections, not the raw world y/z. Free function (no Std state) so the
+// background ordering below and its unit tests can call it directly.
+export function projectPoint(x: number, y: number, z: number, cam: CameraFrame, playfield: { x: number; y: number; width: number; height: number }): { x: number; y: number; scale: number } | null {
+  const relX = x - cam.x;
+  const relY = y - cam.y;
+  const relZ = z - cam.z;
+  const viewX = relX * cam.rightX + relY * cam.rightY + relZ * cam.rightZ;
+  const viewY = relX * cam.upX + relY * cam.upY + relZ * cam.upZ;
+  const viewZ = relX * cam.fwdX + relY * cam.fwdY + relZ * cam.fwdZ;
+  if (viewZ <= 40) return null;
+  const halfH = playfield.height / 2;
+  const aspect = playfield.width / playfield.height;
+  const yScale = 1 / Math.tan(cam.fov / 2);
+  const xScale = yScale / aspect;
+  const nx = (viewX * xScale) / viewZ;
+  const ny = (viewY * yScale) / viewZ;
+  return {
+    x: playfield.x + playfield.width * (0.5 + nx * 0.5),
+    y: playfield.y + playfield.height * (0.5 - ny * 0.5),
+    scale: (halfH * yScale) / viewZ
+  };
+}
+
+// View-space depth of a world point — the D3D linear vertex-fog distance
+// metric (FOGVERTEXMODE=D3DFOG_LINEAR, GameWindow.cpp:748-749), used for
+// both per-cell fog and the painter-sort fallback key.
+export function viewDepthOf(x: number, y: number, z: number, cam: CameraFrame): number {
+  return (x - cam.x) * cam.fwdX + (y - cam.y) * cam.fwdY + (z - cam.z) * cam.fwdZ;
+}
+
+// One quad of the background painter's ordering problem: a world-space quad
+// (or camera-facing billboard) plus the legacy (group, center-depth) rank.
+// Mirrors the Job shape StageScene#drawBackground gathers.
+export interface BgOrderJob {
+  group: number;
+  sortZ: number;
+  billboard: boolean;
+  cx: number;
+  cy: number;
+  cz: number;
+  hw: number;
+  hh: number;
+  cosRx: number; sinRx: number;
+  cosRy: number; sinRy: number;
+  cosRz: number; sinRz: number;
+}
+
+// Painter-order emulation of the exe's per-pixel depth test. Th07 draws its
+// two STD zLevel chains into one shared D3D z-buffer (Stage::RenderObjects,
+// GameWindow z-setup), so interpenetrating quads resolve per pixel. Sorting
+// whole quads by center view-depth broke stage 5, whose -45° slope wall
+// (900×271.5) spans the entire staircase run and whose balustrade strips
+// cross many treads: their centers sort in front of individual steps, and
+// the group-1 relief billboards always painted on top.
+//
+// Approximation used here: for every pair of quads whose screen bounding
+// boxes overlap, cast a ray from the camera through the overlap center and
+// compare the two plane-hit distances — the farther plane draws first. Pairs
+// the ray cannot separate (parallel/coplanar, behind camera) fall back to
+// center depth, then to zLevel-chain order, preserving the legacy stacking
+// for genuinely tied decals. A Kahn topological sort turns the pairwise
+// constraints into a draw order; cycles (possible since constraints are
+// heuristic) break by taking the best legacy-ranked remaining job.
+export function orderBgJobsByVisibility<T extends BgOrderJob>(
+  jobs: T[],
+  cam: CameraFrame,
+  playfield: { x: number; y: number; width: number; height: number }
+): T[] {
+  const n = jobs.length;
+  const legacyRank = jobs.map((_, i) => i).sort((a, b) =>
+    (jobs[a].group - jobs[b].group) || (jobs[b].sortZ - jobs[a].sortZ) || (a - b));
+  if (n <= 1) return legacyRank.map((i) => jobs[i]);
+
+  // Per-job plane (unit normal + the on-plane center point) and screen bbox.
+  const nx = new Float64Array(n), ny = new Float64Array(n), nz = new Float64Array(n);
+  const minX = new Float64Array(n), maxX = new Float64Array(n);
+  const minY = new Float64Array(n), maxY = new Float64Array(n);
+  const usable = new Uint8Array(n);
+  const scratch: Vec3 = { x: 0, y: 0, z: 0 };
+  const uAxis: Vec3 = { x: 0, y: 0, z: 0 };
+  for (let i = 0; i < n; i++) {
+    const j = jobs[i];
+    if (j.billboard) {
+      // Camera-facing quad: plane through the center perpendicular to the
+      // view axis; screen extent from the projected perspective scale.
+      const p = projectPoint(j.cx, j.cy, j.cz, cam, playfield);
+      if (!p) continue;
+      nx[i] = cam.fwdX; ny[i] = cam.fwdY; nz[i] = cam.fwdZ;
+      minX[i] = p.x - j.hw * p.scale; maxX[i] = p.x + j.hw * p.scale;
+      minY[i] = p.y - j.hh * p.scale; maxY[i] = p.y + j.hh * p.scale;
+      usable[i] = 1;
+      continue;
+    }
+    let lo = Infinity, hi = -Infinity, loY = Infinity, hiY = -Infinity, valid = 0;
+    for (let s = 0; s < 4; s++) {
+      bgQuadCorner(scratch, (s & 1 ? 1 : -1) * j.hw, (s & 2 ? 1 : -1) * j.hh,
+        j.cosRx, j.sinRx, j.cosRy, j.sinRy, j.cosRz, j.sinRz, j.cx, j.cy, j.cz);
+      const p = projectPoint(scratch.x, scratch.y, scratch.z, cam, playfield);
+      if (!p) continue;
+      valid++;
+      if (p.x < lo) lo = p.x;
+      if (p.x > hi) hi = p.x;
+      if (p.y < loY) loY = p.y;
+      if (p.y > hiY) hiY = p.y;
+    }
+    if (!valid) continue;
+    // Rotated local u/v axes; their cross product is the quad plane normal.
+    bgQuadCorner(uAxis, 1, 0, j.cosRx, j.sinRx, j.cosRy, j.sinRy, j.cosRz, j.sinRz, 0, 0, 0);
+    bgQuadCorner(scratch, 0, 1, j.cosRx, j.sinRx, j.cosRy, j.sinRy, j.cosRz, j.sinRz, 0, 0, 0);
+    let cnx = uAxis.y * scratch.z - uAxis.z * scratch.y;
+    let cny = uAxis.z * scratch.x - uAxis.x * scratch.z;
+    let cnz = uAxis.x * scratch.y - uAxis.y * scratch.x;
+    const len = Math.hypot(cnx, cny, cnz);
+    if (len < 1e-9) continue;
+    nx[i] = cnx / len; ny[i] = cny / len; nz[i] = cnz / len;
+    minX[i] = lo; maxX[i] = hi; minY[i] = loY; maxY[i] = hiY;
+    usable[i] = 1;
+  }
+
+  // Screen point -> world-space ray direction through the camera basis.
+  const yScale = 1 / Math.tan(cam.fov / 2);
+  const xScale = yScale / (playfield.width / playfield.height);
+  const RAY_EPS = 1e-3;
+  const DEPTH_EPS = 1e-3;
+  const planeHit = (i: number, dx: number, dy: number, dz: number): number | null => {
+    const denom = dx * nx[i] + dy * ny[i] + dz * nz[i];
+    if (Math.abs(denom) < 1e-9) return null;
+    const j = jobs[i];
+    const t = ((j.cx - cam.x) * nx[i] + (j.cy - cam.y) * ny[i] + (j.cz - cam.z) * nz[i]) / denom;
+    return t > RAY_EPS ? t : null;
+  };
+
+  // before[i] = set of job indices that must draw before i.
+  const before: Array<Set<number> | null> = new Array(n).fill(null);
+  const addBefore = (i: number, dep: number): void => {
+    (before[i] ??= new Set()).add(dep);
+  };
+  for (let a = 0; a < n; a++) {
+    if (!usable[a]) continue;
+    const A = jobs[a];
+    for (let b = a + 1; b < n; b++) {
+      if (!usable[b]) continue;
+      const ox0 = Math.max(minX[a], minX[b]), ox1 = Math.min(maxX[a], maxX[b]);
+      if (ox1 <= ox0) continue;
+      const oy0 = Math.max(minY[a], minY[b]), oy1 = Math.min(maxY[a], maxY[b]);
+      if (oy1 <= oy0) continue;
+      const B = jobs[b];
+      const vx = ((((ox0 + ox1) / 2 - playfield.x) / playfield.width - 0.5) * 2) / xScale;
+      const vy = ((0.5 - ((oy0 + oy1) / 2 - playfield.y) / playfield.height) * 2) / yScale;
+      const dx = vx * cam.rightX + vy * cam.upX + cam.fwdX;
+      const dy = vx * cam.rightY + vy * cam.upY + cam.fwdY;
+      const dz = vx * cam.rightZ + vy * cam.upZ + cam.fwdZ;
+      const ta = planeHit(a, dx, dy, dz);
+      const tb = planeHit(b, dx, dy, dz);
+      let aFirst: boolean;
+      if (ta != null && tb != null && Math.abs(ta - tb) > RAY_EPS) aFirst = ta > tb;
+      else if (Math.abs(A.sortZ - B.sortZ) > DEPTH_EPS) aFirst = A.sortZ > B.sortZ;
+      else if (A.group !== B.group) aFirst = A.group < B.group;
+      else continue; // genuine tie: leave unconstrained, legacy rank decides
+      if (aFirst) addBefore(b, a);
+      else addBefore(a, b);
+    }
+  }
+
+  // Kahn topological sort over the constraints, visiting in legacy-rank order
+  // so unconstrained regions keep the old stable ordering.
+  const remaining = new Uint8Array(n).fill(1);
+  const order: T[] = [];
+  let left = n;
+  while (left > 0) {
+    let picked = -1;
+    for (const i of legacyRank) {
+      if (!remaining[i]) continue;
+      const deps = before[i];
+      let ready = true;
+      if (deps) {
+        for (const dep of deps) {
+          if (remaining[dep]) { ready = false; break; }
+        }
+      }
+      if (ready) { picked = i; break; }
+    }
+    if (picked < 0) {
+      // Constraint cycle: fall back to the best-ranked remaining job.
+      picked = legacyRank.find((i) => remaining[i] === 1)!;
+    }
+    remaining[picked] = 0;
+    left--;
+    order.push(jobs[picked]);
+  }
+  return order;
 }

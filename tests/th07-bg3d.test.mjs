@@ -12,7 +12,7 @@ import { mkdirSync } from 'node:fs';
 const outDir = 'tests/.build/bg3d';
 mkdirSync(outDir, { recursive: true });
 execSync(`npx esbuild src/formats/std.ts --bundle --format=esm --outdir=${outDir} --out-extension:.js=.mjs --log-level=silent`);
-const { bgQuadCorner, Std } = await import(`../${outDir}/std.mjs`);
+const { bgQuadCorner, Std, orderBgJobsByVisibility, viewDepthOf } = await import(`../${outDir}/std.mjs`);
 
 const close = (a, b, eps = 1e-4) => assert.ok(Math.abs(a - b) <= eps, `${a} != ${b}`);
 
@@ -89,4 +89,79 @@ test('viewDepth uses the camera forward axis (D3D linear vertex-fog metric)', ()
   // straight ahead at (0, 100·cos30°, -100·sin30°) reads exactly 100.
   const tilt = { ...cam, fwdX: 0, fwdY: Math.cos(Math.PI / 6), fwdZ: -Math.sin(Math.PI / 6) };
   close(std.viewDepth(0, 100 * Math.cos(Math.PI / 6), -100 * Math.sin(Math.PI / 6), tilt), 100, 1e-9);
+});
+
+// --- Painter ordering (orderBgJobsByVisibility) ------------------------------
+// The exe depth-tests background pixels; the web painter emulates that with
+// pairwise ray ordering. Geometry below is real stage-5 data at STD frame
+// 2400 (camera from the live run): the -45° slope wall spans the whole
+// staircase run and its CENTER depth (1056.5) is NEARER than an individual
+// tread's (1093.8), so the legacy center-depth sort painted the wall over
+// the treads — the "brown band through the stairs" tear.
+
+const S5_CAM = {
+  x: 0, y: 884.613563950842, z: -1684.613563950842,
+  rightX: 1, rightY: 0, rightZ: 0,
+  upX: 0, upY: 0.04993761694389223, upZ: -0.9987523388778446,
+  fwdX: 0, fwdY: 0.9987523388778446, fwdZ: 0.04993761694389223,
+  fov: 0.6283185482025146
+};
+const S5_PLAYFIELD = { x: 32, y: 16, width: 384, height: 448 };
+
+function bgJob(overrides) {
+  return {
+    group: 0, sortZ: 0, billboard: false,
+    cx: 0, cy: 0, cz: 0, hw: 10, hh: 10,
+    cosRx: 1, sinRx: 0, cosRy: 1, sinRy: 0, cosRz: 1, sinRz: 0,
+    ...overrides
+  };
+}
+
+test('ordering: stage-5 slope wall draws before the tread it passes behind', () => {
+  // obj1 wall (script 16, instY=1244): anchorTL 900x271.5 quad rot(-45°,0,0),
+  // center (130, 1379.75, -1376). obj0 tread (script 6, same flight): 256x24
+  // rot(-11.25°,0,0) with z offset -2, center (0, 1400, -1490). At this
+  // camera the pair overlaps on screen (tread at screen y≈462) — every obj1
+  // piece lies in the y+z=3.75 slope plane, and the camera/tread both sit on
+  // its near side, so the tread is in front and the wall must paint first.
+  const wallRx = -Math.PI / 4;
+  const wall = bgJob({
+    cx: 130, cy: 1379.75, cz: -1376, hw: 450, hh: 135.75,
+    cosRx: Math.cos(wallRx), sinRx: Math.sin(wallRx),
+    sortZ: viewDepthOf(130, 1379.75, -1376, S5_CAM)
+  });
+  const treadRx = -0.19635;
+  const tread = bgJob({
+    cx: 0, cy: 1400, cz: -1490, hw: 128, hh: 12,
+    cosRx: Math.cos(treadRx), sinRx: Math.sin(treadRx),
+    sortZ: viewDepthOf(0, 1400, -1490, S5_CAM)
+  });
+  // Precondition (the live-dump pathology): the wall's center is NEARER
+  // (smaller depth), so the legacy sort drew the tread first and the wall
+  // over it — the brown band. The ray test must reverse that.
+  assert.ok(wall.sortZ < tread.sortZ, 'wall center must sort nearer than the tread');
+  const ordered = orderBgJobsByVisibility([tread, wall], S5_CAM, S5_PLAYFIELD);
+  assert.equal(ordered[0], wall, 'wall must draw before the tread');
+  assert.equal(ordered[1], tread);
+});
+
+test('ordering: screen-disjoint quads keep the legacy center-depth order', () => {
+  // Two small flat slabs left/right of the view axis: no screen overlap, so
+  // no constraint forms and the farther-center quad still draws first.
+  const near = bgJob({ cx: -60, cy: 1200, cz: -1500, sortZ: viewDepthOf(-60, 1200, -1500, S5_CAM) });
+  const far = bgJob({ cx: 60, cy: 1400, cz: -1500, sortZ: viewDepthOf(60, 1400, -1500, S5_CAM) });
+  const ordered = orderBgJobsByVisibility([near, far], S5_CAM, S5_PLAYFIELD);
+  assert.equal(ordered[0], far);
+  assert.equal(ordered[1], near);
+});
+
+test('ordering: coplanar overlapping quads keep the zLevel-chain order', () => {
+  // Identical plane, identical center depth, different draw chains: the ray
+  // and depth fallbacks both tie, so the group-0 quad must stay first (the
+  // exe draws chain 0/1 before 2/3, and ties resolve by draw order there).
+  const decalBase = bgJob({ cx: 0, cy: 1400, cz: -1500, hw: 50, hh: 50, group: 0, sortZ: viewDepthOf(0, 1400, -1500, S5_CAM) });
+  const decalTop = { ...decalBase, group: 1 };
+  const ordered = orderBgJobsByVisibility([decalTop, decalBase], S5_CAM, S5_PLAYFIELD);
+  assert.equal(ordered[0], decalBase, 'group 0 must draw before group 1 on a tie');
+  assert.equal(ordered[1], decalTop);
 });

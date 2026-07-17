@@ -8,7 +8,7 @@ import type { InputFrame } from '../core/input';
 import { Renderer, PLAYFIELD, SCREEN_W } from '../gfx/renderer';
 import type { GameAssets } from './assets';
 import { Anm, AnmRunner, type AnmFrame } from '../formats/anm';
-import { bgQuadCorner, type Vec3 } from '../formats/std';
+import { bgQuadCorner, orderBgJobsByVisibility, type Vec3 } from '../formats/std';
 import { TH07_DATA } from '../data/th07-data';
 import type { AudioBus } from '../audio/audio';
 import {
@@ -5500,10 +5500,11 @@ export class StageScene implements GameHost {
   // Each quad is transformed like the exe's AnmManager::Draw3 — a centered
   // local quad scaled to the STD size, rotated X->Y->Z by its ANM script,
   // anchor-shifted when the script sets op22 — subdivided along its local v
-  // axis into strips for perspective-correct-enough texture mapping, sorted
-  // back-to-front, with linear distance fog. autoRotate=2 scripts become
-  // camera-facing billboards with manual fog (Stage::RenderObjects,
-  // Stage.cpp:1032-1103).
+  // axis into strips for perspective-correct-enough texture mapping, painted
+  // back-to-front per orderBgJobsByVisibility (pairwise ray ordering standing
+  // in for the exe's z-buffer), with linear distance fog. autoRotate=2
+  // scripts become camera-facing billboards with manual fog
+  // (Stage::RenderObjects, Stage.cpp:1032-1103).
   private drawBackground(r: Renderer, ox: number, oy: number): void {
     const std = this.runtime.std;
     // Camera/fog use script time; quad textures use independent VM time.
@@ -5528,11 +5529,12 @@ export class StageScene implements GameHost {
     type Job = {
       frame: AnmFrame;
       // The exe splits objects across two draw chains by zLevel (0/1 in the
-      // high-prio chain, 2/3 in the low one); painter's algorithm keeps that
-      // as two depth-sorted groups drawn in order.
+      // high-prio chain, 2/3 in the low one), but both chains share one D3D
+      // z-buffer — so chain order only matters for depth ties. Here group is
+      // the ordering fallback for pairs the ray test can't separate.
       group: number;
       // View-space depth of the quad center — the D3D vertex-fog metric and
-      // the back-to-front sort key.
+      // the ordering fallback before group.
       sortZ: number;
       billboard: boolean;
       // World-space quad center and half extents; for billboards the center
@@ -5597,11 +5599,15 @@ export class StageScene implements GameHost {
         });
       }
     }
-    jobs.sort((a, b) => (a.group - b.group) || (b.sortZ - a.sortZ));
+    // The exe depth-tests every background pixel (shared z-buffer across both
+    // zLevel chains); a Canvas2D painter must emulate that with draw order.
+    // Center-depth sorting alone tore stage 5 apart — see
+    // orderBgJobsByVisibility for the pairwise ray-ordering replacement.
+    const ordered = orderBgJobsByVisibility(jobs, camFrame, playfield);
 
     const fogSpan = Math.max(1, fog.far - fog.near);
     const lateralExpand = 10; // world units; hides seams between laterally-adjacent tiles
-    for (const job of jobs) {
+    for (const job of ordered) {
       const rect = job.frame;
       const tint = (rect.color & 0x00ffffff) !== 0x00ffffff;
       const img = tint ? r.tintedRect(rect.imageKey, rect.x, rect.y, rect.w, rect.h, rect.color) : r.image(rect.imageKey);
@@ -6020,22 +6026,23 @@ export class StageScene implements GameHost {
     // timer-advance order, including the repeated 50000 first active tick.
     const plusVal = Math.max(0, Math.trunc(this.cherry.cherryPlus));
     if (this.cherry.borderEngaged) {
-      // AsciiManager.cpp:1256-1295: while a border is pending/active the
+      // AsciiManager.cpp:1251-1295: while a border is pending/active the
       // cherryPlus digits switch to the native recolor (r=255, g/b computed
       // from the value with the %4000 triangle fold), scale x1.41, a 10px
-      // advance and a (+2,-2) offset. (The web keeps its right-aligned
-      // layout; the digit styling is native.)
+      // advance, LEFT-aligned from gauge.x + 40+6+7 (+2,-2 border offset).
+      // The web used to right-align them at the cherry field's edge, which
+      // landed ~20px left / 3px low of vanilla and collided with the
+      // cherry/cherryMax row below.
       const rem = plusVal % 4000;
       const tri = rem >= 2000 ? 4000 - rem : rem;
       const gb = Math.min(255, Math.trunc(plusVal * 192 / 50000) + Math.trunc(tri * 64 / 2000));
       const color = (0xff << 16) | (gb << 8) | gb;
       const digits = String(plusVal);
-      const right = PLAYFIELD.x + 84 + 2;
+      const left = PLAYFIELD.x + 53 + 2;
       for (let i = 0; i < digits.length; i++) {
         const d = digits.charCodeAt(i) - 48;
         r.drawSprite('ascii', d * DIGIT_W, DIGIT_Y, DIGIT_W, DIGIT_H,
-          right - 5 - (digits.length - 1 - i) * 10, 444 - 2 + 8,
-          { color, scaleMultiplier: 1.41 });
+          left + 5 + i * 10, 447, { color, scaleMultiplier: 1.41 });
       }
     } else {
       r.text(`+${plusVal}`, PLAYFIELD.x + 84, 444, { size: 10, color: '#c080b0', align: 'right' });

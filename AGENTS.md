@@ -258,6 +258,14 @@ skipped (the slack-expanded texture edges otherwise peek past the fog
 overlay as streaks). Roadside trees (stage 1/2) and stage-5/7/8 scenery
 are autoRotate=2 billboards (see the anchor note above) — drawn
 camera-facing with manual euclidean-distance fog, matching the exe.
+**Draw order is NOT center-depth sorting**: the exe z-buffers every
+background pixel (both zLevel chains share one depth buffer), which
+`orderBgJobsByVisibility` emulates by ray-casting through each
+screen-overlapping pair's overlap center and drawing the farther plane
+first (fallbacks: center depth, then zLevel-chain order for ties).
+Center-depth-only sorting tore stage 5 apart — its -45° slope wall
+spans the whole staircase run, so its CENTER often sorts nearer than
+individual treads while lying behind them.
 
 **ECL** (`src/game/eclvm.ts`, `src/formats/ecl.ts`): header
 `{u16 subCount, u16 timelineCount, u32 offsets[16+subs]}`; sub instruction
