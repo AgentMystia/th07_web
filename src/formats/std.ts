@@ -158,6 +158,25 @@ export function applyStdFormula(t: number, mode: number): number {
   }
 }
 
+// Row-vector X→Y→Z rotation of a local quad offset (u,v,0), translated to
+// the quad's world center — the same math AnmManager::Draw3 applies to the
+// centered 256x256 base quad (S·RotX·RotY·RotZ, AnmManager.cpp:1418-1441),
+// in the STD world axes (x lateral, y depth, z height; unrotated = flat slab,
+// which is why flat quads reduce to the old corner extents).
+export function bgQuadCorner(
+  out: Vec3, u: number, v: number,
+  cosRx: number, sinRx: number, cosRy: number, sinRy: number, cosRz: number, sinRz: number,
+  cx: number, cy: number, cz: number
+): void {
+  const y1 = v * cosRx;
+  const z1 = v * sinRx;
+  const x2 = u * cosRy + z1 * sinRy;
+  const z2 = -u * sinRy + z1 * cosRy;
+  out.x = cx + x2 * cosRz - y1 * sinRz;
+  out.y = cy + x2 * sinRz + y1 * cosRz;
+  out.z = cz + z2;
+}
+
 // Camera position + orientation basis for one frame, precomputed once so
 // project() can be called many times per frame with only dot products.
 export interface CameraFrame {
@@ -188,7 +207,7 @@ export class Std {
   private facingTrack = makeVecTrack(vec(0, 1, 0));
   private upTrack = makeVecTrack(vec(0, 1, 0));
   private fovTrack = makeScalarTrack(30 * DEG);
-  private fogCurrent: FogState = { r: 16, g: 0, b: 32, near: 200, far: 500 };
+  private fogCurrent: FogState = { r: 0, g: 0, b: 0, near: 200, far: 500 };
   private fogStart: FogState = { ...this.fogCurrent };
   private fogTarget: FogState = { ...this.fogCurrent };
   private fogDuration = 0;
@@ -297,7 +316,7 @@ export class Std {
     this.facingTrack = makeVecTrack(vec(0, 1, 0));
     this.upTrack = makeVecTrack(vec(0, 1, 0));
     this.fovTrack = makeScalarTrack(30 * DEG);
-    this.fogCurrent = { r: 16, g: 0, b: 32, near: 200, far: 500 };
+    this.fogCurrent = { r: 0, g: 0, b: 0, near: 200, far: 500 };
     this.fogStart = { ...this.fogCurrent };
     this.fogTarget = { ...this.fogCurrent };
     this.fogDuration = 0;
@@ -578,5 +597,12 @@ export class Std {
       y: playfield.y + playfield.height * (0.5 - ny * 0.5),
       scale: (halfH * yScale) / viewZ
     };
+  }
+
+  // View-space depth of a world point — the D3D linear vertex-fog distance
+  // metric (FOGVERTEXMODE=D3DFOG_LINEAR, GameWindow.cpp:748-749), used for
+  // both per-cell fog and the native painter-sort key.
+  viewDepth(x: number, y: number, z: number, cam: CameraFrame): number {
+    return (x - cam.x) * cam.fwdX + (y - cam.y) * cam.fwdY + (z - cam.z) * cam.fwdZ;
   }
 }

@@ -533,9 +533,14 @@ comparisons against real play).
   cleared-stage data this port doesn't persist (approved modernization:
   the stage list exists for testing). The stage list renders as plain
   text (original uses its ascii font + per-stage practice scores).
-- Supernatural Border ring remains procedural (no ANM source recovered);
-  it now closes fully at expiry and the playfield carries the exe's
-  30/480/30 tint envelope (FUN_0043e2e0 state 4).
+- Supernatural Border visuals are now native-faithful: the stage background
+  is multiply-darkened through the exe's 128→48→128 grey envelope with
+  SmoothBlendColor averaging (Player.cpp:1975-1995 + Stage.cpp:512-573),
+  the ring is the real etama.anm script-219 magic circle (scale 1→0.25,
+  spin negated on activation; break spawns the 0.0625→1.3 expanding copy
+  fading out over 30f plus the 32 fixed-angle petal burst), the player
+  sprite flashes red every 4 frames, and the HUD shows the pulsing gauge
+  badge + recolored cherryPlus digits (AsciiManager.cpp:1256-1308).
 - Decorative ambient particles (ECL op117/118 → `spawnEffectParticles`) keep
   approximate raster presentation, but their allocation, fixed 400-slot
   pressure, release clocks, and RNG consumption are executable-derived for

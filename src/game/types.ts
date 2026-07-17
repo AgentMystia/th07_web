@@ -188,6 +188,10 @@ export interface EffectParticle {
   color: number;
   size: number;
   kind: 'spark' | 'snow' | 'burst';
+  // Border-break petals only: the exe overrides each petal's direction to
+  // one of 32 fixed angles (Player.cpp:2183-2190) and flies it along it at
+  // 256/30 px per frame (UpdateBurst30Frames). Visual-only.
+  burstDir?: { x: number; y: number };
   ownerEnemyId?: number;
   releaseFrames?: number;
   world?: {

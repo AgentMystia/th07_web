@@ -8,6 +8,7 @@ import type { InputFrame } from '../core/input';
 import { Renderer, PLAYFIELD, SCREEN_W } from '../gfx/renderer';
 import type { GameAssets } from './assets';
 import { Anm, AnmRunner, type AnmFrame } from '../formats/anm';
+import { bgQuadCorner, type Vec3 } from '../formats/std';
 import { TH07_DATA } from '../data/th07-data';
 import type { AudioBus } from '../audio/audio';
 import {
@@ -15,7 +16,7 @@ import {
   type CharacterId, type PlayerBullet
 } from './player';
 import { PlayerEffects } from './player-effects';
-import { CherrySystem, BORDER_DURATION, CHERRY_PLUS_MAX } from './cherry';
+import { CherrySystem, BORDER_DURATION, CHERRY_PLUS_MAX, borderDimRequest, smoothBlendColor } from './cherry';
 import { BombEngine, BombRunner, type AttackSlot, type BombContext } from './player-bombs';
 import { DialogueRunner, portraitSprite } from './dialogue';
 import { stageBgmTrack } from './bgm';
@@ -120,6 +121,14 @@ const EFFECT_SCRIPT_LIFE: Record<number, number> = {
   32: 90, 33: 120
 };
 const CLEAR_LOADING_ANM = ['loading', 'loading2', 'loading3'] as const;
+// Player::BreakBorder flings its 32 effect-29 petals along 32 fixed
+// directions, angle = -PI + i*PI/16 (Player.cpp:2183-2190). Visual-only —
+// the spawn's RNG contract lives in EFFECT_DRAW_COST[29] and never changes.
+export const BORDER_PETAL_DIRS: readonly { x: number; y: number }[] =
+  Array.from({ length: 32 }, (_, i) => {
+    const angle = -Math.PI + i * (Math.PI / 16);
+    return { x: Math.cos(angle), y: Math.sin(angle) };
+  });
 
 // SE slot table, Th07.exe @ 0x494a78 (38 entries × 8 bytes: {i32 wavIndex,
 // i16 volume_millibels, i16 priority}), read from the exe binary. Sound ids
@@ -507,6 +516,15 @@ export class StageScene implements GameHost {
   // FUN_0043eb00 @ 0x43eb00 creates a fixed-center cancel circle on a
   // border break: radius 32, +16/frame, 50 subsequent ticks.
   borderClearWave: { x: number; y: number; radius: number; ticksLeft: number; createdFrame: number } | null = null;
+  // Supernatural Border presentation (all decorative, no game-RNG access):
+  // - borderRing: the etama.anm script-219 ring VM (effect 28), replaced by
+  //   an expanding/fading copy on break, dropped silently on natural end.
+  // - borderBadgeRunner: ascii.anm script 5's pulsing HUD badge.
+  // - borderDimA/Rgb: Stage::SmoothBlendColor state for the background dim.
+  private borderRing: { runner: AnmRunner; mode: 'active' | 'break'; age: number; x?: number; y?: number } | null = null;
+  private borderBadgeRunner: AnmRunner | null = null;
+  private borderDimA = 0;
+  private borderDimRgb = 128;
   // Mirrors Th07.exe DAT_012f40a8's 1 -> 2 "phase failed by timeout" bump:
   // set by the timer-callback path, consumed by endBossSpell to skip the
   // scored field sweep, cleared by the next declare.
@@ -724,6 +742,31 @@ export class StageScene implements GameHost {
           this.playSfx(32);
           this.playSfx(36);
           this.borderMessage = { type: 2, value: 0, age: 0, timer: 180 };
+          // Player::ActivateBorder (Player.cpp:2126-2142): effect 28 is
+          // etama.anm script 219 (entry 3's full-sheet sprite) — a white
+          // ring following the player, spin negated after spawn, scale
+          // driven 1.0 -> 0.25 over the 540-frame border at draw time. The
+          // script's own wait(var0) self-removes it at 540; var0 is poked
+          // after construction exactly like intVars1[0] in the exe (the
+          // wait sits at script time 1, so it arms from the poked value).
+          // (Decorative only: bare test scenes carry no assets.)
+          const etama = this.assets?.anms?.etama;
+          const ascii = this.assets?.anms?.ascii;
+          if (etama) {
+            const runner = new AnmRunner(etama, 0, {
+              entryIndex: 3,
+              spriteIndexOffset: etama.entries[3].spriteBase
+            });
+            runner.setVariable(0, BORDER_DURATION);
+            runner.negateRotationSpeedZ();
+            this.borderRing = { runner, mode: 'active', age: 0 };
+          }
+          // AsciiManager.cpp:1301-1308: the pulsing border badge rides the
+          // cherry gauge while BORDER_ACTIVE (ascii.anm entry-0 script 5).
+          this.borderBadgeRunner = ascii ? new AnmRunner(ascii, 5, {
+            entryIndex: 0,
+            spriteIndexOffset: ascii.entries[0].spriteBase
+          }) : null;
         },
         onBorderCancel: () => this.applyBorderBreakEffects(null, true),
         onBorderEnd: (result, bonus) => {
@@ -743,6 +786,10 @@ export class StageScene implements GameHost {
             this.playerObj.bombCooldown = 40;
             this.borderMessage = { type: 4, value: bonus * 10, age: 0, timer: 180 };
             this.playSfx(33);
+            // Player::BreakBorderNaturally (Player.cpp:2029): the ring is
+            // simply freed — no burst, no expanding copy.
+            this.borderRing = null;
+            this.borderBadgeRunner = null;
           }
         }
       },
@@ -1461,7 +1508,12 @@ export class StageScene implements GameHost {
     count: number,
     color: number,
     seed?: { x: number; y: number; z: number },
-    ownerEnemyId?: number
+    ownerEnemyId?: number,
+    // Border break only: fixed per-petal directions assigned positionally to
+    // each *successfully allocated* particle (skipped allocations skip an
+    // angle, exactly like the exe's per-returned-effect loop). Never feeds
+    // back into spawn order or RNG.
+    burstDirs?: readonly { x: number; y: number }[]
   ): void {
     // The whole engine draws from ONE RNG stream (all 147 exe call sites share
     // state 0x495e00), so a decorative effect that consumes the wrong number of
@@ -1620,6 +1672,8 @@ export class StageScene implements GameHost {
       }
       this.effectSlots[slot] = particle;
       this.insertByPoolSlot(this.particles, particle);
+      const burstDir = burstDirs?.[requested - remaining];
+      if (burstDir) particle.burstDir = burstDir;
       remaining--;
     }
   }
@@ -2192,6 +2246,18 @@ export class StageScene implements GameHost {
       // freeze DAT_0061c25c is set; the 540-frame clock pauses with gameplay.
       const borderBonus = this.cherry.tick(this.slowRate);
       if (borderBonus > 0) this.addScore(borderBonus);
+      // The border ring/badge VMs ride the same clock (the exe's effect VM
+      // ticks inside the frozen-with-gameplay EffectManager priority band):
+      // both pause while the border timer does.
+      if (this.borderRing) {
+        this.borderRing.runner.update(this.slowRate);
+        this.borderRing.age += this.slowRate;
+        if (this.borderRing.runner.removed) this.borderRing = null;
+      }
+      if (this.borderBadgeRunner) {
+        this.borderBadgeRunner.update(this.slowRate);
+        if (this.borderBadgeRunner.removed) this.borderBadgeRunner = null;
+      }
       // Native scheduler order (FUN_0042e420 + priority registrations):
       // player(8) -> enemies(10) -> effects(11) -> item+bullets/lasers(12).
       // Inside the player callback, existing shots move before the firing
@@ -3638,7 +3704,25 @@ export class StageScene implements GameHost {
     // initializer consumes six raw u16 draws (ANM time-0 + FUN_00419bc0),
     // so omitting this decorative burst hid a 192-draw split at Extra
     // PRE10854 and also changed later fixed-pool pressure.
-    this.spawnEffectParticles(29, p.x, p.y, 32, 0xffffffff);
+    this.spawnEffectParticles(29, p.x, p.y, 32, 0xffffffff, undefined, undefined, BORDER_PETAL_DIRS);
+    // Player::BreakBorder (Player.cpp:2159-2174): the shrinking ring is
+    // replaced by a fresh effect 28 that expands 0.0625 -> 1.3 over 30
+    // frames while fading from the spawn alpha to 0 with mode-1 (t²)
+    // easing. The authored spin keeps its original sign this time.
+    // (Decorative only: bare test scenes carry no assets.)
+    const ringAnm = this.assets?.anms?.etama;
+    if (ringAnm) {
+      const runner = new AnmRunner(ringAnm, 0, {
+        entryIndex: 3,
+        spriteIndexOffset: ringAnm.entries[3].spriteBase
+      });
+      runner.setVariable(0, 30);
+      runner.armFade(30, 1, 255, 0);
+      this.borderRing = { runner, mode: 'break', age: 0, x: p.x, y: p.y };
+    } else {
+      this.borderRing = null;
+    }
+    this.borderBadgeRunner = null;
     // Th07.exe FUN_0043eb00 @ 0x43ed6c-0x43ed89.
     this.playSfx(7);
     this.playSfx(33);
@@ -4206,6 +4290,15 @@ export class StageScene implements GameHost {
       // Respawn materialize (exe state 1): in-place scale/alpha ramp.
       r.drawAnmFrame(pf, ox + p.x, oy + p.y, mt);
     } else {
+      // Supernatural Border (exe PLAYER_STATE_BORDER, Player.cpp:1967-1975):
+      // the sprite flashes red every 4 frames — this takes precedence over
+      // the spawn-invuln dim (both gate on the same invuln timer, and the
+      // border branch wins in the native state dispatcher).
+      if (this.cherry.borderActive) {
+        const flashRed = this.cherry.borderTimer % 4 < 2;
+        r.drawAnmFrame(pf, ox + p.x, oy + p.y, flashRed ? { color: 0xff0000 } : {});
+        return;
+      }
       // Spawn/respawn invuln (exe state 3): dark-tint 0x404040 on frames where
       // (timer & 7) < 2 (fcn.0043e2e0), instead of an invisibility blink.
       const dim = p.invulnFrames > 0 && (p.invulnFrames & 7) < 2;
@@ -4819,43 +4912,28 @@ export class StageScene implements GameHost {
     this.particles.length = w;
   }
 
-  // Supernatural Border visual: a rotating square frame that shrinks as the
-  // border's 9 seconds run out, drawn additively around the player.
-  private drawBorder(r: Renderer, ox: number, oy: number): void {
-    const p = this.playerObj;
-    const t = this.cherry.borderTimer / BORDER_DURATION;
-    // The ring closes fully at the mechanical end — it previously popped
-    // out at 40px, which read as the visual ending early. (The exe kills
-    // its border child object synchronously at expiry, all.c:28804-28807;
-    // the ring itself is this port's flagged procedural approximation.)
-    const radius = 360 * t;
-    const ctx = r.ctx;
-    ctx.save();
-    ctx.globalCompositeOperation = 'lighter';
-    // Screen tint envelope (exe FUN_0043e2e0 state-4, all.c:28756-28773):
-    // color 0x303030 additive, alpha ramping over the first 30 frames,
-    // flat 0x80 through frame 510, ramping out over the final 30.
-    const elapsed = BORDER_DURATION - this.cherry.borderTimer;
-    const alphaByte = elapsed < 30 ? (0x50 * elapsed) / 30
-      : elapsed < 510 ? 0x80
-        : (0x50 * (BORDER_DURATION - elapsed)) / 30;
-    ctx.fillStyle = `rgba(48, 48, 48, ${(alphaByte / 255).toFixed(3)})`;
-    ctx.fillRect(ox, oy, 384, 448);
-    ctx.translate(ox + p.x, oy + p.y);
-    for (const phase of [0, Math.PI / 4]) {
-      ctx.save();
-      ctx.rotate(this.frame * 0.01 + phase);
-      ctx.strokeStyle = `rgba(180, 220, 255, ${0.35 + 0.2 * Math.sin(this.frame * 0.2)})`;
-      ctx.lineWidth = 3;
-      ctx.strokeRect(-radius, -radius, radius * 2, radius * 2);
-      ctx.restore();
-    }
-    ctx.beginPath();
-    ctx.arc(0, 0, radius * 0.72, 0, Math.PI * 2);
-    ctx.strokeStyle = 'rgba(255, 200, 240, 0.35)';
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    ctx.restore();
+  // Supernatural Border background treatment (Player.cpp:1975-1995 +
+  // Stage::SmoothBlendColor @ Stage.cpp:512-532, applied @ :566-573): while
+  // the border is up the exe MULTIPLIES the stage background (and the fog
+  // color) by a grey factor ramping 128 -> 48 over the first 30 frames,
+  // holding 48 (~x0.375 brightness), and ramping back over the last 30 —
+  // darkening, never tinting. SmoothBlendColor is fed twice per frame
+  // (player update + player draw) with a per-frame reset between the feeds,
+  // so the applied value is the average of the previous and current
+  // request, and exactly one dimmed frame trails the border's end.
+  private borderDimLevel(): number {
+    const timer = this.cherry.borderTimer;
+    const active = this.cherry.borderActive && timer > 0;
+    const c = borderDimRequest(timer);
+    const state = { a: this.borderDimA, rgb: this.borderDimRgb };
+    if (active) smoothBlendColor(state, c); // Player::UpdateState feed
+    const applied = state.a > 0 ? state.rgb : -1;
+    state.a = 0; // Stage::OnDrawHighPrio apply + reset
+    state.rgb = 128;
+    if (active) smoothBlendColor(state, c); // Player::OnDrawHighPrio feed
+    this.borderDimA = state.a;
+    this.borderDimRgb = state.rgb;
+    return applied;
   }
 
   // -- draw ------------------------------------------------------------------
@@ -4884,7 +4962,39 @@ export class StageScene implements GameHost {
       this.drawBackground(r, ox, oy);
       this.drawSpellBackground(r);
       this.markPass('background');
+      // Supernatural Border dim: multiply-darkens the stage background (the
+      // fog-colored sky included, like the exe's FOGCOLOR multiply) while
+      // leaving everything drawn later — enemies, player, danmaku — at full
+      // brightness, matching the native chain-3/4 window.
+      const dimLevel = this.borderDimLevel();
+      if (dimLevel >= 0 && dimLevel < 128) {
+        const m = Math.min(255, Math.round((dimLevel * 255) / 128));
+        r.ctx.save();
+        r.ctx.globalCompositeOperation = 'multiply';
+        r.ctx.fillStyle = `rgb(${m}, ${m}, ${m})`;
+        r.ctx.fillRect(ox, oy, PLAYFIELD.width, PLAYFIELD.height);
+        r.ctx.restore();
+      }
       for (const p of this.particles) {
+        if (p.effectId === 29 && p.burstDir) {
+          // Border-break petals (etama entry-1 script 10, embedded sprite
+          // 28): the exe flies each petal along its fixed direction at
+          // 256/30 px per frame (UpdateBurst30Frames, EffectManager.cpp:
+          // 232-237); the authored script fades out from t=10 over 20
+          // frames with a randomized initial spin — the pool slot stands
+          // in for that (its RNG was consumed at spawn either way).
+          const sprite = this.assets.anms.etama.sprites.get(this.etamaItemBase + 28);
+          if (sprite) {
+            const alpha = p.age <= 10 ? 1 : Math.max(0, 1 - (p.age - 10) / 20);
+            r.drawSprite(sprite.imageKey, sprite.x, sprite.y, sprite.w, sprite.h,
+              ox + p.x + p.burstDir.x * (p.age * 256 / 30),
+              oy + p.y + p.burstDir.y * (p.age * 256 / 30), {
+                alpha,
+                rotation: p.poolSlot * 2.39996 + p.age * 0.62832 * (p.poolSlot & 1 ? 1 : -1)
+              });
+            continue;
+          }
+        }
         const alpha = 1 - p.age / p.life;
         r.ctx.globalAlpha = alpha * 0.8;
         r.ctx.fillStyle = p.kind === 'snow' ? '#cde' : '#fff';
@@ -4940,6 +5050,20 @@ export class StageScene implements GameHost {
             });
           }
         }
+      }
+      // Supernatural Border ring (exe effect chain 9: above player/shots,
+      // below the enemy danmaku). The scale interp is caller-driven, poked
+      // by Player::ActivateBorder (1.0 -> 0.25 over the border) and
+      // Player::BreakBorder (0.0625 -> 1.3 over 30 frames); the active ring
+      // tracks the player while the break ring stays where it burst.
+      if (this.borderRing) {
+        const ring = this.borderRing;
+        const scaleMul = ring.mode === 'active'
+          ? 1 + (0.25 - 1) * Math.min(1, (BORDER_DURATION - this.cherry.borderTimer) / BORDER_DURATION)
+          : 0.0625 + (1.3 - 0.0625) * Math.min(1, ring.age / 30);
+        r.drawAnmFrame(ring.runner.spriteFrame(),
+          ox + (ring.x ?? this.playerObj.x), oy + (ring.y ?? this.playerObj.y),
+          { scaleMultiplier: scaleMul });
       }
       // Enemy bullets dominate entity draw counts in dense spells. Their
       // sprites are untinted, so one saved Canvas state can safely cover the
@@ -5036,7 +5160,6 @@ export class StageScene implements GameHost {
         r.ctx.strokeStyle = '#f66';
         r.ctx.stroke();
       }
-      if (this.cherry.borderActive) this.drawBorder(r, ox, oy);
       if (this.screenFlash) {
         const f = this.screenFlash;
         const a = ((f.color >>> 24) & 0xff) / 255;
@@ -5366,9 +5489,14 @@ export class StageScene implements GameHost {
   }
 
   // Pseudo-3D stage background: STD quad instances, perspective-projected
-  // (see Std#project for the world-space axis convention this relies on),
-  // subdivided along depth into strips for perspective-correct-enough
-  // texture mapping, sorted back-to-front, with linear distance fog.
+  // (see Std#project for the world-space axis convention this relies on).
+  // Each quad is transformed like the exe's AnmManager::Draw3 — a centered
+  // local quad scaled to the STD size, rotated X->Y->Z by its ANM script,
+  // anchor-shifted when the script sets op22 — subdivided along its local v
+  // axis into strips for perspective-correct-enough texture mapping, sorted
+  // back-to-front, with linear distance fog. autoRotate=2 scripts become
+  // camera-facing billboards with manual fog (Stage::RenderObjects,
+  // Stage.cpp:1032-1103).
   private drawBackground(r: Renderer, ox: number, oy: number): void {
     const std = this.runtime.std;
     // Camera/fog use script time; quad textures use independent VM time.
@@ -5390,133 +5518,196 @@ export class StageScene implements GameHost {
 
     const playfield = { x: ox, y: oy, width: PLAYFIELD.width, height: PLAYFIELD.height };
 
-    type Candidate = {
-      depthCenter: number; // camera-relative forward distance; sort/step heuristic only
-      lateral0: number;
-      lateral1: number;
-      depth0: number;
-      depth1: number;
-      height: number;
-      script: number;
-    };
-    type Job = Candidate & {
-      spriteFrame: AnmFrame;
-      steps: number;
+    type Job = {
+      frame: AnmFrame;
+      // The exe splits objects across two draw chains by zLevel (0/1 in the
+      // high-prio chain, 2/3 in the low one); painter's algorithm keeps that
+      // as two depth-sorted groups drawn in order.
+      group: number;
+      // View-space depth of the quad center — the D3D vertex-fog metric and
+      // the back-to-front sort key.
+      sortZ: number;
+      billboard: boolean;
+      // World-space quad center and half extents; for billboards the center
+      // is the un-anchored VM position the exe projects.
+      cx: number;
+      cy: number;
+      cz: number;
+      hw: number;
+      hh: number;
+      cosRx: number; sinRx: number;
+      cosRy: number; sinRy: number;
+      cosRz: number; sinRz: number;
     };
 
-    // Gather every quad of every instance — stage 1 has only ~31 ground
-    // instances plus a couple dozen tree instances (18 quads each), so there's
-    // no need to pre-filter by a shared draw-call budget; the per-strip
-    // projection below (and Canvas2D itself) cheaply discards anything
-    // actually off-screen.
-    const candidates: Candidate[] = [];
+    // Gather every quad of every instance. Scratch corners are per-job
+    // objects reused across cells — the per-strip projection below (and
+    // Canvas2D itself) cheaply discards anything actually off-screen.
+    const jobs: Job[] = [];
     for (const inst of std.instances) {
       const obj = std.objects[inst.id];
       if (!obj) continue;
+      // Exe per-instance culling (Stage.cpp:989-1004): the object center
+      // (object pos + instance pos + half the object size) must sit within
+      // 1300 units of the camera and inside [60, size/2 + 880] along the
+      // view axis; the 60-unit near bound doubles as the near-clip policy.
+      const occX = obj.x + inst.x + obj.w / 2 - camFrame.x;
+      const occY = obj.y + inst.y + obj.h / 2 - camFrame.y;
+      const occZ = obj.z + inst.z + obj.d / 2 - camFrame.z;
+      if (occX * occX + occY * occY + occZ * occZ > 1690000) continue;
+      const objDot = occX * camFrame.fwdX + occY * camFrame.fwdY + occZ * camFrame.fwdZ;
+      if (objDot < 60 || objDot > Math.hypot(obj.w, obj.h, obj.d) / 2 + 880) continue;
+      const group = obj.zLevel <= 1 ? 0 : 1;
       for (const quad of obj.quads) {
-        // STD quads extend from their position CORNER by width/height (the
-        // PyTouhou vertex construction: (x,y)..(x+w,y+h)), not around a
-        // center point. Corner semantics is what centers stage 1's ground
-        // (instance x=-192, quad x=-64, w=512 → lateral [-256,256]) on the
-        // camera's track; treating it as a center leaves the road's right
-        // half ungeometried, which shows as a fog-colored void wherever
-        // only single-side instances exist (most of the stage).
-        const lateral0 = inst.x + quad.x;
-        const depth0 = inst.y + quad.y;
-        const height = inst.z + quad.z;
-        candidates.push({
-          depthCenter: depth0 + quad.h / 2 - camFrame.y,
-          lateral0,
-          lateral1: lateral0 + quad.w,
-          depth0,
-          depth1: depth0 + quad.h,
-          height,
-          script: quad.script
+        if (quad.type !== 0) continue; // no other type exists in the data
+        const frame = this.bgAnmFrame(quad.script, std.animationFrame);
+        if (!frame || frame.alpha <= 0) continue;
+        const w = quad.w !== 0 ? quad.w : frame.w * Math.abs(frame.scaleX);
+        const h = quad.h !== 0 ? quad.h : frame.h * Math.abs(frame.scaleY);
+        if (w <= 0 || h <= 0) continue;
+        // The VM position is quad pos + instance pos + the script's offset
+        // (Stage.cpp:1019-1021); Draw3 then anchor-shifts x/y (never z) when
+        // op22 is set, so op22 quads extend from their position CORNER by
+        // width/height while unanchored quads are centered (Stage 5's
+        // treads/risers anchor; its balustrades and Stage 1/2's trees don't).
+        const baseX = inst.x + quad.x + frame.posOffsetX;
+        const baseY = inst.y + quad.y + frame.posOffsetY;
+        const baseZ = inst.z + quad.z + frame.posOffsetZ;
+        const billboard = frame.autoRotateMode === 2;
+        const cx = billboard || !frame.anchorTopLeft ? baseX : baseX + w / 2;
+        const cy = billboard || !frame.anchorTopLeft ? baseY : baseY + h / 2;
+        jobs.push({
+          frame,
+          group,
+          sortZ: std.viewDepth(cx, cy, baseZ, camFrame),
+          billboard,
+          cx, cy, cz: baseZ,
+          hw: w / 2,
+          hh: h / 2,
+          cosRx: Math.cos(frame.rotationX), sinRx: Math.sin(frame.rotationX),
+          cosRy: Math.cos(frame.rotationY), sinRy: Math.sin(frame.rotationY),
+          cosRz: Math.cos(frame.rotation), sinRz: Math.sin(frame.rotation)
         });
       }
     }
+    jobs.sort((a, b) => (a.group - b.group) || (b.sortZ - a.sortZ));
 
-    const focalDist = (PLAYFIELD.height / 2) / Math.tan(std.fov / 2);
-    const jobs: Job[] = [];
-    for (const c of candidates) {
-      const spriteFrame = this.bgAnmFrame(c.script, std.animationFrame);
-      if (!spriteFrame || spriteFrame.alpha <= 0) continue;
-      const tl = std.project(c.lateral0, c.depth0, c.height, camFrame, playfield);
-      const tr = std.project(c.lateral1, c.depth0, c.height, camFrame, playfield);
-      const bl = std.project(c.lateral0, c.depth1, c.height, camFrame, playfield);
-      const br = std.project(c.lateral1, c.depth1, c.height, camFrame, playfield);
-      const corners = [tl, tr, bl, br].filter((p): p is { x: number; y: number; scale: number } => p != null);
-      if (corners.length === 0) continue; // fully behind the camera
-      // Only apply the coarse screen-bounds shortcut when all 4 corners
-      // projected validly. A quad straddling the near-clip plane (the
-      // ground tile the camera is *currently* passing through — this
-      // happens every ~256 units of travel) would otherwise get dropped
-      // wholesale here despite its far half being clearly visible; the
-      // per-cell projection in the paint loop below clips each strip
-      // individually, so simply always subdividing it renders correctly.
-      if (corners.length === 4) {
-        const xs = corners.map((p) => p.x);
-        const ys = corners.map((p) => p.y);
-        if (Math.max(...xs) < ox - 24 || Math.min(...xs) > ox + PLAYFIELD.width + 24) continue;
-        if (Math.max(...ys) < oy - 24 || Math.min(...ys) > oy + PLAYFIELD.height + 24) continue;
-      }
-
-      const spanDepth = c.depth1 - c.depth0;
-      const nearViewZ = Math.max(60, (c.depth0 - camFrame.y) + focalDist);
-      const steps = Math.max(1, Math.min(BG_MAX_CELL_STEPS, Math.round((spanDepth / nearViewZ) * 14)));
-      jobs.push({ ...c, spriteFrame, steps });
-    }
-    jobs.sort((a, b) => b.depthCenter - a.depthCenter);
-
+    const fogSpan = Math.max(1, fog.far - fog.near);
     const lateralExpand = 10; // world units; hides seams between laterally-adjacent tiles
     for (const job of jobs) {
-      const rect = job.spriteFrame;
+      const rect = job.frame;
       const tint = (rect.color & 0x00ffffff) !== 0x00ffffff;
       const img = tint ? r.tintedRect(rect.imageKey, rect.x, rect.y, rect.w, rect.h, rect.color) : r.image(rect.imageKey);
       if (!img) continue;
       const srcX0 = tint ? 0 : rect.x;
       const srcY0 = tint ? 0 : rect.y;
       const flip = rect.scaleX < 0;
-      const l0 = job.lateral0 - lateralExpand;
-      const l1 = job.lateral1 + lateralExpand;
-      // UV is clamped to the sprite's own rect (unlike the geometry below):
-      // small decorative quads sit only a few px apart in the atlas (e.g.
-      // sprite1/sprite2), so letting UV overflow with the geometry would
-      // bleed in neighboring sprites. Clamping just stretches the outermost
-      // texel a hair instead — imperceptible at this scale.
+
+      if (job.billboard) {
+        // Camera-facing quad: project the VM position, derive the screen
+        // size from the perspective scale (both axes use the x factor,
+        // Stage.cpp:1062-1063), anchor per DrawFacingCamera
+        // (AnmManager.cpp:1146-1173), and fog manually by euclidean
+        // distance — the exe disables hardware fog here and lerps
+        // color/alpha itself (Stage.cpp:1065-1082). Drawing the texture at
+        // alpha (1-t) and then the fog quad at alpha t over the fog-colored
+        // sky composes to exactly that lerp.
+        const pt = std.project(job.cx, job.cy, job.cz, camFrame, playfield);
+        if (!pt) continue;
+        const dx = job.cx - camFrame.x;
+        const dy = job.cy - camFrame.y;
+        const dz = job.cz - camFrame.z;
+        const fogT = clamp((Math.sqrt(dx * dx + dy * dy + dz * dz) - fog.near) / fogSpan, 0, 1);
+        if (fogT >= 1) continue;
+        const wPx = job.hw * 2 * pt.scale;
+        const hPx = (rect.h * (job.hw * 2 / Math.max(1, rect.w))) * pt.scale;
+        const left = rect.anchorTopLeft ? pt.x : pt.x - wPx / 2;
+        const top = rect.anchorTopLeft ? pt.y : pt.y - hPx / 2;
+        if (left > ox + PLAYFIELD.width + 24 || left + wPx < ox - 24) continue;
+        if (top > oy + PLAYFIELD.height + 24 || top + hPx < oy - 24) continue;
+        const corners = {
+          tl: { x: left, y: top }, tr: { x: left + wPx, y: top },
+          bl: { x: left, y: top + hPx }, br: { x: left + wPx, y: top + hPx }
+        };
+        ctx.save();
+        ctx.globalAlpha = (rect.alpha / 255) * (1 - fogT);
+        ctx.globalCompositeOperation = rect.blendAdd ? 'lighter' : 'source-over';
+        r.drawTexturedQuadCell(img, { u0: srcX0, v0: srcY0, u1: srcX0 + rect.w, v1: srcY0 + rect.h }, corners);
+        if (fogT > 0.01) r.fillFogQuad(corners, fog.css, fogT);
+        ctx.restore();
+        continue;
+      }
+
+      // Project the four outer corners: screen-bounds cull plus the
+      // subdivision metric. A quad straddling the near-clip plane (the tile
+      // the camera is *currently* passing through — every ~256 units of
+      // travel) must keep only its valid corners here; the per-cell
+      // projection in the paint loop clips each strip individually.
+      let valid = 0;
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      let minZ = Infinity, maxZ = -Infinity;
+      const outer: Vec3 = { x: 0, y: 0, z: 0 };
+      for (let s = 0; s < 4; s++) {
+        bgQuadCorner(outer, (s & 1 ? 1 : -1) * job.hw, (s & 2 ? 1 : -1) * job.hh,
+          job.cosRx, job.sinRx, job.cosRy, job.sinRy, job.cosRz, job.sinRz, job.cx, job.cy, job.cz);
+        const p = std.project(outer.x, outer.y, outer.z, camFrame, playfield);
+        if (!p) continue;
+        valid++;
+        if (p.x < minX) minX = p.x;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.y > maxY) maxY = p.y;
+        const vz = std.viewDepth(outer.x, outer.y, outer.z, camFrame);
+        if (vz < minZ) minZ = vz;
+        if (vz > maxZ) maxZ = vz;
+      }
+      if (valid === 0) continue; // fully behind the camera
+      if (valid === 4) {
+        if (maxX < ox - 24 || minX > ox + PLAYFIELD.width + 24) continue;
+        if (maxY < oy - 24 || minY > oy + PLAYFIELD.height + 24) continue;
+      }
+      const steps = Math.max(1, Math.min(BG_MAX_CELL_STEPS, Math.round(((maxZ - minZ) / Math.max(60, minZ)) * 14)));
+
+      // Fraction of [0,1] each cell's *geometry* is expanded by (UV stays
+      // clamped to the sprite — small decorative quads sit only a few px
+      // apart in the atlas, so UV overflow would bleed in neighbors).
+      // Canvas2D's antialiased fills otherwise leave hairline gaps between
+      // adjacent cells and between instances stacked in depth, showing the
+      // fog clear color through.
+      const slack = 0.06 + 0.6 / steps;
+      // UV is clamped to the sprite's own rect (unlike the geometry).
       const u0 = srcX0;
       const u1 = srcX0 + rect.w;
+      const eu = job.hw + lateralExpand;
+      const c0: Vec3 = { x: 0, y: 0, z: 0 };
+      const c1: Vec3 = { x: 0, y: 0, z: 0 };
+      const c2: Vec3 = { x: 0, y: 0, z: 0 };
+      const c3: Vec3 = { x: 0, y: 0, z: 0 };
 
       ctx.save();
       ctx.globalAlpha = rect.alpha / 255;
       ctx.globalCompositeOperation = rect.blendAdd ? 'lighter' : 'source-over';
 
-      const spanDepth = job.depth1 - job.depth0;
-      // Fraction of [0,1] each cell's *geometry* is expanded by (UV stays
-      // clamped to the sprite, see above) — deliberately including the
-      // outer i=0/i=steps-1 edges. Canvas2D's antialiased path clipping
-      // otherwise leaves hairline gaps between adjacent cells, and between
-      // adjacent STD instances stacked in depth, showing the fog clear
-      // color through.
-      const slack = 0.06 + 0.6 / job.steps;
-      // Ground tiles are 256 units deep — a large enough slice of a fog
-      // transition (as short as ~300 units near/far apart) that fogging the
-      // whole quad as one flat overlay visibly banded at tile boundaries;
-      // each cell gets its own alpha from its own depth instead, so the fade
-      // stays continuous both within a quad and across adjacent quads.
-      const fogSpan = Math.max(1, fog.far - fog.near);
-      for (let i = 0; i < job.steps; i++) {
-        const t0 = i / job.steps - slack;
-        const t1 = (i + 1) / job.steps + slack;
-        const d0 = job.depth0 + t0 * spanDepth;
-        const d1 = job.depth0 + t1 * spanDepth;
-        const ptl = std.project(l0, d0, job.height, camFrame, playfield);
-        const ptr = std.project(l1, d0, job.height, camFrame, playfield);
-        const pbl = std.project(l0, d1, job.height, camFrame, playfield);
-        const pbr = std.project(l1, d1, job.height, camFrame, playfield);
+      for (let i = 0; i < steps; i++) {
+        const t0 = i / steps - slack;
+        const t1 = (i + 1) / steps + slack;
+        const v0 = (t0 - 0.5) * job.hh * 2;
+        const v1 = (t1 - 0.5) * job.hh * 2;
+        bgQuadCorner(c0, -eu, v0, job.cosRx, job.sinRx, job.cosRy, job.sinRy, job.cosRz, job.sinRz, job.cx, job.cy, job.cz);
+        bgQuadCorner(c1, eu, v0, job.cosRx, job.sinRx, job.cosRy, job.sinRy, job.cosRz, job.sinRz, job.cx, job.cy, job.cz);
+        bgQuadCorner(c2, -eu, v1, job.cosRx, job.sinRx, job.cosRy, job.sinRy, job.cosRz, job.sinRz, job.cx, job.cy, job.cz);
+        bgQuadCorner(c3, eu, v1, job.cosRx, job.sinRx, job.cosRy, job.sinRy, job.cosRz, job.sinRz, job.cx, job.cy, job.cz);
+        const ptl = std.project(c0.x, c0.y, c0.z, camFrame, playfield);
+        const ptr = std.project(c1.x, c1.y, c1.z, camFrame, playfield);
+        const pbl = std.project(c2.x, c2.y, c2.z, camFrame, playfield);
+        const pbr = std.project(c3.x, c3.y, c3.z, camFrame, playfield);
         if (!ptl || !ptr || !pbl || !pbr) continue;
-        const cellDepthCenter = (d0 + d1) / 2 - camFrame.y;
-        const fogAlpha = clamp((cellDepthCenter - fog.near) / fogSpan, 0, 1);
+        // Fog from the cell center's view-space depth: large tiles span a
+        // visible slice of a fog transition (as short as ~300 units
+        // near/far apart), so each cell gets its own alpha instead of
+        // banding the whole quad at one value.
+        bgQuadCorner(c0, 0, (v0 + v1) / 2, job.cosRx, job.sinRx, job.cosRy, job.sinRy, job.cosRz, job.sinRz, job.cx, job.cy, job.cz);
+        const fogAlpha = clamp((std.viewDepth(c0.x, c0.y, c0.z, camFrame) - fog.near) / fogSpan, 0, 1);
         // Fully-fogged cells are indistinguishable from the sky clear color;
         // skipping them (instead of painting texture + an opaque fog quad)
         // is what actually dissolves the horizon — the slack-expanded
@@ -5821,7 +6012,32 @@ export class StageScene implements GameHost {
     // itself as the countdown. CherrySystem preserves the native write-before-
     // timer-advance order, including the repeated 50000 first active tick.
     const plusVal = Math.max(0, Math.trunc(this.cherry.cherryPlus));
-    r.text(`+${plusVal}`, PLAYFIELD.x + 84, 444, { size: 10, color: '#c080b0', align: 'right' });
+    if (this.cherry.borderEngaged) {
+      // AsciiManager.cpp:1256-1295: while a border is pending/active the
+      // cherryPlus digits switch to the native recolor (r=255, g/b computed
+      // from the value with the %4000 triangle fold), scale x1.41, a 10px
+      // advance and a (+2,-2) offset. (The web keeps its right-aligned
+      // layout; the digit styling is native.)
+      const rem = plusVal % 4000;
+      const tri = rem >= 2000 ? 4000 - rem : rem;
+      const gb = Math.min(255, Math.trunc(plusVal * 192 / 50000) + Math.trunc(tri * 64 / 2000));
+      const color = (0xff << 16) | (gb << 8) | gb;
+      const digits = String(plusVal);
+      const right = PLAYFIELD.x + 84 + 2;
+      for (let i = 0; i < digits.length; i++) {
+        const d = digits.charCodeAt(i) - 48;
+        r.drawSprite('ascii', d * DIGIT_W, DIGIT_Y, DIGIT_W, DIGIT_H,
+          right - 5 - (digits.length - 1 - i) * 10, 444 - 2 + 8,
+          { color, scaleMultiplier: 1.41 });
+      }
+    } else {
+      r.text(`+${plusVal}`, PLAYFIELD.x + 84, 444, { size: 10, color: '#c080b0', align: 'right' });
+    }
+    // AsciiManager.cpp:1301-1308: the pulsing border badge rides the cherry
+    // gauge while BORDER_ACTIVE (ascii.anm entry-0 script 5, gauge +24/+8).
+    if (this.cherry.borderActive && this.borderBadgeRunner) {
+      r.drawAnmFrame(this.borderBadgeRunner.spriteFrame(), PLAYFIELD.x + 24, 448 + 8);
+    }
 
     if (this.bossActive) {
       const hp = Math.max(0, this.bossActive.hp);

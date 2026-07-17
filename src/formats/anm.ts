@@ -242,10 +242,12 @@ export interface AnmFrame {
   blendAdd: boolean;
   anchorTopLeft: boolean;
   autoRotate: boolean;
+  autoRotateMode: number;
   vmX: number;
   vmY: number;
   posOffsetX: number;
   posOffsetY: number;
+  posOffsetZ: number;
   flipX: boolean;
   flipY: boolean;
 }
@@ -293,6 +295,7 @@ export class AnmRunner {
   private y = 0;
   private offX = 0;
   private offY = 0;
+  private offZ = 0;
   private useOffset = false;
   private scaleX = 1;
   private scaleY = 1;
@@ -311,6 +314,7 @@ export class AnmRunner {
   private flipY = false;
   private cornerRelative = false;
   private autoOrient = false;
+  private autoRotateMode = 0;
   private fadeInterp: Interp | null = null;
   private moveInterp: Interp | null = null;
   private scaleInterp: Interp | null = null;
@@ -353,6 +357,28 @@ export class AnmRunner {
   // wait duration (Th07.exe v1.00b @ 0x4275e7-0x42760f).
   setVariable(index: number, value: number): void {
     if (index >= 0 && index < ANM_VAR_COUNT) this.vars[index] = value;
+  }
+
+  // Player::ActivateBorder flips the border ring's authored spin after
+  // construction (vm->angleVel.z *= -1, Player.cpp:2136).
+  negateRotationSpeedZ(): void {
+    this.rotSpeedZ = -this.rotSpeedZ;
+  }
+
+  // Player::BreakBorder pokes the ring VM's alpha-interp slot directly: fade
+  // from the spawn color's alpha (255) to 0 over 30 frames with mode 1 (t²)
+  // easing (Player.cpp:2168-2171). SpawnEffect assigns vm.color AFTER the
+  // script's time-0 ops run (EffectManager.cpp:644-646), so the script's own
+  // alpha(0)/fadeTime pair is fully replaced here, base alpha included.
+  armFade(durationFrames: number, formula: number, fromAlpha: number, toAlpha: number): void {
+    this.alpha = fromAlpha & 0xff;
+    this.fadeInterp = {
+      start: this.frame,
+      duration: Math.max(1, durationFrames),
+      formula,
+      from: [fromAlpha & 0xff],
+      to: [toAlpha & 0xff]
+    };
   }
 
   interrupt(label: number): boolean {
@@ -502,6 +528,12 @@ export class AnmRunner {
         if (this.useOffset) {
           this.offX = x;
           this.offY = y;
+          // ins_6 writes all three offset components (Stage::RenderObjects
+          // adds offset.z to the quad's world z); stage background scripts
+          // use it to lift geometry (stg5bg treads author z=-2). The arg is
+          // absent only in truncated/hand-built scripts.
+          const instrLen = this.ip - a + 8;
+          this.offZ = instrLen >= 20 ? this.getVal(v.f32(a + 8)) : 0;
         } else {
           this.x = x;
           this.y = y;
@@ -581,8 +613,9 @@ export class AnmRunner {
       case 24: // toggle dest-offset mode
         this.useOffset = !!v.i32(a);
         break;
-      case 25: // automatic orientation to motion angle
+      case 25: // automatic orientation: 1 = face motion (shots), 2 = stage billboard
         this.autoOrient = !!v.i32(a);
+        this.autoRotateMode = v.i32(a);
         break;
       case 26: // shift texture u — not reproducible with plain Canvas drawImage
       case 27: // shift texture v
@@ -716,10 +749,12 @@ export class AnmRunner {
       blendAdd: this.blendAdd,
       anchorTopLeft: this.cornerRelative,
       autoRotate: this.autoOrient,
+      autoRotateMode: this.autoRotateMode,
       vmX: this.x,
       vmY: this.y,
       posOffsetX: this.offX,
       posOffsetY: this.offY,
+      posOffsetZ: this.offZ,
       flipX: false,
       flipY: false
     };

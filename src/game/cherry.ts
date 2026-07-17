@@ -36,6 +36,31 @@
 //   `score +=` below is already in the port's `this.score` units.
 export const CHERRY_PLUS_MAX = 50000;
 export const BORDER_DURATION = 540;
+
+// Supernatural Border background-dim envelope (Player.cpp:1975-1995, integer
+// math preserved): while the border is up the stage background is
+// multiply-darkened by a grey factor that ramps 128 -> 48 over the first 30
+// frames, holds 48 (~x0.375), and ramps back over the last 30. 128 = neutral.
+export function borderDimRequest(timer: number): number {
+  if (timer >= 510) return 128 - Math.trunc((BORDER_DURATION - timer) * 80 / 30);
+  if (timer < 30) return 128 - Math.trunc(timer * 80 / 30);
+  return 48;
+}
+
+// Stage::SmoothBlendColor (Stage.cpp:512-532): the first feed of a frame
+// replaces the blend state outright; later feeds average into it. The stage
+// applies the state once per frame and resets it to (a=0, rgb=128), and the
+// player feeds it twice (update + draw), so the applied value tracks the
+// average of two consecutive requests and one dimmed frame trails the end.
+export function smoothBlendColor(state: { a: number; rgb: number }, v: number): void {
+  if (state.a === 0) {
+    state.rgb = v;
+    state.a = 128;
+  } else {
+    state.rgb = (state.rgb + v) >> 1;
+    state.a = (state.a + 128) >> 1;
+  }
+}
 // Th07.exe run-init FUN_0042cf2f @ 0x42cf2f (all.c:19765-19796): cherryMax
 // starts per difficulty — Easy/Normal 200000, Hard 250000, Lunatic 300000
 // Extra/Phantasm start at 400000 with cherry pre-loaded to 200000/300000.
