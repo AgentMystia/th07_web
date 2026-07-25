@@ -105,8 +105,9 @@ node scripts/pixel-report.mjs /tmp/s.png
   引擎写下的逐面状态快照为校验点、以「原局玩家不该死」为存活不变量逐帧回放。
   当前尚未全面通过（对齐战役进行中），因此仍不宣称逐帧一致——但差距首次可
   机判、可定位到帧。
-- Extra / Phantasm 的覆盖与逆向证据少于 Stage 1-6；其开局 Bomb / Power
-  仍采用社区惯例，状态为 PROBABLE。
+- Extra / Phantasm 的覆盖与逆向证据仍少于 Stage 1-6，但开局状态已由两份原版
+  录像确定：**开局 0 Power**（并非社区惯例说的满 Power）、2 条命、Bomb 取自
+  角色 `.sht`。Extra 录像已逐帧全对，Phantasm 在 57876 帧中对齐到第 51989 帧。
 - Practice Start 已接入；Replay 可在浏览器中选择并播放本地原版 `.rpy`
   （含关卡选择与三种原版播放模式）。Result、Music Room、Option、Quit
   尚未接入；结局、replay 保存和 `score.dat` 持久化也未实现。
@@ -248,8 +249,12 @@ under `reference/` is committed, deployed, or loaded by the browser.
   fully pass yet (the alignment campaign is ongoing), so frame-level parity
   is still not claimed — but the gap is now machine-checkable and localized
   to exact frames.
-- Extra and Phantasm have less coverage and executable evidence than Stages
-  1-6. Their initial bomb/power values remain community-convention PROBABLEs.
+- Extra and Phantasm still have less coverage and executable evidence than
+  Stages 1-6, but their run-init is now settled by two original replays:
+  they start at **0 power** (not the community-convention full power), with
+  2 lives and the character's own `.sht` bomb stock. The Extra replay
+  verifies frame-exact end to end; the Phantasm one is exact through frame
+  51989 of 57876.
 - Practice Start is wired, and Replay can load and play a browser-local
   original `.rpy` with stage selection and the three original playback modes.
   Result, Music Room, Option, and Quit are not wired. Endings, replay saving,

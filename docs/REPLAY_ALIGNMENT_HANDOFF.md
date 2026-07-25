@@ -1,9 +1,89 @@
-# Stage 1-6 replay alignment handoff
+# Replay alignment handoff (all difficulties)
 
-Updated: 2026-07-13. This is the restart procedure for a fresh session
-continuing original-grade Stage 1-6 replay/RNG alignment. Read `AGENTS.md`
-completely before using it. The checkpoint is for the committed
-`tests/replays/th7_udFe25.rpy` fixture: SakuyaA, Lunatic.
+Updated: 2026-07-25. This is the restart procedure for a fresh session
+continuing original-grade replay/RNG alignment. Read `AGENTS.md` completely
+before using it. Stage 1-6 Lunatic (`tests/replays/th7_udFe25.rpy`, SakuyaA)
+and Extra (`replay/th7_udHm54.rpy`, MarisaB) are converged; the open work is
+Hard, Normal, Easy and the last 10% of Phantasm.
+
+## Where things stand (2026-07-25)
+
+`node scripts/replay-verify.mjs --all` prints this matrix. Cells are the
+earliest frame at which any of the seven AUX event streams disagrees.
+
+| replay | char | difficulty | st1 | st2 | st3 | st4 | st5 | st6 | st7 |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| th7_udFe25 | sakuyaA | Lunatic | PASS | PASS | PASS | PASS | PASS | PASS | — |
+| th7_udHm54 | marisaB | Extra | — | — | — | — | — | — | PASS |
+| th7_udSg10 | reimuA | Phantasm | — | — | — | — | — | — | 51989 |
+| th7_udMt01 | sakuyaB | Easy | PASS | PASS | PASS | 4536 | 7290 | 1628 | — |
+| th7_udYo01 | sakuyaA | Normal | PASS | 8747 | 11863 | 18596 | 2280 | 2727 | — |
+| th7_udFi03 | reimuB | Hard | 5440 | 2165 | 537 | 2360 | 617 | 1330 | — |
+
+The five non-fixture replays are third-party recordings kept as local
+evidence in the git-ignored `replay/` directory. Never commit them.
+
+**`wine`/`winedbg` is not installed in the current environment**, so the
+native PRE-trace acquisition below cannot be run here. Until it can, the
+replay's own AUX event streams are the oracle: dense, frame-exact, and free.
+Their limit is coverage, not accuracy — an RNG or position divergence that
+produces no AUX event stays invisible until it changes one, so read a clean
+prefix as "no observed event differs", not as "state is identical".
+
+## Open leads
+
+- **Hard / ReimuB (earliest divergence in the whole matrix, st3 @ 537).**
+  ReimuB is the only shot type with no passing stage in any replay, and the
+  only one that saturates the 96-slot player-shot pool: at Hard stage 3 the
+  pool is full on 28 of 140 sampled frames, with 12-33 slots held by spent
+  post-impact sprites. Every measured ReimuB divergence is a kill landing a
+  few frames LATE — we deal slightly less damage, never more. Under
+  saturation the impact-sprite lifetime (`b.runner.removed` on the
+  `sprite+0x20` script) and the live-sprite offscreen cull
+  (`stage-scene.ts` `updatePlayerBullets`) directly set the live-shot count
+  and therefore DPS; an error there is invisible for Sakuya/Marisa/ReimuA and
+  fatal for ReimuB. Verify both against FUN_0043a290 / FUN_0043d2f0 before
+  looking anywhere else.
+  Worked example (st3): enemy pool slot 1 is a scripted straight descent at
+  x=40.0 exactly, so its position cannot be RNG-drift. We take it to 3 HP by
+  frame 537 and kill it at 546; the recording kills it at 537. Our hit
+  history on it is 510/514/517/522/533/537 — two conspicuous dry windows.
+  `--trace-damage 505,550` reproduces this in one command.
+  Note that the Hard st1 case (midboss spell captured 20f late) sits behind
+  an RNG-positioned boss: ECL stage-1 Sub29 picks its move angle with
+  `ins_52([10004], -π, π)`, so that boss's parked X is not a fixed target
+  and cannot by itself prove or disprove a shot-side bug.
+- **Easy/Normal (four of the five first divergences are item collects).**
+  In every case the kill stream stays exact for hundreds to thousands of
+  frames past the first collect mismatch, which puts the fault in the item
+  pipeline rather than the enemy simulation. The mismatches are ±1 frame
+  inside dense auto-collect bursts (Easy st4: our stream is missing 4536 and
+  has an extra 4545 in an otherwise identical 4521..4547 run). Start from
+  `updateItems`' homing/AABB tail, which already carries one exe-derived
+  rounding fix keyed to this very replay.
+- **Phantasm (st7 @ 51989).** Exact for 51989 of 57876 frames — 565 kills,
+  2739 collects, 23 contacts, 7 bombs and every border event. Boss sub 127's
+  HP reaches 0 two frames early, i.e. ~2 HP of accumulated excess over a long
+  spellcard, not a rate error. Use `--trace-damage` across the spell and look
+  at ReimuA's homing target cache first. The RNG-residue oracle does not
+  exist for single-stage replays (it needs a following stage's seed), so the
+  damage trace is the only quantitative handle. The two extra player contacts
+  (56038, 56993) and the death at 57037 are downstream of this; re-measure
+  rather than treating them as separate defects.
+- **Non-Lunatic ECL branches.** Every difficulty-gated branch in
+  `src/game/eclvm.ts` has only ever executed under Lunatic in a converged
+  replay: effect 8's `difficulty < 2` scale/base/state, the `difficulty >= 3`
+  and `difficulty === 3` gates, `difficulty < 3 ? 4 : 2` with its π/6-vs-π/2
+  pair, and effect 12/21's band plus `[10,18,22,25][difficulty]` child count.
+  Each child costs RNG draws, so a wrong count shifts every later draw in the
+  stage. Re-derive each from `all.c` / `spec-effects-misc.md` rather than
+  assuming the Lunatic-validated code is right.
+
+## Legacy Stage 1-6 Lunatic checkpoint
+
+Everything below predates the all-difficulty baseline and describes the
+now-complete Lunatic campaign. The native-acquisition and first-divergence
+procedures still apply verbatim wherever `wine` is available.
 
 ## Goal and authority
 
@@ -31,10 +111,12 @@ The exact acceptance target for every Stage 1-6 replay is:
 Do not enable replay ghosting for acceptance runs. Ghost mode is diagnostic
 only and changes survival/timing consequences.
 
-## Current checkpoint
+## Historical Lunatic checkpoint (superseded — all six stages now PASS)
 
 `PRE N` means the state immediately before processing replay input frame N.
-A first mismatch at PRE N belongs to processing frame N-1.
+A first mismatch at PRE N belongs to processing frame N-1. The table below is
+the 2026-07-13 state of the Lunatic campaign, kept only as a worked example of
+how each split was classified; every row has since converged.
 
 | stage | native coverage | exact PRE boundary | first work on restart |
 |---|---:|---:|---|
@@ -273,9 +355,14 @@ At a convergence checkpoint run, in order:
 npm run check
 npm run build
 npm test
-npm run replay:verify
+npm run replay:verify                       # committed fixture, must stay 6/6
+node scripts/replay-verify.mjs --all        # regression matrix, all difficulties
 node scripts/dev-shot.mjs /tmp/th07-preview-boot.png 300
 ```
+
+The matrix arm is not optional for a fidelity change. A fix that converges one
+replay while moving another's exact prefix backward is a regression, not a fix,
+and only the side-by-side table makes that visible.
 
 For browser Replay, also drive the actual browser file-selection/playback path
 and record machine-readable scene, replay metadata, selected stage, frame, and

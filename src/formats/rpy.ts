@@ -36,20 +36,47 @@ export const RPY_BITS = {
 // Bits of the per-frame AUX word (the second u16 of each frame record,
 // ctx+0x9e). The exe ORs event bits into it as the frame plays out — the
 // recording preserves a per-frame EVENT STREAM of the original run, which
-// makes it a frame-exact verification oracle. Writers in Th07.exe (all.c
-// lines): 0x2 @27780/27914 (player hit registered), 0x4 @28596 (bomb),
-// 0x8 @28928 (border start, FUN_0043e890 region), 0x10 @28994 (border
-// break/end), 0x20 @13887/14351/14360 (enemy kill, incl. sweeps),
-// 0x40 @22016 (item collected), 0x1 @28486 (border-adjacent, PROBABLE),
-// 0x100 @29442 (DAT_00625620, a latched flag consumed each tick at
-// scheduler prio 6; observed as sparse single-tick pulses — 1-3 per stage in
-// the fixture, absent from most files — NOT a dialogue window; setter not
-// visible in the decompile, unidentified).
+// makes it a frame-exact verification oracle. Every writer below was read at
+// its `*(ushort *)(DAT_004afe28 + 0x9e) |= …` site in the decompile and then
+// confirmed against our own simulation on already-converged replays:
+//
+//   0x1  @28486 — BOMB accepted. The site sits inside FUN_0043d9a0's trigger
+//        branch, which goes on to set the bomb-active flag (+0x16a20 = 1),
+//        arm the post-bomb cooldown (+0x23fc) and call FUN_0042bd01(-1) (the
+//        -200 rank penalty). Confirmed: th7_udSg10 (Phantasm) records
+//        [10405,27248,37748,50080,50870,51805,56039] and our seven bomb
+//        frames are identical. The older "border-adjacent, PROBABLE" reading
+//        of this bit was wrong.
+//   0x2  @27780/27914 — player contact registered, BEFORE the
+//        state/invulnerability outcome gate (a bordered or invulnerable
+//        player still sets it).
+//   0x4  @28596 — player MISS. The site is the branch where the deathbomb
+//        meter (+0x23f8) decrements to zero, i.e. the frame the death is
+//        committed — 30 squish frames before the life counter drops.
+//        Confirmed: th7_udYo01 stage 2 records [8578] and our death state
+//        starts at 8578, while `lives` only falls at 8608. The older
+//        mapping had `bomb` on this bit.
+//   0x8  @28928 — Supernatural Border START (FUN_0043e890 region).
+//        Confirmed exact on all 20 borders of th7_udHm54 and all 8 of the
+//        Lunatic fixture's stage 6.
+//   0x10 @28994 — border BREAK only: the site is the tail of FUN_0043eb00
+//        (32-petal burst, player state 3, 40-frame bomb cooldown). The
+//        natural-expiry/cherry-full path FUN_0043e620 writes NO bit, so a
+//        survived border must not be counted here. Confirmed: th7_udHm54
+//        records [10853,11714] — exactly our two forced breaks — and none of
+//        our finishBorderSurvival() ends appear in any file.
+//   0x20 @13887/14351/14360 — enemy kill / slot vacate (incl. sweeps).
+//   0x40 @22016 — item collected.
+//   0x100 @29442 (DAT_00625620, a latched flag consumed each tick at
+//        scheduler prio 6; observed as sparse single-tick pulses — 1-3 per
+//        stage in the fixture, absent from most files — NOT a dialogue
+//        window; setter not visible in the decompile, unidentified).
 export const RPY_AUX_BITS = {
+  bomb: 0x0001,
   playerHit: 0x0002,
-  bomb: 0x0004,
+  playerMiss: 0x0004,
   borderStart: 0x0008,
-  borderEnd: 0x0010,
+  borderBreak: 0x0010,
   enemyKill: 0x0020,
   itemCollect: 0x0040
 };

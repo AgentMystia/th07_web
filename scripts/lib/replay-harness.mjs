@@ -10,14 +10,17 @@
 import { cachedEsbuild } from './test-build-cache.mjs';
 
 let modsPromise = null;
+let loadedMod = null;
 
 // Bundles src/testkit/replay-entry.ts once per process and imports it.
 export function loadEngine() {
   modsPromise ??= (async () => {
-    return cachedEsbuild({
+    const mod = await cachedEsbuild({
       name: 'replay-harness',
       entryPoints: ['src/testkit/replay-entry.ts']
     });
+    loadedMod = mod;
+    return mod;
   })();
   return modsPromise;
 }
@@ -40,44 +43,24 @@ export function makeStubAudio() {
   };
 }
 
-// Applies a stage's recorded entry snapshot to a freshly constructed scene —
-// the same fields StageScene's own carry block sets, without triggering the
-// mid-run stage transition (frame alignment against the recorded stream is
-// calibrated separately).
+// Applies a stage's recorded entry snapshot to a freshly constructed scene.
+//
+// This is a thin wrapper over the PRODUCTION restore (Th07.exe FUN_00440480,
+// src/game/replay-playback.ts) — browser playback and the Node verifier must
+// enter a stage in exactly the same state, or the verifier certifies something
+// the shipped game does not do. The hand-written copy that used to live here
+// had silently lost `powerItemCountForScore` and `replayHasStage5Data` (the
+// Gui.cpp:1365 stage-6 clear-bonus arm).
+//
+// The only harness-side addition is `restoreRng`: runStage constructs the
+// scene with the recorded seed so manager bootstrap consumes from it (like
+// native playback) and therefore passes `false`, while ad-hoc test scenes that
+// were built with some other seed can ask for the seed to be re-seated.
 export function applySnapshot(scene, rpy, stageIndex, opts = {}) {
-  const s = rpy.stages[stageIndex];
-  const previous = stageIndex > 0 ? rpy.stages[stageIndex - 1] : null;
-  // FUN_00440480 restores a prior score only for a physically adjacent
-  // Stage 1..6 slot. Extra/Phantasm start from zero, and the replay header's
-  // final score is metadata rather than the live HUD hi-score.
-  scene.score = s.stage >= 2 && s.stage <= 6 && previous?.stage === s.stage - 1
-    ? previous.scoreAtEnd
-    : 0;
-  scene.graze = s.graze;
-  scene.pointItems = s.pointItems;
-  scene.playerObj.lives = s.lives;
-  scene.playerObj.bombs = s.bombs;
-  scene.playerObj.power = s.power;
-  scene.cherry.cherry = s.cherry;
-  scene.cherry.cherryMax = s.cherryMax;
-  scene.cherry.cherryPlus = s.cherryPlus;
-  scene.cherry.spellsCaptured = s.spellsCaptured;
-  scene.extendLevel = s.extendLevel;
-  scene.captureStageEntryTotals();
-  if (scene.extendThreshold !== s.extendThreshold) {
-    throw new Error(
-      `T7RP stage ${s.stage} extend threshold ${s.extendThreshold} ` +
-      `does not match level ${s.extendLevel} (${scene.extendThreshold})`
-    );
-  }
-  // Recorded rank (DAT_00625884). The port's rank dynamics are under review;
-  // seeding the recorded stage-entry value keeps the entry state faithful.
-  scene.rank = s.rankByte;
-  // Config starting-lives from the replay header (run-state +0x1c) — drives
-  // the FUN_00429446 Player Penalty on every stage-clear bonus.
-  scene.startingLives = rpy.initialLives;
+  if (!loadedMod) throw new Error('applySnapshot: await loadEngine() first');
+  loadedMod.applyReplayStageSnapshot(scene, rpy, stageIndex);
   if (opts.restoreRng !== false) {
-    scene.rng.seed = s.rngSeed;
+    scene.rng.seed = rpy.stages[stageIndex].rngSeed;
     scene.runtime.initializeRandomCounters(scene.rng);
   }
 }
@@ -130,6 +113,10 @@ export function digestFrame(scene) {
 // (trace/digest hook). frameTrace carries the raw replay input and the RNG
 // state/counter on both sides of that tick, so native PRE-state traces can be
 // compared without an off-by-one correction.
+// opts.onScene(scene, currentFrame) runs ONCE after construction and snapshot
+// restore, before the first tick, for diagnostics that need to instrument the
+// scene from frame 0 (e.g. the damage attribution trace). `currentFrame` reads
+// the live frame index so a wrapper can stamp its own records.
 //
 // End conditions:
 //  - completed: onStageComplete fired (arcade stages 1-5) — carryOut captured;
@@ -216,11 +203,16 @@ export async function runStage(rpy, stageIndex, opts = {}) {
   const source = new mod.ReplayInputSource();
   const deaths = [];
   const bombs = [];
-  // Our sim's per-frame event streams, mirroring the replay aux-word oracle
-  // (RPY_AUX_BITS): kill frames (enemy-slot-vacate events) and item collects.
+  // Our sim's per-frame event streams, one per RPY_AUX_BITS entry. Each is a
+  // Set because AUX is a bitfield: several events of one kind inside a single
+  // tick collapse to one frame marker in the recording, so ours must too.
   const killFrames = new Set();
   const collectFrames = new Set();
   const playerHitFrames = new Set();
+  const bombFrames = new Set();
+  const missFrames = new Set();
+  const borderStartFrames = new Set();
+  const borderBreakFrames = new Set();
   let prevLives = scene.playerObj.lives;
   let prevBombs = scene.playerObj.bombs;
   const graceFrames = opts.graceFrames ?? 900;
@@ -276,7 +268,45 @@ export async function runStage(rpy, stageIndex, opts = {}) {
     // intentionally committed-hit-only and therefore cannot serve as this
     // oracle. Tap the shared contact handler instead without changing play.
     scene.onPlayerContact = () => playerHitFrames.add(f);
+    // AUX-0x01 is written inside FUN_0043d9a0's ACCEPT branch (all.c:28486),
+    // right next to the -200 rank call our onBombUsed() ports. The free
+    // Border-break branch above it returns early and writes nothing, so the
+    // bomb stream must not tap the raw held-X button or the timer.
+    const origBombUsed = scene.onBombUsed.bind(scene);
+    scene.onBombUsed = () => {
+      bombFrames.add(f);
+      return origBombUsed();
+    };
+    // AUX-0x04 (all.c:28596) fires the frame the deathbomb meter reaches zero
+    // and the miss COMMITS — 30 squish frames before the life counter drops.
+    // `deaths` below tracks the life decrement instead and is 30 frames late,
+    // which is why it is reporting-only and never the oracle.
+    const origPlayerDeath = scene.onPlayerDeath.bind(scene);
+    scene.onPlayerDeath = () => {
+      missFrames.add(f);
+      return origPlayerDeath();
+    };
+    // AUX-0x08 (all.c:28928) at the tail of FUN_0043e890's success path;
+    // CherrySystem calls onBorderStart from exactly that seam.
+    const cherryEvents = scene.cherry.events;
+    const origBorderStart = cherryEvents.onBorderStart;
+    cherryEvents.onBorderStart = () => {
+      borderStartFrames.add(f);
+      return origBorderStart?.call(cherryEvents);
+    };
+    // AUX-0x10 (all.c:28994) is the tail of FUN_0043eb00 — the forced
+    // break/cancel path ONLY. The natural expiry / cherry-full path
+    // (FUN_0043e620, our finishBorderSurvival) writes no bit, so tapping
+    // onBorderEnd would over-report. applyBorderBreakEffects is our port of
+    // FUN_0043eb00 and is reached by both the hit break and the marker-2
+    // cancel, which is exactly the exe's call graph.
+    const origBreakEffects = scene.applyBorderBreakEffects.bind(scene);
+    scene.applyBorderBreakEffects = (...args) => {
+      borderBreakFrames.add(f);
+      return origBreakEffects(...args);
+    };
   }
+  opts.onScene?.(scene, () => f);
   for (; f < stage.inputs.length + graceFrames; f++) {
     const word = f < stage.inputs.length ? stage.inputs[f] : 0;
     if (f >= stage.inputs.length) extraFrames++;
@@ -337,6 +367,10 @@ export async function runStage(rpy, stageIndex, opts = {}) {
     killModeTally,
     collectFrames: [...collectFrames],
     playerHitFrames: [...playerHitFrames],
+    bombFrames: [...bombFrames],
+    missFrames: [...missFrames],
+    borderStartFrames: [...borderStartFrames],
+    borderBreakFrames: [...borderBreakFrames],
     rngBootstrapDraws,
     rngDraws: rngBootstrapDraws + rngDraws,
     rngProfile: rngProfile

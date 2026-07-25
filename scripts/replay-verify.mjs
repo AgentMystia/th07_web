@@ -2,16 +2,19 @@
 //
 // Replays each recorded stage headlessly and compares our end-of-stage state
 // against the NEXT stage's recorded entry snapshot — ground truth written by
-// the original engine. PASS also requires the exact RNG residue, exact
-// per-frame kill/collect/player-hit AUX streams, and an authored stage end.
-// Final-stage blocks include recorder sentinel/padding words after the last
-// native gameplay row, so array exhaustion is not a completion oracle.
-// Any unexpected player death is reported with its frame: the original player
-// demonstrably survived every frame their replay shows them surviving, so a
-// death localizes the first observable bullet misalignment at or before it.
+// the original engine. PASS also requires the exact RNG residue, an authored
+// stage end, and all SEVEN per-frame AUX event streams (kills, collects,
+// player contacts, misses, bombs, border starts, border breaks) matching
+// frame for frame. Final-stage blocks include recorder sentinel/padding words
+// after the last native gameplay row, so array exhaustion is not a completion
+// oracle. Any unexpected player death is reported with its frame: the original
+// player demonstrably survived every frame their replay shows them surviving,
+// so a death localizes the first observable bullet misalignment at or before it.
 //
 // Usage:
-//   node scripts/replay-verify.mjs [--replay tests/replays/th7_udFe25.rpy]
+//   node scripts/replay-verify.mjs [--replay a.rpy[,b.rpy…]]
+//     [--all]             verify every replay/*.rpy (local evidence) plus the
+//                         committed fixture, and print a difficulty×stage matrix
 //     [--stage N]         verify only stage N (1-based)
 //     [--json out.json]   write the full machine-readable report
 //     [--trace A,B]       input + pre/post RNG + fixed-slot JSONL for A..B
@@ -23,7 +26,7 @@
 //                         ghost mode is diagnostic-only and never PASSes)
 //
 // Exit codes: 0 = all verified stages PASS; 2 = divergence; 1 = error.
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadEngine, runStage } from './lib/replay-harness.mjs';
 
@@ -42,16 +45,30 @@ function parseArgs(argv) {
   return args;
 }
 
+const FIXTURE = 'tests/replays/th7_udFe25.rpy';
+// Local, git-ignored evidence: the E/N/H/Extra/Phantasm replays live here so
+// third-party recordings never enter the repository. Only FIXTURE is committed
+// and only FIXTURE gates CI.
+const LOCAL_REPLAY_DIR = 'replay';
+
+function resolveReplayPaths(args) {
+  if (args.replay && args.replay !== true) return String(args.replay).split(',');
+  if (!args.all) return [FIXTURE];
+  const local = existsSync(LOCAL_REPLAY_DIR)
+    ? readdirSync(LOCAL_REPLAY_DIR)
+        .filter((f) => f.endsWith('.rpy'))
+        .sort()
+        .map((f) => join(LOCAL_REPLAY_DIR, f))
+    : [];
+  return [FIXTURE, ...local];
+}
+
 const args = parseArgs(process.argv);
-const replayPath = args.replay ?? 'tests/replays/th7_udFe25.rpy';
+const replayPaths = resolveReplayPaths(args);
 const onlyStage = args.stage ? Number(args.stage) : null;
 
 const mod = await loadEngine();
-const rpy = new mod.Rpy(readFileSync(replayPath));
-console.log(
-  `replay: ${replayPath} — ${rpy.character} diff=${rpy.difficulty} "${rpy.name}" ` +
-    `${rpy.stages.length} stages, final score ${rpy.score}`
-);
+const DIFFICULTY_NAMES = ['Easy', 'Normal', 'Hard', 'Lunatic', 'Extra', 'Phantasm'];
 
 // Expected end-of-stage state for stage index i: the entry snapshot of stage
 // i+1. The final fixture stage has one directly measured native-playback
@@ -118,12 +135,94 @@ function impliedDeaths(rpy, i) {
   return Math.max(0, cur.lives + extendsGained - next.lives);
 }
 
-const report = { replay: replayPath, stages: [] };
+const report = { replays: [] };
 let failed = false;
 
 const outDir = args.out ?? 'tmp/replay';
 const traceRange = args.trace ? String(args.trace).split(',').map(Number) : null;
+const damageRange = args['trace-damage'] ? String(args['trace-damage']).split(',').map(Number) : null;
 const dumpFrame = args['dump-frame'] !== undefined ? Number(args['dump-frame']) : null;
+
+// Damage attribution. "We killed this boss N frames early/late" is the shape
+// of almost every remaining divergence, and the AUX oracle localizes it to a
+// frame but not to a shot. Wrapping the two seams of the exe's damage pipeline
+// (FUN_0041ed50: per-hit accumulation, then one settlement per enemy per
+// frame) gives the missing half without any production hook: every contact is
+// attributed to a player-shot pool slot, and every settlement reports what the
+// 70-cap / spell-divisor / shield chain actually removed.
+function installDamageTrace(scene, currentFrame, range, sink) {
+  const inRange = () => currentFrame() >= range[0] && currentFrame() <= range[1];
+  const origDamage = scene.damageEnemy.bind(scene);
+  scene.damageEnemy = (enemy, damage, kind = 'shot') => {
+    if (inRange()) {
+      // damageEnemy() receives only the resolved number (exactly as
+      // FUN_0041ed50 does), so recover the shot side geometrically: every
+      // still-live shot whose AABB currently overlaps this enemy's hitbox.
+      // The collision pass flips a shot to 'collided' only AFTER the damage
+      // call, so the contributing slot is always in this list; slots listed
+      // beyond it are the ones queued to hit on a later pass.
+      const box = enemy.ecl?.hitbox ?? { x: 0, y: 0 };
+      const overlapping = scene.playerBullets
+        .filter((b) => !b.dead && b.state === 'fired' &&
+          Math.abs(b.x - enemy.x) <= (box.x + b.hitboxW) * 0.5 &&
+          Math.abs(b.y - enemy.y) <= (box.y + b.hitboxH) * 0.5)
+        .map((b) => `${b.poolSlot}:${b.damage}`);
+      sink.push({
+        f: currentFrame(),
+        ev: 'hit',
+        kind,
+        enemy: enemy.poolSlot,
+        sub: enemy.ecl?.subId ?? null,
+        boss: Boolean(enemy.ecl?.isBoss),
+        ex: Number(enemy.x.toFixed(3)),
+        ey: Number(enemy.y.toFixed(3)),
+        hitbox: `${box.x}x${box.y}`,
+        hp: enemy.hp,
+        damage,
+        overlappingShots: overlapping
+      });
+    }
+    return origDamage(enemy, damage, kind);
+  };
+  const origSettle = scene.settlePendingDamage.bind(scene);
+  scene.settlePendingDamage = (enemy) => {
+    const rawShot = enemy.pendingShotDmg;
+    const rawBomb = enemy.pendingBombDmg;
+    const hpBefore = enemy.hp;
+    const out = origSettle(enemy);
+    if (inRange() && (rawShot > 0 || rawBomb > 0)) {
+      sink.push({
+        f: currentFrame(),
+        ev: 'settle',
+        enemy: enemy.poolSlot,
+        sub: enemy.ecl?.subId ?? null,
+        rawShot,
+        rawBomb,
+        settled: enemy.damageThisFrame,
+        hpBefore,
+        hpAfter: enemy.hp,
+        spell: Boolean(scene.spellcard),
+        shield: enemy.ecl?.damageShield ?? 0
+      });
+    }
+    return out;
+  };
+}
+
+for (const replayPath of replayPaths) {
+const rpy = new mod.Rpy(readFileSync(replayPath));
+const replayReport = {
+  replay: replayPath,
+  character: rpy.character,
+  difficulty: rpy.difficulty,
+  difficultyName: DIFFICULTY_NAMES[rpy.difficulty] ?? String(rpy.difficulty),
+  stages: []
+};
+report.replays.push(replayReport);
+console.log(
+  `\n=== ${replayPath} — ${rpy.character} ${replayReport.difficultyName} "${rpy.name}" ` +
+    `${rpy.stages.length} stages, final score ${rpy.score}`
+);
 
 for (let i = 0; i < rpy.stages.length; i++) {
   const stage = rpy.stages[i];
@@ -192,8 +291,12 @@ for (let i = 0; i < rpy.stages.length; i++) {
     };
   }
 
+  const damageLines = [];
   const r = await runStage(rpy, i, {
     onFrame,
+    onScene: damageRange
+      ? (scene, currentFrame) => installDamageTrace(scene, currentFrame, damageRange, damageLines)
+      : undefined,
     ghost: Boolean(args.ghost),
     // Formal verification ends at the recorded stream boundary. Empty-input
     // tail ticks can be useful for diagnosis, but must never manufacture a
@@ -211,28 +314,31 @@ for (let i = 0; i < rpy.stages.length; i++) {
   // infer it once per stage before comparing. An ambiguous vote is reported
   // and falls back to raw indices, which cannot PASS spuriously (exactness
   // still gates it).
+  // Every bit the AUX word actually carries is an independent frame-exact
+  // oracle, so all seven streams are compared and all seven gate PASS. The
+  // sparse ones (bombs, misses, border start/break) are what localize a
+  // divergence in a stage whose kill/collect traffic is thin.
+  const STREAMS = [
+    ['kills', mod.RPY_AUX_BITS.enemyKill, r.killFrames],
+    ['collects', mod.RPY_AUX_BITS.itemCollect, r.collectFrames],
+    ['playerHits', mod.RPY_AUX_BITS.playerHit, r.playerHitFrames],
+    ['misses', mod.RPY_AUX_BITS.playerMiss, r.missFrames],
+    ['bombs', mod.RPY_AUX_BITS.bomb, r.bombFrames],
+    ['borderStarts', mod.RPY_AUX_BITS.borderStart, r.borderStartFrames],
+    ['borderBreaks', mod.RPY_AUX_BITS.borderBreak, r.borderBreakFrames]
+  ];
   let auxAlignment;
   try {
-    auxAlignment = mod.detectAuxAlignment(stage, [
-      { bit: mod.RPY_AUX_BITS.enemyKill, frames: r.killFrames },
-      { bit: mod.RPY_AUX_BITS.itemCollect, frames: r.collectFrames },
-      { bit: mod.RPY_AUX_BITS.playerHit, frames: r.playerHitFrames }
-    ]);
+    auxAlignment = mod.detectAuxAlignment(
+      stage,
+      STREAMS.map(([, bit, frames]) => ({ bit, frames }))
+    );
   } catch (e) {
     auxAlignment = { offset: 0, prefixByOffset: null, ambiguous: e.message };
   }
   const alignment = {};
-  for (const [name, bit] of [
-    ['kills', mod.RPY_AUX_BITS.enemyKill],
-    ['collects', mod.RPY_AUX_BITS.itemCollect],
-    ['playerHits', mod.RPY_AUX_BITS.playerHit]
-  ]) {
+  for (const [name, bit, ourFrames] of STREAMS) {
     const oracle = mod.auxEventFrames(stage, bit, auxAlignment.offset);
-    const ourFrames = name === 'kills'
-      ? r.killFrames
-      : name === 'collects'
-        ? r.collectFrames
-        : r.playerHitFrames;
     let matched = 0;
     let ptr = 0;
     let firstGap = null;
@@ -251,14 +357,34 @@ for (let i = 0; i < rpy.stages.length; i++) {
       : oracle.length === ourFrames.length
         ? null
         : { index: oracle.length, expected: null, actual: ourFrames[oracle.length] ?? null };
+    // The frame the two streams actually part ways: whichever side fired
+    // first at the first differing index. A missing entry on one side is not
+    // a frame, so a null there falls back to the other side's frame.
+    const divergesAt = firstMismatch === null
+      ? null
+      : Math.min(firstMismatch.expected ?? Infinity, firstMismatch.actual ?? Infinity);
     alignment[name] = {
       oracle: oracle.length,
       ours: ourFrames.length,
       exact: firstMismatch === null,
       firstMismatch,
+      divergesAt: Number.isFinite(divergesAt) ? divergesAt : null,
       matchedWithin3: matched,
       firstGap
     };
+  }
+
+  // One number to drive the convergence loop: the earliest frame at which ANY
+  // native event stream disagrees. Reading three (now seven) separate lines
+  // hid earlier signals — e.g. th7_udYo01 stage 2's contact and miss are both
+  // exact while the true first break is an item collect thousands of frames
+  // before the first kill mismatch.
+  let earliestDivergence = null;
+  for (const [name, a] of Object.entries(alignment)) {
+    if (a.divergesAt === null) continue;
+    if (!earliestDivergence || a.divergesAt < earliestDivergence.frame) {
+      earliestDivergence = { frame: a.divergesAt, stream: name };
+    }
   }
 
   // RNG draw budget: the recorder snapshots the live RNG per stage, so the
@@ -284,8 +410,13 @@ for (let i = 0; i < rpy.stages.length; i++) {
     }
   }
 
-  if (traceLines.length || dumped) {
+  if (traceLines.length || dumped || damageLines.length) {
     mkdirSync(outDir, { recursive: true });
+    if (damageLines.length) {
+      const p = join(outDir, `stage${stage.stage}-damage.jsonl`);
+      writeFileSync(p, damageLines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+      console.log(`damage trace written to ${p}`);
+    }
     if (traceLines.length) {
       const p = join(outDir, `stage${stage.stage}-trace.jsonl`);
       writeFileSync(p, traceLines.join('\n') + '\n');
@@ -304,7 +435,11 @@ for (let i = 0; i < rpy.stages.length; i++) {
     if (actual[key] !== want) diffs.push({ field: key, expected: want, actual: actual[key] });
   }
   const implied = impliedDeaths(rpy, i);
-  const unexpectedDeaths = implied === null ? r.deaths : r.deaths.slice(implied);
+  // AUX-0x04 records the original's misses frame-exactly (all.c:28596), so an
+  // unexpected death is now a set difference against the recording rather
+  // than the lives-arithmetic lower bound `impliedDeaths` used to supply.
+  const oracleMisses = new Set(mod.auxEventFrames(stage, mod.RPY_AUX_BITS.playerMiss, auxAlignment.offset));
+  const unexpectedDeaths = r.missFrames.filter((frame) => !oracleMisses.has(frame));
   const completion = { requirement: 'stageComplete', met: r.completed };
   const nativeFinalScore = !rpy.stages[i + 1] ? nativeLiveFinalScore(rpy, stage) : null;
   const metadataAdvisories = nativeFinalScore !== null && stage.scoreAtEnd !== nativeFinalScore
@@ -338,12 +473,14 @@ for (let i = 0; i < rpy.stages.length; i++) {
     hits: r.hits,
     auxAlignment,
     alignment,
+    earliestDivergence,
     rngBudget,
     impliedDeaths: implied,
+    unexpectedDeaths,
     metadataAdvisories,
     diffs
   };
-  report.stages.push(stageReport);
+  replayReport.stages.push(stageReport);
 
   console.log(`\nstage ${stage.stage}: ${args.ghost ? 'GHOST (diagnostic-only)' : pass ? 'PASS' : 'FAIL'}  ` +
     `(${r.framesRun}/${r.framesAvailable} frames, ${Math.round(r.wallMs)}ms)`);
@@ -364,6 +501,12 @@ for (let i = 0; i < rpy.stages.length; i++) {
         (a.firstGap !== null ? `; first unmatched oracle event @${a.firstGap}` : '')
     );
   }
+  if (earliestDivergence) {
+    console.log(
+      `  EARLIEST DIVERGENCE: frame ${earliestDivergence.frame} (${earliestDivergence.stream}) ` +
+        `— ${((earliestDivergence.frame / r.framesAvailable) * 100).toFixed(1)}% into the recorded stream`
+    );
+  }
   if (rngBudget) {
     console.log(
       `  rng draws: ours ${rngBudget.ourDraws} (≡${rngBudget.ourResidue} mod 65536), ` +
@@ -378,11 +521,12 @@ for (let i = 0; i < rpy.stages.length; i++) {
       `(${advisory.provenance})`
     );
   }
-  if (r.deaths.length) {
-    const first = r.deaths[0];
+  if (unexpectedDeaths.length) {
     console.log(
-      `  deaths: ${r.deaths.length} (implied by replay: ${implied ?? '?'}) — ` +
-        `FIRST DIVERGENCE at/before frame ${first.frame} (stageFrame ${first.stageFrame})`
+      `  UNEXPECTED DEATHS: ${unexpectedDeaths.length} of ${r.missFrames.length} ` +
+        `(recording has ${oracleMisses.size}; lives arithmetic implies ${implied ?? '?'}) — ` +
+        `first at frame ${unexpectedDeaths[0]}. The original demonstrably survived ` +
+        `every frame their replay shows them surviving.`
     );
     for (const h of r.hits.slice(0, 3)) {
       const b = h.bullet;
@@ -403,6 +547,28 @@ for (let i = 0; i < rpy.stages.length; i++) {
   }
   for (const d of diffs) {
     console.log(`  ${d.field}: expected ${d.expected}, got ${d.actual}`);
+  }
+}
+}
+
+// Regression matrix. Every fidelity fix has to be re-measured against every
+// available difficulty/shot-type combination — a change that converges one
+// replay while moving another's exact prefix backward is a regression, not a
+// fix, and only a side-by-side table makes that obvious.
+if (report.replays.length > 1) {
+  const stageIds = [...new Set(report.replays.flatMap((rep) => rep.stages.map((s) => s.stage)))]
+    .sort((a, b) => a - b);
+  const label = (rep) => `${rep.difficultyName}/${rep.character}`.padEnd(17);
+  console.log('\n=== matrix (PASS, or the earliest diverging frame) ===');
+  console.log(`${''.padEnd(17)}${stageIds.map((s) => `st${s}`.padStart(9)).join('')}`);
+  for (const rep of report.replays) {
+    const cells = stageIds.map((id) => {
+      const s = rep.stages.find((st) => st.stage === id);
+      if (!s) return ''.padStart(9);
+      if (s.pass) return 'PASS'.padStart(9);
+      return String(s.earliestDivergence ? s.earliestDivergence.frame : 'FAIL').padStart(9);
+    });
+    console.log(`${label(rep)}${cells.join('')}`);
   }
 }
 

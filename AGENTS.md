@@ -119,8 +119,16 @@ For any gameplay or visual change:
    recorded snapshot (ground truth written by the original engine), reporting
    per-field diffs plus every unexpected player death with the killing
    bullet's provenance (owner enemy, ECL sub, spawn frame, angle/speed).
-   `--trace A,B` dumps per-frame JSONL; `--dump-frame F` dumps a full
-   snapshot. Format + workflow spec: reference/re-specs/exe-replay.md.
+   PASS additionally requires all **seven** AUX event streams (§6) to match
+   frame for frame, and each stage prints one `EARLIEST DIVERGENCE` line —
+   the minimum over the seven streams, which is the number to drive a
+   convergence loop with. Flags: `--all` runs every local `replay/*.rpy`
+   plus the fixture and prints a difficulty × stage matrix; `--replay a,b`
+   takes an explicit list; `--trace A,B` dumps per-frame JSONL;
+   `--trace-damage A,B` dumps every player-shot→enemy contact and the
+   per-enemy damage settlement (use this when a boss/enemy dies N frames
+   early or late); `--dump-frame F` dumps a full snapshot.
+   Format + workflow spec: reference/re-specs/exe-replay.md.
 3. Drive the affected states headlessly and read the **snapshot JSON**
    (entity counts, positions, boss/spell state, cherry, player) printed by
    the tools. Assert the fields your change should have moved — and that
@@ -359,7 +367,23 @@ by fixed 4-byte frame records (u16 input word + u16 aux, no RLE). Input
 bits: 0x1 Z, 0x2 X, 0x4 Shift, 0x8 Esc, 0x10-0x80 directions (numpad
 diagonals OR pairs), 0x100 Ctrl-skip, 0x1000 Enter. **Direction chords
 resolve by priority — up beats down, right beats left (FUN_0043be00), NOT
-vector cancellation**; real replays contain such chords. Rank
+vector cancellation**; real replays contain such chords.
+
+**AUX word (second u16 of each frame record, ctx+0x9e)** — the original
+engine's own per-frame EVENT STREAM, and therefore the project's densest
+frame-exact oracle. All seven bits are verified by `replay:verify`:
+`0x1` bomb accepted (all.c:28486, FUN_0043d9a0's trigger branch),
+`0x2` player contact registered before the state gate (27780/27914),
+`0x4` player MISS — the frame the deathbomb meter reaches 0 and the death
+commits, 30 squish frames before the life counter drops (28596),
+`0x8` border start (28928), `0x10` border BREAK ONLY — the tail of
+FUN_0043eb00; the natural expiry / cherry-full path FUN_0043e620 writes no
+bit (28994), `0x20` enemy kill / slot vacate (13887/14351/14360),
+`0x40` item collected (22016). `0x100` (29442) is still unidentified.
+The pre-2026-07-25 mapping had `bomb` on 0x4 and called 0x1
+"border-adjacent, PROBABLE"; both were wrong and both are now confirmed
+against the decompile *and* against our own simulation on converged replays.
+Rank
 (DAT_00625884): recorded per stage; 16 at run start (= the neutral point of
 every rank formula), 32 from stage 2 on; no per-frame increment exists in
 the exe (machine-code scan) — constant within a stage.
@@ -415,6 +439,47 @@ These corrections are engine-wide, but two Lunatic replays do **not** prove
 Easy/Normal/Hard convergence. Lower ranks select different ECL instructions,
 formulas, bullet counts, and pool-pressure paths. Each difficulty still needs
 its own native replay PRE trace plus full event/end-state verification.
+
+### All-difficulty baseline (2026-07-25)
+
+Five further native replays cover every remaining difficulty. They are
+third-party recordings and stay **local evidence** under the git-ignored
+`replay/` directory — never commit them; `tests/replays/th7_udFe25.rpy`
+remains the only fixture and the only CI gate. Run the whole set with
+`node scripts/replay-verify.mjs --all`, which prints a difficulty × stage
+matrix of PASS / earliest-diverging-frame:
+
+| replay | char | difficulty | st1 | st2 | st3 | st4 | st5 | st6 | st7 |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| th7_udFe25 | sakuyaA | Lunatic | PASS | PASS | PASS | PASS | PASS | PASS | — |
+| th7_udHm54 | marisaB | **Extra** | — | — | — | — | — | — | **PASS** |
+| th7_udSg10 | reimuA | Phantasm | — | — | — | — | — | — | 51989 |
+| th7_udMt01 | sakuyaB | Easy | PASS | PASS | PASS | 4536 | 7290 | 1628 |— |
+| th7_udYo01 | sakuyaA | Normal | PASS | 8747 | 11863 | 18596 | 2280 | 2727 | — |
+| th7_udFi03 | reimuB | Hard | 5440 | 2165 | 537 | 2360 | 617 | 1330 | — |
+
+Extra is fully converged (467 kills, 2064 collects, 4 contacts, 2 bombs,
+20 border starts, 2 border breaks — all frame-exact — plus an exact final
+score). Phantasm is exact for 51989 of 57876 frames; its boss spell (sub 127)
+dies two frames early, i.e. we are ~2 HP ahead over a long spellcard.
+
+Two structural facts to carry into any continuation:
+
+- **`wine`/`winedbg` is not installed in the current environment**, so the
+  native PRE-trace procedure below cannot be run here. The AUX streams are
+  the substitute oracle. They are dense and frame-exact, but they are not
+  complete: an RNG or position divergence that happens to produce no AUX
+  event stays invisible until it changes one. Do not read "exact through
+  frame N" as "identical through frame N".
+- **ReimuB is the only shot type with no passing stage in any replay**, and
+  it is the only one that saturates the 96-slot player-shot pool: measured
+  at Hard stage 3, the pool is full on 28 of 140 sampled frames with 12-33
+  slots held by spent (post-impact) sprites. Every ReimuB divergence
+  measured so far is a kill landing a few frames LATE, never early, i.e. we
+  deal slightly less damage. Under saturation the impact-sprite lifetime and
+  the offscreen cull directly set live-shot count and therefore DPS, so an
+  error there that is invisible for Sakuya/Marisa/ReimuA becomes a DPS error
+  for ReimuB. Investigate that before anything else on Hard.
 
 ### Next-session fidelity workflow
 
@@ -531,8 +596,18 @@ comparisons against real play).
   + shape restore + background interrupt 1 + rate reset; split-counter
   timers accumulate fractionally). See `spec-slowmo.md`, with its old claim
   that the two background writes are dead explicitly overruled above.
-- Extra/Phantasm starting bombs/power PROBABLE (community convention),
-  not exe-verified.
+- ~~Extra/Phantasm starting bombs/power PROBABLE~~ — **resolved 2026-07-25,
+  against the community convention.** Extra and Phantasm start at **power 0**
+  (not full power) with the character's ordinary SHT bomb stock and lives
+  forced to 2. Evidence: the stage-7 entry snapshots two native replays'
+  recorders wrote — th7_udHm54 (marisaB, Extra) `power=0 lives=2 bombs=2`
+  and th7_udSg10 (reimuA, Phantasm) `power=0 lives=2 bombs=3`, the bomb
+  values being exactly ply01b/ply00b's `bomb_per_life`. `FUN_0042cf2f`
+  (all.c:19715-19717) only forces lives; it never writes power, which is why
+  spec-extra-phantasm.md §2 could not find a write site. The route keeps its
+  top-of-screen auto-collect regardless, since the PoC predicate is
+  difficulty-gated (`power >= 128 || difficulty > 3`, ItemManager.cpp:195).
+  Pinned by tests/th07-extra-phantasm-init.test.mjs.
 - ESC pause menu: presentation is the authored ascii.anm entry-2
   (pause.png) scripts verbatim, but the exe's trigger/menu logic was not
   statically recoverable — BGM-keeps-playing and the confirm default

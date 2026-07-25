@@ -808,12 +808,18 @@ export class StageScene implements GameHost {
     this.bombContext = this.createBombContext();
     this.player = this.playerObj;
     // Extra/Phantasm run-init (FUN_0042cf2f @ all.c:19715-19717): lives
-    // forced to 2 for difficulty >= 4. Power 128 at start is the
-    // community-documented convention (PROBABLE — the exe-side write site
-    // wasn't located; spec-extra-phantasm.md §2).
+    // forced to 2 for difficulty >= 4. Power is NOT touched — Extra and
+    // Phantasm begin at 0 like every other route, and bombs come from the
+    // SHT header as usual. The old `power = 128` here was the community
+    // "Extra starts maxed" convention that spec-extra-phantasm.md §2 could
+    // not find a write site for; two native replays settle it against that
+    // convention. Their stage-7 entry snapshots (sub-header +0x22/+0x23/
+    // +0x24, written by the original engine) read:
+    //   th7_udHm54 marisaB Extra     power=0 lives=2 bombs=2
+    //   th7_udSg10 reimuA  Phantasm  power=0 lives=2 bombs=3
+    // — 2/3 bombs being exactly ply01b/ply00b's SHT bomb_per_life.
     if (!carry && this.difficulty >= 4) {
       this.playerObj.lives = 2;
-      this.playerObj.power = 128;
     }
     // Mid-run stage entry: score/lives/power/graze/cherry persist across
     // stages within one credit (the exe keeps them in the run-global stats

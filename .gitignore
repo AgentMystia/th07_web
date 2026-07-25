@@ -1,6 +1,9 @@
 node_modules/
 dist/
 reference/
+# Local-only replay evidence (third-party recordings). The only committed
+# fixture is tests/replays/th7_udFe25.rpy.
+replay/
 
 playwright-report/
 test-results/
