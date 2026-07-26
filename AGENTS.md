@@ -202,6 +202,18 @@ Chromium at `/opt/pw-browsers/chromium-*/chrome-linux/chrome`; run
   fields, never from the CLI flags. `--chrome-major` pins the expected
   browser (148); `--allow-invalid-refresh` for non-144Hz rigs/Xvfb.
   `npm run perf:smoke -- desync=0` is the matching throughput control arm.
+  **Under Xvfb neither probe can adjudicate the desync default.** Measured
+  2026-07-26 on Playwright Chromium 141 under Xvfb: the granted-desync arm
+  reports steady p50 17.93 ms event-to-displayed while the `--no-desync`
+  control reports 9.54 ms — i.e. the control looks *better*. That is the same
+  accounting artifact as the draw-cost pitfall in §8: with the backbuffer,
+  `present()` flushes the batched raster inside the timed window, and Xvfb has
+  no real scanout (`refreshValid` null, hence the flag). Do not "fix" the
+  default from a headless number; the presentation default needs a real
+  desktop Chrome eyeball, per §3. `perf:smoke`'s cadence gate also fails on
+  BOTH this tree and pristine `314bdfb` here (p99 33-50 ms, ~120-130 vsync gaps
+  >25 ms) for the same reason — A/B against the merge-base before believing a
+  cadence regression, and prefer the cost rings, which are stable.
 
 Standard stage checkpoints (dev-shot frame → machine-checkable criteria):
 
@@ -503,6 +515,18 @@ without new evidence:
   bursts.* Instrumenting the pass over Easy st4 frames 4515-4550 found zero
   spawns during the item pass and zero items visited twice. The hazard is real
   in principle (see §7) but is not the cause of those divergences.
+- *The item homing angle should not be narrowed to f32.* Dropping the
+  `Math.fround` around its `atan2` left the fixture passing and Easy st4
+  unchanged — no evidence either way, so the exe-cited narrowing stays.
+- *The enemy offscreen cull should test the pre-integration position* (proposed
+  to explain the oracle's two consecutive stage-3 kill bits at 3086/3087 as two
+  slot-vacates one frame apart). Culling on the previous position broke the
+  fixture at stage-1 frame 1775 and moved Hard st3 backwards to 2649. The
+  post-integration order in `updateEnemies` is correct.
+- *The Easy st4 collect burst is a lerp-completion problem.* Running the
+  spawn-mode-2 tween's lerp at elapsed 60 (so an item lands on its exact target
+  rather than stopping at t=59/60) does not move Normal st6, the cell where death
+  drops actually decide a collect.
 
 ### Next-session fidelity workflow
 
