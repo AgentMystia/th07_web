@@ -177,10 +177,37 @@ prefix as "no observed event differs", not as "state is identical".
   bullet-EX deceleration ramp (`exAccel`/`exAccelElapsed`, and the
   one-promotion-per-tick rule in FUN_004229f0) before anything else — a ramp that
   clamps to zero when native's keeps it moving would both explain the frozen
-  bullet and put a real bullet near the player at 1628. Also worth ruling out
-  first: whether the player is motionless because a dialogue freeze is active in
-  our run when it should not be, since 1628 sits early in stage 6 and an
-  82-frame offset is the right order of magnitude for a mis-scheduled MSG wait.
+  bullet and put a real bullet near the player at 1628.
+  A dialogue freeze was suspected and is REFUTED: no MSG runner is active
+  anywhere in 1600-1720 (`dialogue.idx` null every frame), and the player is
+  motionless simply because the recorded input word is 1 (shoot, no direction)
+  from 1620 to 1709 — the position track is exactly input-determined. What the
+  window really is: a dense pattern where the live bullet count climbs 125 → 342
+  while the player holds still, so any small upstream position error decides
+  whether a contact lands. Treat this cell as a member of the upstream-drift
+  family below rather than as a hitbox or scheduling bug.
+
+### The upstream-drift family (three cells, and why events cannot close them)
+
+Easy st4, Easy st6 and Normal st6 have all now been measured to the same
+conclusion: the divergence is the first *observable* symptom of a position or RNG
+error that accumulated earlier and produced no AUX event until it moved one. The
+evidence differs in each case and is independent:
+
+- Easy st4 — an offline pursuit simulator reproduces all 181 engine collect frames
+  exactly, and matching the oracle demands mixed-direction offsets (two items
+  farther, one closer), so no uniform engine change can produce it; the spawn
+  positions themselves differ.
+- Normal st6 — the drops' tween targets are a pure function of RNG position, and a
+  per-drop stride probe across k=0..10 yielded only scattered chance hits.
+- Easy st6 — nothing is marginal (nearest bullet 5.54 px against a 1.1 px player
+  half-box) amid 137+ live bullets.
+
+This is the limit of the event-stream oracle, exactly as the top of this document
+warns. Closing these needs per-frame native state — the Wine/winedbg PRE trace
+procedure below — not further bisection of kill/collect frames. A static read of
+`Th07.exe` alone will not do it either: these are accumulated-state questions, not
+constant-verification questions.
 - **Easy st4 @4536 is proven NOT to be an item-pipeline bug.** At frame 4513 a
   SakuyaB bomb's full-screen clear (region `{x:226.774, y:195.009, radius:800}`)
   converts 181 live enemy bullets into `cherry` items, all born `state:1`; from
