@@ -105,6 +105,16 @@ prefix as "no observed event differs", not as "state is identical".
   an RNG-positioned boss: ECL stage-1 Sub29 picks its move angle with
   `ins_52([10004], -π, π)`, so that boss's parked X is not a fixed target
   and cannot by itself prove or disprove a shot-side bug.
+  **Hard st4 @2360 is NOT pool starvation** — do not spend time there. Measured
+  across 2335-2365: the pool peaks at 82/96 and the whole stage drops only 4
+  spawns, so nothing is being starved. It is spent-dominated (70-80 post-impact
+  slots, `fired` falling to 0-2) simply because almost every needle reaches the
+  boss immediately and then holds its slot for its impact script's 20 ticks,
+  which is the correct post-fix behavior. The oracle kills at 2360 and takes a
+  contact at 2362 (dying at 2375, i.e. 13 frames into ReimuB's 15-frame deathbomb
+  window); we kill at 2362 and never take that contact at all. So what is left is
+  a 2-frame damage-cadence question with the settlement well under the 70 cap —
+  look at arrival cadence and the per-frame settlement, not at the pool.
 - **Easy/Normal collect bursts.** The framing that these are all item-pipeline
   bugs is now known to be wrong for at least the post-respawn half: Normal st5
   looked exactly like a ±1-frame auto-collect bug and was really the respawn
