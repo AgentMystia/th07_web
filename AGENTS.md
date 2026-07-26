@@ -603,6 +603,22 @@ Each also has an inline comment at its code site. Do not silently "fix"
 gameplay to taste — improve these only with better evidence (Ghidra, frame
 comparisons against real play).
 
+- **ReimuB unfocused bomb runs at a 50% duty cycle — empirical fit, exe grounding
+  UNCONFIRMED** (`reimuBUnfocused`, src/game/player-bombs.ts). `if (ctx.frame % 2
+  !== 1) return;` before the four slot writes. Replay-validated: th7_udFi03 Hard
+  st6 1727 → 1791 and st3 3087 → 3092 with all 22 cells otherwise byte-identical,
+  336 tests green, perf unchanged. But the "odd-frame write gating" the previous
+  comment attributed to the exe could NOT be located: FUN_00408f10
+  (0x408f10-0x4093c0) has the frame-0 init, a frame-60 shake, four unconditional
+  `call 0x43e730` clear-region allocations with exactly our geometries, and the
+  attack-slot loop — no parity test anywhere. ZunTimer::HasTicked, the one
+  documented per-tick gate, is always true at rate 1 and cannot produce it.
+  Re-derive or delete this the moment FUN_00408f10 can be read against a v1.00b
+  build; do not build further inference on it. Verified correct alongside it and
+  needing no change: all twelve forms call FUN_00431d10 (force-collect) on bomb
+  frame 0, matching our unconditional `forceCollectAllItems()`; and every readable
+  per-form duration at +0x16a28 matches `BOMB_PARAMS` exactly (reimuB 140/190,
+  marisaA 200/260, marisaB 300/340, sakuyaA 160/250, sakuyaB 160/300).
 - Frame tiling positions (exact-fit math, engine placement not literal).
 - HUD star icon x positions; spell-timer and fps exact placement.
 - Cherry+ banner interrupt→state mapping (dim=charging, bright=border).
