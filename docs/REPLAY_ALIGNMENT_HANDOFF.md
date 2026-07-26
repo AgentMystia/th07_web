@@ -112,10 +112,23 @@ prefix as "no observed event differs", not as "state is identical".
   player track reproduced all three oracle collects AND the three non-events
   immediately before them). Sort each remaining cell by the miss table above
   before assuming anything.
-  Still open in this family: **Normal st6 @2727** (collect 3 frames late, 220
-  frames after the miss at 2507 — the 55-tick lock did not move it, so measure
-  the player's position track against the recorded inputs the way Normal st5 was
-  measured), **Easy st5 @7290** (measured insensitive to the lock length — its
+  Still open in this family: **Normal st6 @2727**, now localized to a single
+  number — the late collect is death-drop power item slot 841 (spawned at the
+  2507 miss, so `age` 221 at 2727), falling straight down at terminal vy=3 with
+  x fixed at 328.095. Y is the binding axis: at 2727 the player is at
+  (321.85, 381.00), so |Δx| = 6.25 passes but |Δy| = 27.84 exceeds the 22 box
+  half-extent (12 grab + itemRadius/2); we collect at 2730 when |Δy| falls to
+  21.95. Reproducing the oracle needs that item **5.84 px lower at 2727**, which
+  at terminal speed is almost exactly two frames of extra fall. Two candidates
+  remain, and they are indistinguishable from this cell alone: the drop begins
+  falling ~2 frames earlier than ours, or its RNG-derived tween TARGET y sits
+  5.84 px lower (the target comes from `rng.f()*192-64`, a 192 px range, so this
+  is a 3% shift — check the per-item draw order in `spawnDeathDrop` against the
+  native one). Measured and refuted here: completing the lerp at elapsed 60 so
+  the item lands on its exact target (instead of stopping at t=59/60) does not
+  move the cell. Note tween items are ONLY death drops, so anything changed in
+  that branch is unreachable for every currently-passing replay.
+  Also still open: **Easy st5 @7290** (measured insensitive to the lock length — its
   first collect mismatch stays at index 191 and ~38 frames late for locks of 60,
   57 and 36, so it is an independent defect and not respawn timing at all), and
   **Easy st6 @1628**, which is a *contact*
