@@ -684,9 +684,26 @@ contains ONLY `orb=0` records — focused ReimuB fires no option needles at all.
 So the player is FOCUSED through this midboss, and "check whether both option orbs
 register" (suggested by an earlier revision of this section) is moot here: there
 are no option shots in the window. The 12x40 needle geometry is likewise
-irrelevant to this cell. What remains in play is main-shot cadence and count —
-`firePlayerBullets` timing, the 96-slot pool, and the per-frame raw-damage
-integral against the /7 divisor.
+irrelevant to this cell. What remains in play is main-shot cadence and count.
+
+**Pool saturation is REFUTED for this cell.** `--trace 5380,5462` shows
+player-shot pool occupancy peaking at **31 of 96** and never once reaching 90, so
+Phase A's dropped-spawn failure mode — the reason st6/st5/st3/st2 all moved and st1
+did not — is simply not in play here. Focus is held for the whole window
+(`input 0x0005`/`0x0045`, bit 0x4 set), which independently confirms the ply00bs
+reading above.
+
+Observed cadence from the damage trace is a clean 5-frame cycle: two d24 contacts
+plus one d15, i.e. 63 raw per 5 frames, holding steadily across 5400-5462. The
+enemy takes 96 net HP in that window, which at /7 is roughly 670 raw, against the
+~780 the observed cadence supplies — the slack being `trunc` losses, and the
+numbers are self-consistent.
+
+So the surviving candidate is narrow: the shot INTERVAL or the shot COUNT per
+cycle differs slightly from native at this power level. Check the `interval` field
+of the relevant ply00bs level record against the observed 5-frame cycle, and the
+number of simultaneous contacts (2×d24 + 1×d15) against that level's record count.
+Both are data-side and readable without a native trace; neither has been checked.
 
 Concrete first checks, in order: whether BOTH ReimuB option orbs' needles register
 on that enemy (option shots are `orb=1`/`orb=2`, d7-d12, hitbox 12x40 at speed 22 —
