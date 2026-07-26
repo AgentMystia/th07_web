@@ -3028,8 +3028,14 @@ export class StageScene implements GameHost {
       }
       // Th07.exe FUN_0043a290: both fired and collided slots keep integrating
       // velocity (× the global rate) every frame; the per-shot ANM VM ticks
-      // alongside and the bullet dies when its script removes itself (impact
-      // scripts end in remove(); flight scripts end in static and never do).
+      // alongside and the bullet dies when its script ENDS (FUN_0044aa20
+      // returns nonzero → +0x34a = 0). A script ends by op1 remove OR by
+      // running out — op2 static / the 0xffff sentinel. ReimuB's impact
+      // scripts 98-101 and MarisaA's 97-104 end static (alpha already faded
+      // to 0), NOT remove; treating only remove() as death left those spent
+      // impacts squatting the 96-slot pool for hundreds of frames
+      // (th7_udFi03 Hard: 12-33 spent slots, spawns dropped, kills late).
+      // Flight scripts end static at t=10000/20000 — unreachable on screen.
       // FUN_0043a290 @ all.c:27472-27475 stores each rate-scaled add back
       // into the slot's float32 position fields. Per-tick f32 rounding is
       // observable at long-window id5 collision boundaries (Stages 2/3).
@@ -3043,7 +3049,7 @@ export class StageScene implements GameHost {
         b.fadePending = false;
       }
       b.runner.update(rate);
-      if (b.runner.removed) {
+      if (b.runner.removed || b.runner.stopped) {
         b.dead = true;
       } else if (b.shotType !== 4 && b.shotType !== 5) {
         // Player::UpdateShots (0x0043d2f0) culls with the shot VM's LIVE
