@@ -75,9 +75,73 @@ like an item bug and was not one.
 The five non-fixture replays are third-party recordings kept as local
 evidence in the git-ignored `replay/` directory. Never commit them.
 
-**Wine + winedbg CAN be made to work in this container — recipe below.** This
-was the blocker across several sessions; it is no longer one. Established
-2026-07-26 on Ubuntu noble:
+**Wine works in this container and the game runs, renders and takes input. The
+native trace is nevertheless blocked — on the BINARY, not the tooling.** Read the
+"wrong build" subsection before spending any time here; everything else in this
+section is a solved, reusable recipe.
+
+### The blocker: `reference/Th07.exe` is v1.00, the replays are v1.00b
+
+Every one of the six replays — the five local-evidence files AND the committed
+fixture `tests/replays/th7_udFe25.rpy` — records the recording executable's
+fingerprint in its decompressed image:
+
+| field | offset in image | value in all six replays |
+|---|---|---|
+| build tag (ASCII, 5 chars + NUL) | `+0xE0` | `"0100b"` |
+| exe size | `+0xD8` | `650752` |
+| exe checksum | `+0xDC` | `0xAEC5445C` |
+
+The binary extracted from the download this session self-identifies as **v1.00**,
+not v1.00b:
+
+- build tag at `.rdata` VMA `0x48D230` is `"0100_"` (raw `30 31 30 30 5f 00`)
+- the only window/title version string in the whole file is `… ver 1.00` (no `b`)
+- file size 607744, `SizeOfCode` 530432 — neither is the recorded 650752
+- sha256 `1251458d0564c565610b28bc94a434f5d4e8aee5d0882fa278b19277c7ac4cf7`
+
+`FUN_004402d0` (the replay loader) ends with two gates past the checksum:
+`if (image[0x95] != 0) reject;` then `FUN_00437ab4(this=0x56b930, image+0xE0,
+image[0xD8], image[0xDC])`, nonzero = reject. Our files pass magic (`T7RP`),
+the version word (`0x1100` at `+0x4`), the additive checksum
+(`0x3F000318 + Σ bytes[0x0D,EOF)` == `u32 @+0x08`, verified byte-exact in Python)
+and `image[0x95] == 0` — and then die on the build-fingerprint gate. The gate is
+live, not compiled out: reading the running process shows `[0x56bbfc]`
+(`this+0x2CC`) `= 36445856`, and `FUN_00437ab4` returns 0 (accept) only when that
+field is zero.
+
+Symptom to recognise: the Replay screen comes up with its title and the
+`No. Name Date Player Rank` header and **zero rows**. That is not a rendering
+problem and not a path problem. `FUN_00452660` builds the list by loading each
+candidate and keeping only those `FUN_004402d0` accepts (`[ebp-0x18]` is the kept
+count); a rejected file contributes no row at all. The
+`No.%.2d -------- --/--  -------          0` placeholder belongs to the OTHER
+branch of the shared row widget (`[ebx+8] == 0xe`), so its absence is expected
+here and is not evidence about your file.
+
+**What is needed: a Th07.exe of exactly 650752 bytes whose build tag is `"0100b"`.**
+That is a precise acquisition target — check size first, it is a one-command
+screen.
+
+**Do not patch the gate out.** A v1.00 trace would measure a build that is neither
+the one that produced the replays nor the one the port targets, so every number it
+yields would be unattributable — strictly worse than no trace. (The layout is
+close: `FUN_0043a820`, `FUN_0043a290`, `FUN_0044aa20`, `FUN_004402d0`,
+`FUN_0043e890`, `FUN_0043eb00` are all exact `push ebp; mov ebp,esp` prologues in
+this v1.00 binary, so decompile addresses cited across this repo do resolve here
+and static reads against it stay usable. "Close" is not "identical", and only
+static work gets that latitude.)
+
+Worth holding as a live hypothesis for the residual drift: if the reference
+decompile is v1.00 while every replay was recorded on v1.00b, then anything ZUN
+changed between the two builds presents exactly as the observed signature —
+thousands of frame-exact events, then a lone shifted event that no constant or
+arithmetic audit explains. It cannot be the whole story (Lunatic 6/6, Extra,
+Easy st1-3 and Normal st1 are exact, which a materially different engine would not
+allow), but it is unfalsifiable from v1.00 alone and it is where a v1.00b binary
+would pay off twice.
+
+### Environment recipe (all of this is verified working, 2026-07-26, Ubuntu noble)
 
 ```sh
 # 7z, to unpack a game archive (pip is blocked by the tooling classifier; apt is not)
@@ -92,54 +156,77 @@ apt-get install -y --no-install-recommends wine32:i386
 # disappears. The loader you want afterwards is /usr/lib/wine/wine.
 /usr/lib/wine/wine --version          # -> wine-9.0
 
-export WINEPREFIX=/tmp/wine-th07 WINEDEBUG=-all
-xvfb-run -a /usr/lib/wine/wine wineboot -i
-cd <dir with Th07.exe + Th07.dat>
-xvfb-run -a -s "-screen 0 800x600x24" /usr/lib/wine/wine Th07.exe   # runs
-xvfb-run -a /usr/lib/wine/wine winedbg --gdb Th07.exe               # PRE traces
+# THE ONE THAT COSTS A SESSION IF MISSED: the game is 32-bit, so wined3d needs the
+# i386 GL stack. The amd64 packages do NOT satisfy it, and Xvfb alone has no GL.
+apt-get install -y libgl1-mesa-dri libglx-mesa0            # + llvmpipe for Xvfb
+apt-get install -y libgl1:i386 libglx-mesa0:i386 libgl1-mesa-dri:i386
+apt-get install -y xdotool x11-apps x11-utils              # keys, xwd, xprop
+
+Xvfb :99 -screen 0 640x480x24 &                            # 640x480 = PCB's mode
+export DISPLAY=:99 WINEPREFIX=/tmp/wine-th07 WINEDEBUG=-all
+/usr/lib/wine/wine wineboot -i
+cd <dir with Th07.exe + Th07.dat> && /usr/lib/wine/wine Th07.exe &
 ```
 
-Also install `xdotool` (`apt-get install -y --no-install-recommends xdotool`) for
-the menu key injection the procedure needs; the AGENTS.md warning about not
-improvising the menu schedule still applies.
+Without the i386 GL packages `Direct3DCreate8` returns NULL, the game puts up a
+Shift-JIS message box titled `log` (`Direct3D オブジェクトは何故か作成出来なかった`)
+and sits at **0.0% CPU forever**. Zero accumulated CPU time on the Th07.exe task is
+the fastest way to tell "never started" from "running but not responding to keys" —
+check it before anything else. With GL present the title screen runs at a steady
+60.00 fps under llvmpipe.
 
-Verified: the game runs 90 s under Xvfb without crashing or erroring,
-`winedbg --gdb` is present, and with the game up on a dedicated Xvfb display
-`xdotool search --name .` finds its windows and delivers keys without killing it.
-What is NOT yet done is the menu schedule itself — driving title -> Replay -> file
--> stage -> mode and confirming the reached stage before trusting a trace.
+### Reading native state: use `/proc/<pid>/mem`, not winedbg
 
-Two things learned while proving this out, both of which will otherwise cost an
-hour:
+Wine maps the PE at its preferred base, so the Linux process image is the Windows
+address space: `pread(/proc/<pid>/mem, 4, 0x400000)` returns `MZ`. A ~30-line
+Python `os.pread` helper reads any global instantly, needs no debugger, no attach,
+and does not slow the game down — strictly better than the winedbg route this
+document previously recommended, which only ever managed the same reads more
+slowly. Snapshotting `0x492000..0x700000` (2.5 MB, the whole data region) takes
+well under a second, which makes classic value-scanning practical: snapshot,
+inject input, snapshot, and intersect on the expected values to locate an unknown
+variable.
 
-- `winedbg` attaches to a live process and enumerates it — `printf 'info proc\nquit\n'
-  | /usr/lib/wine/wine winedbg` lists every Windows pid, which is how you get the
-  handle to read `0x62583c` (stage), `0x4afe28` (frame), `0x495e00/04` (RNG) without
-  launching under the debugger and slowing the game to a crawl.
-- **Native memory reads are verified working end to end.** With the game alive on
-  its own Xvfb display: get the wpid from `info proc`, then
-  `printf "attach 0x<pid>\nprint *(int*)0x62583c\ndetach\nquit\n" |
-  /usr/lib/wine/wine winedbg` prints the stage variable. Confirmed 2026-07-26 —
-  attached to wpid 0x20 and read stage `0` (still in the menu). This is the whole
-  mechanism the PRE trace needs; what is unfinished is only the key schedule that
-  walks Replay -> file -> stage -> mode, and stage != 0 is the check that it worked.
-  Two details that cost attempts here: winedbg appends `print` output to its
-  `Wine-dbg>` prompt, so do NOT anchor a grep to line start (pipe through
-  `tr '>' '\n'`); and reading 0x495e00 before a run has started gives 0, so use
-  stage (0x62583c) as the "am I in gameplay yet" probe, not the seed.
-  Measured state as of this session: `Down Down Down z` then `z z z` from the title
-  leaves stage at 0 — the schedule is NOT yet right. Iterate it against the stage
-  read (cheap: one launch, one attach) before spending a long trace run on it, and
-  check whether Z is even reaching the game as a confirm key under Wine.
-- **PCB only lists replays in its numbered slots**, so a third-party filename like
-  `th7_udMt01.rpy` never appears in the Replay menu. Copy it to a slot name
-  (`replay/th7_01.rpy`) BEFORE launching, or the list is empty and injected keys
-  walk past it into Quit — which is exactly what killed the first attempt here (the
-  game process was gone by the time winedbg attached).
+Find the pid by **`comm`**, never by cmdline: `[ -f /proc/$p/comm ] &&
+[ "$(cat /proc/$p/comm)" = Th07.exe ]`. A cmdline match self-matches the helper
+shell whose command line contains the string — `pkill -f Th07.exe` kills your own
+tool call (observed: exit 144 mid-script).
 
-With that caveat, the PRE-trace procedure further down this document is executable
-here rather than deferred, which is what the remaining cells need — see the
-upstream-drift family, whose members are provably NOT closable from event streams.
+`0x62583c` is NOT confirmed to be the stage variable. It read `4` while the game
+was demonstrably still on the title screen and did not track the menu cursor; the
+earlier identification in this document was never validated against a running
+game. Re-derive it by value-scan before relying on it.
+
+### Driving the menus
+
+- **No window manager runs, so X focus is `PointerRoot`** (`xdotool getwindowfocus`
+  errors with `BadWindow` on `0x1`). Move the pointer over the game window and set
+  focus explicitly: `xdotool mousemove 320 240; xdotool windowfocus $(xdotool search
+  --name 'Perfect Cherry Blossom' | head -1)`.
+- **`xdotool key` does not work — the press must be HELD.** `xdotool key` presses and
+  releases in ~12 ms, which falls entirely between two 60 fps DirectInput polls, so
+  the game never sees it. This looks exactly like "keys are not reaching the app"
+  and sent the previous attempt down a blind alley. Use:
+  `xdotool keydown Down; sleep 0.10; xdotool keyup Down; sleep 0.18`.
+- **Locked menu entries are SKIPPED by the cursor.** With no `score.dat`, Extra Start
+  and Practice Start are dimmed and stepped over, so **Replay is 2 Downs from Start,
+  not 3**. Verify visually rather than counting — see below.
+- Screenshots: `xwd -root -silent > s.xwd`, then convert with a ~30-line pure-Python
+  xwd→PNG writer (big-endian header, `ZPixmap`, pixel data at
+  `header_size + ncolors*12`, BGRX rows of `bytes_per_line`). No ImageMagick, ffmpeg
+  or PIL is installed and none is needed. Reading the cropped menu region is by far
+  the cheapest way to confirm cursor position.
+- The Replay list is built from BOTH the numbered slots `./replay/th7_01.rpy` …
+  `th7_15.rpy` (loop 1) and a `FindFirstFile` glob of `th7_ud????.rpy` (loop 2), so
+  third-party filenames like `th7_udMt01.rpy` DO get enumerated. The earlier claim in
+  this document that PCB "only lists replays in its numbered slots", and the
+  workaround of copying to `replay/th7_01.rpy`, were both wrong — harmless, but do
+  not repeat them.
+
+Once a v1.00b binary exists, the PRE-trace procedure further down this document is
+executable here rather than deferred, which is what the remaining cells need — see
+the upstream-drift family, whose members are provably NOT closable from event
+streams.
 
 Until a trace is actually acquired, the replay's own AUX event streams remain the
 working oracle: dense, frame-exact, and free. Their limit is coverage, not

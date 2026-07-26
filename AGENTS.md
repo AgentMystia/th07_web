@@ -27,7 +27,15 @@ When sources conflict, higher wins:
 2. Approved modernizations (§3).
 3. Original data and executable in `reference/`: readable disassemblies in
    `reference/ECL7|DSTD7|MSG7|ANM7`, raw unpacked files in
-   `reference/th07-original/`, `reference/Th07.exe` (v1.00b) for Ghidra.
+   `reference/th07-original/`, `reference/Th07.exe` for Ghidra. **The binary
+   present is v1.00, not v1.00b** — build tag `"0100_"` at `.rdata` `0x48D230`,
+   title string `ver 1.00`, 607744 bytes, sha256 `1251458d…`. Every replay in
+   this tree was recorded on **v1.00b** (tag `"0100b"`, exe size 650752,
+   checksum `0xAEC5445C`, stored at image `+0xE0/+0xD8/+0xDC`). Cited decompile
+   addresses do resolve against the v1.00 binary, so static reads stay usable —
+   but it cannot play the replays (see docs/REPLAY_ALIGNMENT_HANDOFF.md) and a
+   build difference is an open, unfalsifiable-from-v1.00 hypothesis for residual
+   drift. Label new findings with the build actually inspected.
 4. Existing project implementation.
 5. External docs (thtk source, PyTouhou, priw8's sht-webedit docs, wikis) —
    cross-validation only, never sole authority. TH06 semantics are NOT
@@ -91,7 +99,8 @@ Every commit must satisfy ALL of:
    a build breaker.
 6. Nothing from `reference/` committed — no bytes, no long decompiled
    listings. Recovered *constants* with a provenance comment
-   (`// Th07.exe (v1.00b) @ 0x43cb30`) are fine and encouraged.
+   (`// Th07.exe (v1.00) @ 0x43cb30` — name the build you actually read; the
+   binary in `reference/` is v1.00, see §2) are fine and encouraged.
 7. `index.html` keeps working as a static page (esbuild IIFE bundle, no
    ESM imports at runtime, no dev-server-only paths).
 
@@ -477,12 +486,18 @@ dies two frames early, i.e. we are ~2 HP ahead over a long spellcard.
 
 Three structural facts to carry into any continuation:
 
-- **Wine + winedbg are obtainable here — the native PRE-trace procedure is no
-  longer blocked.** Verified 2026-07-26: Wine 9.0 with 32-bit support runs
-  `Th07.exe` under Xvfb and `winedbg --gdb` is available. The install order is
-  fiddly (and installing `wine32:i386` removes the amd64 `wine` binary, leaving
-  the loader at `/usr/lib/wine/wine`) — the exact recipe is at the top of
-  docs/REPLAY_ALIGNMENT_HANDOFF.md. Until a trace is acquired the AUX streams
+- **Wine runs the game here; the native PRE trace is blocked on the BINARY, not
+  the tooling.** Verified 2026-07-26: Wine 9.0 + i386 Mesa GL runs `Th07.exe`
+  under Xvfb at a steady 60 fps, `xdotool` drives the menus, and native globals
+  read straight out of `/proc/<pid>/mem` (the PE maps at 0x400000 — no debugger
+  needed, and this supersedes the old winedbg recipe). What blocks the trace is
+  that `reference/Th07.exe` is **v1.00** while every replay records **v1.00b**;
+  the loader's build-fingerprint gate rejects all six, so the Replay list comes
+  up empty. Needed: a Th07.exe of exactly **650752 bytes**, tag `"0100b"`. Do
+  not patch the gate out — a v1.00 trace measures neither the build that
+  recorded the replays nor the build the port targets. Full recipe, gotchas
+  (held keypresses, PointerRoot focus, locked-entry skipping) and the failure
+  signatures are in docs/REPLAY_ALIGNMENT_HANDOFF.md. Until a trace is acquired the AUX streams
   remain the working oracle; they are dense and frame-exact but NOT complete, so
   an RNG or position divergence producing no AUX event stays invisible until it
   changes one. Do not read "exact through frame N" as "identical through
@@ -755,13 +770,21 @@ comparisons against real play).
   baseline section), so it stays as-is rather than being "cleaned up" blind: the
   fix is a fixed-slot scan, and it needs a converging witness before landing.
 
-### Exe-verified damage/death constants (2026-07-26, Th07.exe v1.00b)
+### Exe-verified damage/death constants (2026-07-26, Th07.exe **v1.00**)
 
 Verified directly with `objdump -d -M intel -b pei-i386 reference/Th07.exe` after
-the original was made available locally. The binary is confirmed to be the one
-every citation in this tree refers to: `cmp DWORD PTR [ebp-0x14],0x1e` sits
-exactly at **0x43a8d5**, the shot-cycle constant §6 cites. `.text` is
-0x401000..0x482638, so cited addresses map directly.
+the original was made available locally. Cited addresses map directly: `.text` is
+0x401000..0x482638, `cmp DWORD PTR [ebp-0x14],0x1e` sits exactly at **0x43a8d5**
+(the shot-cycle constant §6 cites), and `FUN_0043a820 / 0043a290 / 0044aa20 /
+004402d0 / 0043e890 / 0043eb00` are all exact prologues — so the layout agrees
+with the decompile this tree was built from.
+
+Provenance correction: this binary is **v1.00** (tag `"0100_"`), not the v1.00b
+originally recorded here, while all six replays were recorded on v1.00b. The
+table below is therefore v1.00-verified with a v1.00b recheck pending. The
+findings it drove were independently corroborated by the replay matrix (6 cells
+improved, zero regressions, full suite green), so they stand on two legs, not
+one — but do not re-cite them as v1.00b.
 
 | fact | site | verdict |
 |---|---|---|
@@ -908,7 +931,7 @@ acceptance criteria, or when two of them share a file.
 
 ### Ghidra RE workflow (repeatable)
 
-1. `reference/Th07.exe` (PE32, v1.00b). Install headless Ghidra (JDK 17+,
+1. `reference/Th07.exe` (PE32; the copy present is v1.00 — see §2). Install headless Ghidra (JDK 17+,
    `analyzeHeadless <proj> th07 -import Th07.exe`), or radare2 as
    fallback.
 2. Anchor by immediates (e.g. 0xC350=50000, 0x21C=540) or IEEE-754 float
