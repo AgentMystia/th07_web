@@ -107,8 +107,10 @@ Verified: the game runs 90 s under Xvfb without crashing or erroring,
 `winedbg --gdb` is present, and with the game up on a dedicated Xvfb display
 `xdotool search --name .` finds its windows and delivers keys without killing it.
 What is NOT yet done is the menu schedule itself — driving title -> Replay -> file
--> stage -> mode and confirming the reached stage before trusting a trace. That makes the PRE-trace procedure further down this
-document executable here, which is what the remaining cells need — see the
+-> stage -> mode and confirming the reached stage before trusting a trace.
+
+With that caveat, the PRE-trace procedure further down this document is executable
+here rather than deferred, which is what the remaining cells need — see the
 upstream-drift family, whose members are provably NOT closable from event streams.
 
 Until a trace is actually acquired, the replay's own AUX event streams remain the
