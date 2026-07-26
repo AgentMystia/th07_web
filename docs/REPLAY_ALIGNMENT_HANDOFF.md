@@ -112,22 +112,30 @@ prefix as "no observed event differs", not as "state is identical".
   player track reproduced all three oracle collects AND the three non-events
   immediately before them). Sort each remaining cell by the miss table above
   before assuming anything.
-  Still open in this family: **Normal st6 @2727**, now localized to a single
-  number — the late collect is death-drop power item slot 841 (spawned at the
-  2507 miss, so `age` 221 at 2727), falling straight down at terminal vy=3 with
-  x fixed at 328.095. Y is the binding axis: at 2727 the player is at
-  (321.85, 381.00), so |Δx| = 6.25 passes but |Δy| = 27.84 exceeds the 22 box
-  half-extent (12 grab + itemRadius/2); we collect at 2730 when |Δy| falls to
-  21.95. Reproducing the oracle needs that item **5.84 px lower at 2727**, which
-  at terminal speed is almost exactly two frames of extra fall. Two candidates
-  remain, and they are indistinguishable from this cell alone: the drop begins
-  falling ~2 frames earlier than ours, or its RNG-derived tween TARGET y sits
-  5.84 px lower (the target comes from `rng.f()*192-64`, a 192 px range, so this
-  is a 3% shift — check the per-item draw order in `spawnDeathDrop` against the
-  native one). Measured and refuted here: completing the lerp at elapsed 60 so
-  the item lands on its exact target (instead of stopping at t=59/60) does not
-  move the cell. Note tween items are ONLY death drops, so anything changed in
-  that branch is unreachable for every currently-passing replay.
+  Still open in this family: **Normal st6 @2727 — read the stream by INDEX, not
+  by frame.** Index-aligned, the oracle runs `… 2727, 2730, 2765 …` and we run
+  `… 2730, 2765, 3140 …`, so our 2730 and 2765 land on the oracle's own frame
+  values and what we actually lack is one collect EVENT at 2727. This is not
+  "our collects are three frames late" — that reading is wrong and was corrected
+  after measuring the index alignment.
+  The window belongs to the six death drops from the 2507 miss (bigPower + 5×
+  power, slots 839-844, all past their 60-frame tween and falling at terminal
+  vy=3). The oracle collects two of them across 2727-2730; we collect exactly one
+  (slot 841 at 2730, x 328.095, when |Δy| finally reaches 21.95 against the 22 px
+  half-extent). Our other five never come close — at 2727 the player is at
+  (321.85, 381.00) while slot 840 sits at x 285.78 (|Δx| 36) and slots 839/842/843
+  are 200-250 px away — and they fall off the bottom uncollected past y≥464.
+  So one drop's TWEEN TARGET differs enough that the original collected it and we
+  never do. Targets come from consecutive `rng.f()` pairs in `spawnDeathDrop`
+  (`x = rand*288+48`, `y = rand*192-64`), so the root is most likely the draw
+  count or order on the death frame — the hit frame already spends 16 raw draws
+  on RerollRng plus 4 on RegenerateGameIntegrityCsum plus two effect bursts, and
+  every one of those is upstream of the six target pairs. Nothing in that chain is
+  exercised by a passing replay.
+  Measured and refuted here: completing the lerp at elapsed 60 so an item lands
+  on its exact target (instead of stopping at t=59/60) does not move the cell.
+  Note tween items are ONLY death drops, so anything changed in that branch is
+  unreachable for every currently-passing replay.
   Also still open: **Easy st5 @7290** (measured insensitive to the lock length — its
   first collect mismatch stays at index 191 and ~38 frames late for locks of 60,
   57 and 36, so it is an independent defect and not respawn timing at all), and
