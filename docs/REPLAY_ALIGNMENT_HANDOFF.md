@@ -256,12 +256,22 @@ constant-verification questions.
 - **Phantasm (st7 @ 51989).** Exact for 51989 of 57876 frames — 565 kills,
   2739 collects, 23 contacts, 7 bombs and every border event. Boss sub 127's
   HP reaches 0 two frames early, i.e. ~2 HP of accumulated excess over a long
-  spellcard, not a rate error. Use `--trace-damage` across the spell and look
-  at ReimuA's homing target cache first. The RNG-residue oracle does not
-  exist for single-stage replays (it needs a following stage's seed), so the
-  damage trace is the only quantitative handle. The two extra player contacts
-  (56038, 56993) and the death at 57037 are downstream of this; re-measure
-  rather than treating them as separate defects.
+  spellcard, not a rate error. Restate it in raw terms per the divisor entry
+  above: 2 HP through `/7` is about **14 raw damage — roughly one extra shot
+  landing** somewhere across the spell. That is the target to hunt.
+  **`steerHomingBullet`'s float64 residues are REFUTED as the cause** (measured
+  2026-07-26) — they were the standing prime suspect and they are not it. All
+  three stagings leave the divergence at *exactly* 51989: `fround`ing the
+  unrounded `dist`, comparing `>= maxSpeed` against the f32 `mag` instead of the
+  float64 `magExact`, and both together. Note such experiments are risk-free for
+  the converged rows, since shotTypes 1/2 are ReimuA-only — the fixture is sakuyaA
+  and Extra is marisaB, so neither can be moved by editing that function.
+  With the steering exonerated, the extra shot has to come from spawn cadence, pool
+  occupancy or the collision AABB instead. The RNG-residue oracle does not exist
+  for single-stage replays (it needs a following stage's seed), so the damage trace
+  is the only quantitative handle. The two extra player contacts (56038, 56993) and
+  the death at 57037 are downstream of this; re-measure rather than treating them
+  as separate defects.
 - **Non-Lunatic ECL branches — mostly RESOLVED, and the method matters.**
   The old claim that these had "only ever executed under Lunatic" was wrong: a
   converged *stage* validates a branch just as well as a converged replay, and
