@@ -127,11 +127,24 @@ prefix as "no observed event differs", not as "state is identical".
   are 200-250 px away — and they fall off the bottom uncollected past y≥464.
   So one drop's TWEEN TARGET differs enough that the original collected it and we
   never do. Targets come from consecutive `rng.f()` pairs in `spawnDeathDrop`
-  (`x = rand*288+48`, `y = rand*192-64`), so the root is most likely the draw
-  count or order on the death frame — the hit frame already spends 16 raw draws
-  on RerollRng plus 4 on RegenerateGameIntegrityCsum plus two effect bursts, and
-  every one of those is upstream of the six target pairs. Nothing in that chain is
-  exercised by a passing replay.
+  (`x = rand*288+48`, `y = rand*192-64`), so the targets are a pure function of
+  the RNG position when the drops spawn.
+  **A draw-accounting error at the death frame was tested and is NOT supported.**
+  Adding k raw draws per drop (k = 0..10, i.e. per-drop stride 4..14 raw, probing
+  the idea that the exe spends draws per drop that we do not) produced a collect
+  at 2727 only at k=3 and k=10 — and both immediately broke at 2730 instead —
+  while k=9 broke *earlier*, at 2703. Two isolated hits scattered across eleven
+  values, neither carrying further, is what re-rolling twelve random targets looks
+  like by chance, not a real offset. Do not read either k as a lead.
+  What that leaves is the harder possibility: the RNG position at the drops is
+  wrong because of drift accumulated somewhere upstream in the preceding ~2500
+  frames, which stayed invisible precisely because it produced no AUX event until
+  it moved an item target. That is the same shape as Easy st4, and like Easy st4 it
+  needs a position/RNG-level native trace rather than more event-stream bisection.
+  (Worth ruling out cheaply first, though: whether the exe spawns anything else at
+  the miss commit that we omit, since the hit frame already spends 16 raw draws on
+  RerollRng plus 4 on RegenerateGameIntegrityCsum plus two effect bursts, and all
+  of those sit upstream of the six target pairs.)
   Measured and refuted here: completing the lerp at elapsed 60 so an item lands
   on its exact target (instead of stopping at t=59/60) does not move the cell.
   Note tween items are ONLY death drops, so anything changed in that branch is
