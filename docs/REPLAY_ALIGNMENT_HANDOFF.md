@@ -109,6 +109,19 @@ Verified: the game runs 90 s under Xvfb without crashing or erroring,
 What is NOT yet done is the menu schedule itself — driving title -> Replay -> file
 -> stage -> mode and confirming the reached stage before trusting a trace.
 
+Two things learned while proving this out, both of which will otherwise cost an
+hour:
+
+- `winedbg` attaches to a live process and enumerates it — `printf 'info proc\nquit\n'
+  | /usr/lib/wine/wine winedbg` lists every Windows pid, which is how you get the
+  handle to read `0x62583c` (stage), `0x4afe28` (frame), `0x495e00/04` (RNG) without
+  launching under the debugger and slowing the game to a crawl.
+- **PCB only lists replays in its numbered slots**, so a third-party filename like
+  `th7_udMt01.rpy` never appears in the Replay menu. Copy it to a slot name
+  (`replay/th7_01.rpy`) BEFORE launching, or the list is empty and injected keys
+  walk past it into Quit — which is exactly what killed the first attempt here (the
+  game process was gone by the time winedbg attached).
+
 With that caveat, the PRE-trace procedure further down this document is executable
 here rather than deferred, which is what the remaining cells need — see the
 upstream-drift family, whose members are provably NOT closable from event streams.
