@@ -234,6 +234,25 @@ constant-verification questions.
   mid-pass `this.items` splice (zero mid-pass spawns and zero double visits in
   4515-4550) and the f32 narrowing of the homing angle (dropping it leaves the
   fixture passing and this cell unchanged, so the exe-cited narrowing stays).
+- **Boss-spell kills are dominated by divisor truncation — read any spell-kill
+  divergence in RAW damage, not HP.** `settlePendingDamage` applies the spell
+  divisor once per enemy per frame as `dmg >= 8 ? trunc(dmg/7) : dmg > 0 ? 1 : 0`,
+  so the fractional part is discarded every settlement. Measured on the Hard st1
+  midboss spell (enemy slot 2, hp 203, 58 settlements over frames 5153-5460):
+  raw damage sums to **1629** while only **207** lands — 87% discarded — with
+  **zero** settlements hitting the 70 cap and a median raw of 24
+  (`trunc(24/7) = 3`, losing 0.43 per settle). We also damage on only 58 of the
+  spell's 307 frames, with six gaps longer than 4 frames and one of 118.
+  Two consequences worth carrying:
+  - A spell-kill that lands N frames late is a *small* raw-damage deficit
+    amplified by the divisor, so hunt for a missing or late-arriving shot, not for
+    a damage-formula error. Concretely, **Phantasm's "~2 HP excess" is about 14
+    raw damage — roughly ONE extra shot arriving somewhere across the spell.**
+  - Truncation makes arrival *distribution* matter, not just totals: several small
+    settlements lose far more than one large one (4 separate hits of 12 give
+    4×trunc(12/7)=4, the same four clumped into one frame give trunc(48/7)=6).
+    Any change to shot cadence or pool lifetime therefore moves spell kills much
+    more than its effect on total damage suggests.
 - **Phantasm (st7 @ 51989).** Exact for 51989 of 57876 frames — 565 kills,
   2739 collects, 23 contacts, 7 bombs and every border event. Boss sub 127's
   HP reaches 0 two frames early, i.e. ~2 HP of accumulated excess over a long
