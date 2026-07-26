@@ -593,13 +593,19 @@ all twelve forms for `+0x9f8` references:
 | **reimuB unfocused / focused** | **no reference at all** | — | n/a |
 | marisaA unf, marisaB unf/foc, sakuyaB unf/foc | no reference | — | n/a |
 
-**All four implemented thresholds are exe-correct.** Read operands with a
-realigned `objdump` window, never a `grep` of a wide dump: a first pass here
-truncated the display and reported 0x6/0x5/0x1/0x3 for what are actually
-0x64/0x50/0x1e/0x3e7, which manufactured a "sakuyaA says 80 but the exe says 3"
-discrepancy that does not exist. The `0x3e7` (999) guards on both sakuyaA forms
-are effectively unlimited and are the one part not obviously mirrored in our code —
-low priority, since 999 at d22-d24 is dozens of hits.
+**All four implemented thresholds are exe-correct, and so is the 0x3e7 pair.**
+Read operands with a realigned `objdump` window, never a `grep` of a wide dump: a
+first pass here truncated the display and reported 0x6/0x5/0x1/0x3 for what are
+actually 0x64/0x50/0x1e/0x3e7, which manufactured a "sakuyaA says 80 but the exe
+says 3" discrepancy that does not exist.
+
+`0x3e7` (999) is a SENTINEL, not a damage cap. At 0x40b9f1-0x40ba24 (sakuyaA
+unfocused; 0x40c3fd is the focused twin) the shape is: if the slot's tally is
+below 999, attach impact script `0x460` to the knife's visual, then WRITE 999
+into the tally so the branch can never run again. It is a one-shot
+"impact already played" latch. We model the same one-shot with
+`knifeFx[slotId] = null` after `setScript(96)`, so there is nothing to add —
+and nothing here is a damage threshold at all.
 
 **Neither ReimuB form touches the tally**, so Hard st2's ~18 points of excess
 damage is NOT a per-slot tally cap. That hypothesis is refuted from the binary
