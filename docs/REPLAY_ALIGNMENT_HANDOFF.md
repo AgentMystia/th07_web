@@ -583,16 +583,23 @@ pools, and it decodes cleanly:
 The cap, where it exists at all, is checked by the individual bomb form. Scanning
 all twelve forms for `+0x9f8` references:
 
-| form | tally refs | thresholds seen |
-|---|---:|---|
-| reimuA unfocused | 1 | zeroes only |
-| reimuA focused | 2 | `cmp … 0x6` |
-| marisaA focused | 2 | `cmp … 0x5` |
-| sakuyaA unfocused | 4 | `cmp … 0x1`, `cmp … 0x3` |
-| sakuyaA focused | 4 | `cmp … 0x0`, `cmp … 0x3` |
-| **reimuB unfocused** | **0** | — |
-| **reimuB focused** | **0** | — |
-| marisaA unf, marisaB unf/foc, sakuyaB unf/foc | 0 | — |
+| form | exe threshold | our code | verdict |
+|---|---|---|---|
+| reimuA focused | `cmp … 0x64` (100) | `hitTally > 99` (:341) | ✅ match |
+| marisaA focused | `cmp … 0x50` (80) | `hitTally < 80` (:458) | ✅ match |
+| sakuyaA unfocused | `cmp … 0x1e` (30), `0x3e7` (999) | `hitTally < 30` (:577) | ✅ match |
+| sakuyaA focused | `cmp … 0x0`, `0x3e7` (999) | `hitTally === 0` (:688) | ✅ match |
+| reimuA unfocused | zeroes only | — | n/a |
+| **reimuB unfocused / focused** | **no reference at all** | — | n/a |
+| marisaA unf, marisaB unf/foc, sakuyaB unf/foc | no reference | — | n/a |
+
+**All four implemented thresholds are exe-correct.** Read operands with a
+realigned `objdump` window, never a `grep` of a wide dump: a first pass here
+truncated the display and reported 0x6/0x5/0x1/0x3 for what are actually
+0x64/0x50/0x1e/0x3e7, which manufactured a "sakuyaA says 80 but the exe says 3"
+discrepancy that does not exist. The `0x3e7` (999) guards on both sakuyaA forms
+are effectively unlimited and are the one part not obviously mirrored in our code —
+low priority, since 999 at d22-d24 is dozens of hits.
 
 **Neither ReimuB form touches the tally**, so Hard st2's ~18 points of excess
 damage is NOT a per-slot tally cap. That hypothesis is refuted from the binary
@@ -601,12 +608,12 @@ isn't one.
 
 Two follow-ups this opens, both readable without v1.00b:
 
-1. `sakuyaAFocused`'s comment in player-bombs.ts says its slot runs "d12 until its
-   own tally reaches 80". The exe compares that form's tally against 0x0 and 0x3,
-   not 80. Either the 80 refers to a different field or the comment is wrong —
-   worth resolving, and sakuyaA is the character behind Normal st2-6.
-2. The four capped forms' thresholds above are concrete constants to check our
-   implementations against.
+1. RESOLVED, no bug: the "d12 until its own tally reaches 80" note belongs to
+   marisaAFocused (FUN_0040a050), not sakuyaA, and 80 is exactly right —
+   `cmp …,0x50` with `jge` skipping the write, plus dims 0x43000000 = 128.0f for
+   both axes, matching our `engine.set(i, x, y, 128, 128, 12)` under
+   `hitTally < 80`.
+2. Still open: the `0x3e7` (999) guards on both sakuyaA forms.
 
 ### The upstream-drift family (three cells, and why events cannot close them)
 
