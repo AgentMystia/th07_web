@@ -266,8 +266,24 @@ constant-verification questions.
   float64 `magExact`, and both together. Note such experiments are risk-free for
   the converged rows, since shotTypes 1/2 are ReimuA-only — the fixture is sakuyaA
   and Extra is marisaB, so neither can be moved by editing that function.
-  With the steering exonerated, the extra shot has to come from spawn cadence, pool
-  occupancy or the collision AABB instead. The RNG-residue oracle does not exist
+  The kill mechanics are now fully measured, and they rule the AABB out too. Boss
+  is enemy slot 1, sub 69 running spell sub 127; its hp falls
+  36→26→25→17→13→12→11→10 and then to 0 at f51989. That final settlement is three
+  shots — 30 + 30 + 28 = **88 raw**, which the 70 cap turns into exactly
+  `trunc(70/7) = 10`, precisely killing a 10-hp boss. With one fewer shot (60 raw
+  → 8 settled) it survives at 2 hp and dies later, which is the whole divergence.
+  But **none of the three is marginal**: measured one frame earlier they are all
+  ~0.7-2.4 px outside on Y while travelling at vy ≈ −12, so on the hit frame they
+  are ~10 px inside the box. No rounding at the collision edge can remove one.
+  Therefore the 2 hp was accumulated EARLIER in the spell, and the search is for
+  two extra hp of settled damage, not for one mis-timed shot at the kill.
+  That is a weaker signal than it sounds, because of the divisor's floor: for
+  `raw < 8` the settlement is exactly 1, so **a single tiny hit is worth a whole
+  hp** regardless of its raw value (our curve has several such 1-hp steps at
+  f51981/51986/51987/51988, each from one 5-damage shot). Two extra small hits
+  anywhere across the spell are enough to explain the entire cell. That makes this
+  a member of the upstream-drift family in practice: it needs per-frame native
+  state, not another local hypothesis. The RNG-residue oracle does not exist
   for single-stage replays (it needs a following stage's seed), so the damage trace
   is the only quantitative handle. The two extra player contacts (56038, 56993) and
   the death at 57037 are downstream of this; re-measure rather than treating them
