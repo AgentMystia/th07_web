@@ -432,18 +432,53 @@ Established facts:
 - All 140 kills preceding the divergence are frame-exact, so every item's spawn
   frame and spawn enemy are right.
 
-The important negative result: **the 1727/1728 collect is NOT one of the bomb's
-cancel items.** The frame-1726 dump shows 184 items alive, all still at their
-spawn (bullet) positions with `state: 1`, and the NEAREST is 95.47 px from the
-player. At `autocollectSpeed` 8 the first cancel item cannot arrive before frame
-~1738, and the farthest (466 px) not before ~1784 — which matches the shape of
-the 1728-1800 burst but not its start. So both sides' first collect here is
-something else (most plausibly an ordinary falling drop from the 1716/1717 kills
-reaching a player parked at the bottom edge), and the one-frame gap lives in that
-item, not in the cancel conversion. Identify it before theorising: the `itemDump`
-in `--dump-frame` is capped at 12 of 184 entries, so this needs a scratch driver
-on the harness `onScene` hook logging every item's position and every
-`collectItem` call across 1720-1735.
+**CAUSE IDENTIFIED — it is the bomb's bullet-clear firing on the trigger frame.**
+
+(An earlier revision of this section claimed the 1727 collect was NOT a cancel
+item, on the grounds that the nearest of 184 items was 95 px away. That was wrong:
+`--dump-frame`'s `itemDump` is capped at 12 of 184 entries and the sample is by
+slot, not by distance. Use a scratch driver, not the dump, for item questions.)
+
+A driver on the harness `onScene` hook wrapping `collectItem`/`spawnItem` shows
+exactly what happens:
+
+- Frame **1726**: `cancelBulletWithBombSlots` → `beginBombClearFade` →
+  `beginBulletClearFade` converts **122 bullets** to `cherry` items, then a
+  trickle over 1727-1734 (3, 5, 3, 1, 1, 1, 3, 2) as the bomb box expands.
+- Frame **1727**: three of those items are collected on their FIRST pass
+  (`age: 1`, `state: 1`) — slots 129, 193, 198.
+- Slot 198 spawned at roughly (324.0, 410) against a player at
+  (315.398, 421.482). The grab test is `|dx| <= 12 + itemRadius/2 = 22` on both
+  axes, so it was **already inside the grab box at its spawn position** — it must
+  be collected on whatever frame it is first visited, homing step or not.
+
+So the item cannot be made to collect later by changing homing; it can only
+collect later if it does not yet EXIST at 1727. Our bomb publishes its attack
+slots on the trigger frame because `prepareBombEffects()` is gated on
+`p.bombTimer > 0` *after* `tryBomb()` has set it, while the cherry drain three
+lines above deliberately uses the frame-entry snapshot
+(`bombActiveAtFrameStart`) because "a newly triggered bomb does not pay until the
+following player tick".
+
+Both deferral experiments confirm the mechanism and both are net-negative — do
+not simply re-land either:
+
+| variant | Hard st6 | side effects |
+|---|---|---|
+| gate all of `prepareBombEffects()` on `bombActiveAtFrameStart` | 1727 → **1747** | **Extra PASS → 10067**, Phantasm 51989 → 10478, Normal st4 18596 → 4620 |
+| defer only `cancelBulletWithBombSlots` on the trigger frame | 1727 → **1747** | Lunatic 6/6 and Extra hold, but Phantasm 51989 → **10406**, Easy st4 4536 → 4215, Hard st5 2090 → 2077 |
+
+The Phantasm number is the key: its first recorded bomb is at frame **10405**, and
+the deferred build diverges at **10406** — one frame later. So ReimuA's bomb DOES
+clear bullets on its trigger frame while ReimuB's (Hard st6) does not, and
+MarisaB's Extra bomb is insensitive to the bullet-clear deferral but sensitive to
+deferring the whole effects pass.
+
+**Conclusion: bomb clear timing is per-character, set by that character's bomb
+script, not by a global rule.** The fix belongs in the bomb form/choreography —
+which frame each character's bomb publishes live attack slots — and any global
+gate will trade one cell for another. This is now a narrow, well-posed question
+about six bomb scripts rather than an open-ended hunt.
 
 ### Refuted: state-1 items skipping their first homing step
 
