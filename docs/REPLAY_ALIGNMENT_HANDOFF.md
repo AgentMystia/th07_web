@@ -99,8 +99,15 @@ xvfb-run -a -s "-screen 0 800x600x24" /usr/lib/wine/wine Th07.exe   # runs
 xvfb-run -a /usr/lib/wine/wine winedbg --gdb Th07.exe               # PRE traces
 ```
 
-Verified: the game runs 90 s under Xvfb without crashing or erroring, and
-`winedbg --gdb` is present. That makes the PRE-trace procedure further down this
+Also install `xdotool` (`apt-get install -y --no-install-recommends xdotool`) for
+the menu key injection the procedure needs; the AGENTS.md warning about not
+improvising the menu schedule still applies.
+
+Verified: the game runs 90 s under Xvfb without crashing or erroring,
+`winedbg --gdb` is present, and with the game up on a dedicated Xvfb display
+`xdotool search --name .` finds its windows and delivers keys without killing it.
+What is NOT yet done is the menu schedule itself — driving title -> Replay -> file
+-> stage -> mode and confirming the reached stage before trusting a trace. That makes the PRE-trace procedure further down this
 document executable here, which is what the remaining cells need — see the
 upstream-drift family, whose members are provably NOT closable from event streams.
 
