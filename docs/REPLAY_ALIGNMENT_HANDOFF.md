@@ -621,6 +621,35 @@ Two follow-ups this opens, both readable without v1.00b:
    `hitTally < 80`.
 2. Still open: the `0x3e7` (999) guards on both sakuyaA forms.
 
+### Hard st1 @5440 — the cleanest damage signal left, and NOT a boundary case
+
+Worth promoting over the 1-frame cells for whoever continues. Hard st1 has **no
+bomb anywhere in the stage** (`bombs: oracle 0, ours 0, exact yes`) and **no oracle
+deaths**, so bomb timing and respawn timing are both excluded by construction: it
+is pure player-shot damage.
+
+- kill #152: oracle **5440**, ours **5460** — twenty frames LATE. Kills #0-#151 are
+  frame-exact.
+- collect #90 shifts identically, 5441 -> 5461, so that collect is the same kill's
+  drop riding along behind it.
+- `borderStarts`: oracle 1 at 9629, ours none — downstream of the above.
+- RNG residue diverges (Δ29100), consistent with a long shot-count difference
+  rather than a single mis-timed event.
+
+Twenty frames is one to two orders of magnitude above the noise floor of the
+1-frame cells (Hard st2, Easy st4/st6, Normal st6), which makes it far easier to
+attribute: it is a SUSTAINED damage deficit against ONE enemy, not a rounding or
+ordering boundary. If that enemy is the RNG-positioned midboss this stage is known
+for, twenty frames on a long HP pool is roughly a 10% DPS shortfall — the kind of
+gap a whole missing damage source produces, not a float epsilon.
+
+Concrete first checks, in order: whether BOTH ReimuB option orbs' needles register
+on that enemy (option shots are `orb=1`/`orb=2`, d7-d12, hitbox 12x40 at speed 22 —
+the only 40px-tall shot box in the game); whether the enemy sits where one orb's
+column misses; and whether the 96-slot player-shot pool is saturating during the
+approach (Phase A's fix addressed exactly that failure mode on other Hard stages,
+and st1 was the one Hard cell it did NOT move).
+
 ### The upstream-drift family (three cells, and why events cannot close them)
 
 Easy st4, Easy st6 and Normal st6 have all now been measured to the same
