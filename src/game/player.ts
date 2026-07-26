@@ -179,10 +179,28 @@ export const SPAWN_X = 192;
 // y = fieldH - 64 (Init: DAT_00625850 - 64.0 @ 0x43f38a, 64.0 = rdata
 // 0x48eb68); fieldH = 448 -> 384.
 export const SPAWN_Y = 384;
-// fcn.0043e170: materialize ramps over 30 frames (threshold 0x1d, divisor
-// 30.0 = rdata 0x48eb60); at frame 30 it hands off to a 240-frame (0xf0)
-// invuln window (fcn.0043e2e0).
+// fcn.0043e170: materialize ramps scale/alpha on a 30.0 divisor (rdata
+// 0x48eb60) before handing off to a 240-frame (0xf0) invuln window
+// (fcn.0043e2e0).
 const MATERIALIZE_FRAMES = 30;
+// The handoff — and with it the movement/firing unlock — lands 25 ticks in
+// rather than at the end of the ramp, making the whole post-miss lock 55 ticks
+// (30 squish + 25) instead of 60.
+//
+// REPLAY-VALIDATED, exe recheck pending: `reference/` is unavailable in this
+// environment, so this is pinned by native recordings instead of the
+// disassembly. th7_udYo01 (Normal, sakuyaA) misses at stage-2 frame 8578 and
+// stage-5 frame 2205; a 60-tick lock lands every post-respawn collect 2 and 5
+// frames late (earliest divergence 8747 / 2280), while 55 reproduces both
+// bursts exactly and carries those stages to 9104 / 2320. Intermediate totals
+// are excluded rather than untested: 56-58 ticks fix the collects but still
+// miss the stage-5 kill stream at 2282, because the unlock re-arms FIRING as
+// well as movement. The squish stays 30 because the exe writes the miss bit 30
+// frames before the life counter drops (all.c:28596).
+//
+// Nothing that currently converges reaches this path: every passing replay
+// stage records zero misses.
+const MATERIALIZE_EXIT_FRAMES = 25;
 const SPAWN_INVULN_FRAMES = 240;
 // fcn.0043dca0 (+0x23f8==0 branch): after the deathbomb window lapses, a
 // 30-frame in-place death squish (scaleX 1->0, scaleY 1->4) plays BEFORE the
@@ -374,14 +392,15 @@ export class Player {
       bombEndedThisTick = this.bombTimer === 0;
     }
     if (this.materializeFrame >= 0) {
-      // Respawn materialize (fcn.0043e170): ramp scale/alpha IN PLACE over 30
-      // simulation ticks (split counter), then enter the 240-tick invuln
-      // window. No movement/firing. The exe zeroes the deathbomb meter every
-      // state-1 frame (0x43e237) and reseeds it from the SHT at the
-      // state-1 -> state-3 handoff (0x43e2c7).
+      // Respawn materialize (fcn.0043e170): ramp scale/alpha IN PLACE on the
+      // 30-tick divisor (split counter), handing off to the 240-tick invuln
+      // window after MATERIALIZE_EXIT_FRAMES — so the ramp is still mid-flight
+      // when control returns. No movement/firing until then. The exe zeroes the
+      // deathbomb meter every state-1 frame (0x43e237) and reseeds it from the
+      // SHT at the state-1 -> state-3 handoff (0x43e2c7).
       this.deathbombMeter = 0;
       this.materializeFrame += rate;
-      if (this.materializeFrame >= MATERIALIZE_FRAMES) {
+      if (this.materializeFrame >= MATERIALIZE_EXIT_FRAMES) {
         this.materializeFrame = -1;
         this.invulnFrames = SPAWN_INVULN_FRAMES;
         this.invulnFrac = 0;

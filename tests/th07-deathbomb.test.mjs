@@ -150,20 +150,59 @@ test('meter is wall-clock under slowmo; squish and materialize ride the split co
   }
   assert.equal(respawnAt, 60, '30-tick squish takes 60 wall frames at rate 0.5');
   // Materialize: die() teleports + starts materialize; meter pinned at 0
-  // until the handoff, then reseeds to N with the 240-tick invuln.
+  // until the handoff, then reseeds to N with the 240-tick invuln. The handoff
+  // is 25 ticks in (MATERIALIZE_EXIT_FRAMES), while the scale/alpha ramp keeps
+  // its 30-tick divisor — so control returns before the ramp finishes.
   p.die();
   assert.equal(p.deathbombMeter, 0);
   const held = new Set();
   const input = { held, pressed: new Set() };
-  for (let k = 0; k < 59; k++) {
+  for (let k = 0; k < 49; k++) {
     p.update(input, 0.5);
     assert.equal(p.deathbombMeter, 0, `meter pinned during materialize (${k})`);
     assert.equal(p.tryBomb(), false, 'meter gate blocks bombing while materializing');
   }
-  p.update(input, 0.5); // 60th half-tick -> 30 ticks: handoff
-  assert.equal(p.materializeFrame, -1, 'materialize completed');
+  p.update(input, 0.5); // 50th half-tick -> 25 ticks: handoff
+  assert.equal(p.materializeFrame, -1, 'materialize handed off at 25 ticks');
   assert.equal(p.deathbombMeter, 15, 'meter reseeded at the state-1 -> state-3 handoff');
   assert.equal(p.invulnFrames, 240, '240-tick invuln window armed');
+});
+
+test('the post-miss control lock is 55 ticks: 30 squish then a 25-tick materialize', () => {
+  // What the native recordings actually pin (see MATERIALIZE_EXIT_FRAMES): from
+  // the frame the miss commits, the player regains movement AND firing 55 ticks
+  // later. th7_udYo01's stage-2 and stage-5 respawn collect bursts land 2 and 5
+  // frames late at 60, and its stage-5 kill stream still breaks at 56-58.
+  for (const { shots, n } of FAMILIES) {
+    const p = new Player(shots[0], anms);
+    p.invulnFrames = 0;
+    p.hit();
+    // Burn the deathbomb window; the miss commits on the tick the meter hits 0.
+    let commit = -1;
+    for (let k = 1; k <= n; k++) if (frame(p).death === 'effects') commit = k;
+    assert.equal(commit, n, `${shots[0]}: miss commits as the meter empties`);
+    assert.equal(p.controllable, false, 'not controllable during the squish');
+
+    // Squish: 30 ticks after the commit, die() runs (life lost, respawn armed).
+    let respawn = -1;
+    for (let k = 1; k <= 40 && respawn < 0; k++) {
+      if (p.tickDeath(1) === 'respawn') respawn = k;
+    }
+    assert.equal(respawn, 30, `${shots[0]}: 30-tick squish`);
+    p.die();
+
+    // Materialize: control returns on the 25th tick, not the 30th.
+    const input = { held: new Set(), pressed: new Set() };
+    let unlock = -1;
+    for (let k = 1; k <= 40 && unlock < 0; k++) {
+      p.update(input, 1);
+      if (p.controllable) unlock = k;
+    }
+    assert.equal(unlock, 25, `${shots[0]}: control returns 25 ticks into the materialize`);
+    assert.equal(respawn + unlock, 55, `${shots[0]}: 55-tick post-miss lock`);
+    assert.equal(p.invulnFrames, 240, 'the 240-tick invuln window arms at the handoff');
+    assert.equal(p.deathbombMeter, n, 'the meter reseeds from the SHT at the handoff');
+  }
 });
 
 test('failure path bookkeeping: life-- and bomb reset land at the respawn, drops at the commit', () => {
