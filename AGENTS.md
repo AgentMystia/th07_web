@@ -440,7 +440,7 @@ Easy/Normal/Hard convergence. Lower ranks select different ECL instructions,
 formulas, bullet counts, and pool-pressure paths. Each difficulty still needs
 its own native replay PRE trace plus full event/end-state verification.
 
-### All-difficulty baseline (2026-07-25)
+### All-difficulty baseline (2026-07-26)
 
 Five further native replays cover every remaining difficulty. They are
 third-party recordings and stay **local evidence** under the git-ignored
@@ -455,15 +455,15 @@ matrix of PASS / earliest-diverging-frame:
 | th7_udHm54 | marisaB | **Extra** | — | — | — | — | — | — | **PASS** |
 | th7_udSg10 | reimuA | Phantasm | — | — | — | — | — | — | 51989 |
 | th7_udMt01 | sakuyaB | Easy | PASS | PASS | PASS | 4536 | 7290 | 1628 |— |
-| th7_udYo01 | sakuyaA | Normal | PASS | 8747 | 11863 | 18596 | 2280 | 2727 | — |
-| th7_udFi03 | reimuB | Hard | 5440 | 2165 | 537 | 2360 | 617 | 1330 | — |
+| th7_udYo01 | sakuyaA | Normal | PASS | 9104 | 11863 | 18596 | 2320 | 2727 | — |
+| th7_udFi03 | reimuB | Hard | 5440 | 7624 | 3087 | 2360 | 2090 | 1727 | — |
 
 Extra is fully converged (467 kills, 2064 collects, 4 contacts, 2 bombs,
 20 border starts, 2 border breaks — all frame-exact — plus an exact final
 score). Phantasm is exact for 51989 of 57876 frames; its boss spell (sub 127)
 dies two frames early, i.e. we are ~2 HP ahead over a long spellcard.
 
-Two structural facts to carry into any continuation:
+Three structural facts to carry into any continuation:
 
 - **`wine`/`winedbg` is not installed in the current environment**, so the
   native PRE-trace procedure below cannot be run here. The AUX streams are
@@ -471,15 +471,38 @@ Two structural facts to carry into any continuation:
   complete: an RNG or position divergence that happens to produce no AUX
   event stays invisible until it changes one. Do not read "exact through
   frame N" as "identical through frame N".
-- **ReimuB is the only shot type with no passing stage in any replay**, and
-  it is the only one that saturates the 96-slot player-shot pool: measured
-  at Hard stage 3, the pool is full on 28 of 140 sampled frames with 12-33
-  slots held by spent (post-impact) sprites. Every ReimuB divergence
-  measured so far is a kill landing a few frames LATE, never early, i.e. we
-  deal slightly less damage. Under saturation the impact-sprite lifetime and
-  the offscreen cull directly set live-shot count and therefore DPS, so an
-  error there that is invisible for Sakuya/Marisa/ReimuA becomes a DPS error
-  for ReimuB. Investigate that before anything else on Hard.
+- **Every stage that currently PASSes records zero player misses.** Read that
+  off the `--json` report's `alignment.misses.oracle` before touching anything
+  in the death/respawn path: it means that whole path is unvalidated by the
+  converged replays, so a change there cannot regress them — and equally, that
+  it was free to be wrong for a long time. The 55-tick post-miss control lock
+  (§7) was found exactly there.
+- **Divergence families, as measured on 2026-07-26.** The cells split by
+  whether an oracle miss precedes the divergence (`auxEventFrames(stage,
+  RPY_AUX_BITS.playerMiss)` needs no simulation to check). Post-respawn cells
+  showed one shared signature — the first collect after a respawn landing LATE
+  — which the 55-tick lock resolved for Normal st2/st5 and did not for Normal
+  st6 or Easy st5 (Easy st5 is 39 frames late, far more than the lock can
+  explain, so it carries a second cause). Cells with no preceding miss
+  (Hard st1/st2, Easy st4, Normal st3/st4, Phantasm) are a separate family and
+  must not be attributed to respawn timing.
+
+Hypotheses measured and **refuted** on 2026-07-26 — do not re-derive these
+without new evidence:
+
+- *ReimuB's unfocused bomb publishing four attack slots for two unique
+  geometries doubles its damage.* Publishing one pair per frame (16 dmg/frame
+  instead of 32) left Hard st2 7624, st3 3087, st5 2090 and st6 1727 completely
+  unchanged, and the oracle's own stage-3 kill at 3086 is what 32 dmg/frame
+  reproduces (enemy hp 26 → −6). The four-slot model stands.
+- *The item collect test should use the player's precomputed (pre-move) grab
+  corners.* That broke the committed fixture at stage-1 frame 796 and moved
+  Easy st4 from 4536 to 638. The live post-move centre is correct; native's
+  corner cache must be written after its own movement integration.
+- *A mid-pass `this.items` splice is what shifts the Easy/Normal collect
+  bursts.* Instrumenting the pass over Easy st4 frames 4515-4550 found zero
+  spawns during the item pass and zero items visited twice. The hazard is real
+  in principle (see §7) but is not the cause of those divergences.
 
 ### Next-session fidelity workflow
 
@@ -537,7 +560,16 @@ comparisons against real play).
   exact VM spawns. Per-form spawn cadence/orb motion are from specs
   spec-bombs-{shared,reimu,marisa,sakuya}.md.
 - Player shots run per-shot ANM VMs (SHT `sprite` = global script id; impact
-  re-arms `sprite+0x20`; bullet dies when its script ends). MarisaB's two
+  re-arms `sprite+0x20`; bullet dies when its script ends — **both spellings of
+  "ends" count**: op1 `remove` and op2 `static`/running off the end. ReimuB's
+  orb impacts (player00 98-101) and MarisaA's missile impacts (player01 97-104)
+  close on `static` at 20-45f, exactly where their fade reaches alpha 0; honoring
+  only `remove` left those invisible slots squatting the fixed 96-slot pool, and
+  `firePlayerBullets` drops new spawns when the pool is full. Flight scripts also
+  end `static`, but at t=10000/20000 — unreachable, so a flying shot still dies
+  only by bounds. MarisaA's forms are exercised by no replay: the shape is pinned
+  data-side by tests/th07-player-shot-anm.test.mjs, not by a converged run.)
+  MarisaB's two
   persistent-laser forms (3-slot tracker, beam-history ring, helper boxes)
   and MarisaA's repeat-hit missile explosion are implemented. See
   spec-marisab-beams.md / exe-player-funcs1.md.
@@ -645,6 +677,28 @@ comparisons against real play).
 - Ghost runs remain diagnostic-only. Dialogue, death consequences and manager
   lifetime can change how long ambient generators run, so only a no-ghost
   original replay establishes acceptance. `replay:verify` enforces this.
+- Post-miss control lock: 55 ticks, as 30 squish + a materialize that hands off
+  to the invuln window after **25** ticks while its scale/alpha ramp keeps the
+  cited 30.0 divisor (so the ramp is still mid-flight when control returns).
+  REPLAY-VALIDATED, exe recheck pending — `reference/` was unavailable when it
+  was found, so it is pinned by th7_udYo01's stage-2 (miss 8578) and stage-5
+  (miss 2205) respawns rather than by the disassembly: 60 ticks lands both
+  post-respawn collect bursts late, 55 reproduces them exactly, and 56-58 fix
+  the collects but still miss the stage-5 kill stream because the unlock re-arms
+  firing as well as movement. The squish stays 30 (all.c:28596 writes the miss
+  bit 30 frames before the life counter drops). See
+  `MATERIALIZE_EXIT_FRAMES` and tests/th07-deathbomb.test.mjs.
+- `updateItems` is the last manager still walking the dense `this.items` array
+  (`for (const it of this.items)`); enemies, player shots and enemy bullets all
+  scan their fixed slot arrays the way the exe does. That difference is
+  observable in principle — `collectItem` can spawn items mid-pass (a power
+  pickup crossing 128, or `fullPower`, runs `cancelBulletsToItems`, one
+  `spawnItem` per live bullet), and `insertByPoolSlot` splices into the array the
+  `for…of` is walking, so an insert below the cursor re-visits the current entry
+  and ticks new low-slot items a native ascending scan would skip. It is NOT
+  currently known to cause any divergence (measured refuted at Easy st4, see the
+  baseline section), so it stays as-is rather than being "cleaned up" blind: the
+  fix is a fixed-slot scan, and it needs a converging witness before landing.
 
 ## 8. Pitfall catalog (check these FIRST when something looks wrong)
 

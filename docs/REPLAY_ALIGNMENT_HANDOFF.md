@@ -1,12 +1,12 @@
 # Replay alignment handoff (all difficulties)
 
-Updated: 2026-07-25. This is the restart procedure for a fresh session
+Updated: 2026-07-26. This is the restart procedure for a fresh session
 continuing original-grade replay/RNG alignment. Read `AGENTS.md` completely
 before using it. Stage 1-6 Lunatic (`tests/replays/th7_udFe25.rpy`, SakuyaA)
 and Extra (`replay/th7_udHm54.rpy`, MarisaB) are converged; the open work is
 Hard, Normal, Easy and the last 10% of Phantasm.
 
-## Where things stand (2026-07-25)
+## Where things stand (2026-07-26)
 
 `node scripts/replay-verify.mjs --all` prints this matrix. Cells are the
 earliest frame at which any of the seven AUX event streams disagrees.
@@ -17,8 +17,60 @@ earliest frame at which any of the seven AUX event streams disagrees.
 | th7_udHm54 | marisaB | Extra | — | — | — | — | — | — | PASS |
 | th7_udSg10 | reimuA | Phantasm | — | — | — | — | — | — | 51989 |
 | th7_udMt01 | sakuyaB | Easy | PASS | PASS | PASS | 4536 | 7290 | 1628 | — |
-| th7_udYo01 | sakuyaA | Normal | PASS | 8747 | 11863 | 18596 | 2280 | 2727 | — |
-| th7_udFi03 | reimuB | Hard | 5440 | 2165 | 537 | 2360 | 617 | 1330 | — |
+| th7_udYo01 | sakuyaA | Normal | PASS | 9104 | 11863 | 18596 | 2320 | 2727 | — |
+| th7_udFi03 | reimuB | Hard | 5440 | 7624 | 3087 | 2360 | 2090 | 1727 | — |
+
+Two engine fixes landed on 2026-07-26; both are original-behavior corrections,
+not golden-only adjustments, and neither moved a converged cell.
+
+1. **A player-shot slot frees when its ANM script ENDS, not only on op1
+   `remove`.** ReimuB's orb impacts (player00 98-101) and MarisaA's missile
+   impacts (player01 97-104) close on op2 `static` at 20-45f, right where their
+   fade reaches alpha 0. Honoring only `remove` left those invisible slots
+   holding the fixed 96-slot pool — measured full at 96/96 across the dry
+   windows of a scripted x=40 descent in Hard st3 — and `firePlayerBullets`
+   drops new spawns when the pool is full, so ReimuB's kills landed late.
+   Effect: Hard st2 2165→7624, st3 537→3087, st5 617→2090, st6 1330→1727.
+2. **The post-miss control lock is 55 ticks, not 60** (30 squish + a
+   materialize handing off at 25 while its ramp keeps the cited 30.0 divisor).
+   Replay-validated against th7_udYo01's two respawns; see AGENTS.md §7.
+   Effect: Normal st2 8747→9104, st5 2280→2320.
+
+Three hypotheses were measured and refuted; AGENTS.md's baseline section lists
+them with their disproving measurements (ReimuB bomb double-slot damage,
+pre-move grab corners for the item collect test, and the mid-pass `this.items`
+splice as the cause of the Easy/Normal collect bursts). Do not re-derive them
+without new evidence.
+
+## The cheapest triage available (do this first)
+
+Two facts make the remaining cells much easier to sort than the old
+frame-by-frame grind, and neither needs a simulation run:
+
+- Every stage that PASSes records **zero** oracle misses, so the whole
+  death/respawn path is unvalidated by the converged replays. Changes there
+  cannot regress them.
+- `mod.auxEventFrames(stage, mod.RPY_AUX_BITS.playerMiss, 1)` on a parsed `Rpy`
+  lists the original's death frames directly from the recording. Compare each to
+  the cell's divergence frame:
+
+| cell | divergence | oracle miss before it | family |
+|---|---:|---|---|
+| Normal st2 | 9104 | 8578 | post-respawn (partly resolved) |
+| Normal st5 | 2320 | 2205 | post-respawn (partly resolved) |
+| Normal st6 | 2727 | 2507 | post-respawn, unresolved (3f late collect) |
+| Easy st5 | 7290 | 7119 | post-respawn, unresolved (39f late — second cause) |
+| Easy st4 | 4536 | none | no-death family (1f late collect) |
+| Easy st6 | 1628 | none | no-death family (contact mismatch) |
+| Hard st1/st2 | 5440 / 7624 | none | no-death family |
+| Normal st3/st4 | 11863 / 18596 | none | no-death family |
+| Hard st3/st4/st5/st6 | 3087 / 2360 / 2090 / 1727 | none before the frame | no-death family |
+| Phantasm st7 | 51989 | none | boss-spell damage excess |
+
+Do not attribute a no-death cell to respawn timing, and do not attribute a
+post-respawn cell to the item pipeline before checking the player's position
+track against the recorded input words — the Normal st5 case looked exactly
+like an item bug and was not one.
 
 The five non-fixture replays are third-party recordings kept as local
 evidence in the git-ignored `replay/` directory. Never commit them.
@@ -32,35 +84,46 @@ prefix as "no observed event differs", not as "state is identical".
 
 ## Open leads
 
-- **Hard / ReimuB (earliest divergence in the whole matrix, st3 @ 537).**
-  ReimuB is the only shot type with no passing stage in any replay, and the
-  only one that saturates the 96-slot player-shot pool: at Hard stage 3 the
-  pool is full on 28 of 140 sampled frames, with 12-33 slots held by spent
-  post-impact sprites. Every measured ReimuB divergence is a kill landing a
-  few frames LATE — we deal slightly less damage, never more. Under
-  saturation the impact-sprite lifetime (`b.runner.removed` on the
-  `sprite+0x20` script) and the live-sprite offscreen cull
-  (`stage-scene.ts` `updatePlayerBullets`) directly set the live-shot count
-  and therefore DPS; an error there is invisible for Sakuya/Marisa/ReimuA and
-  fatal for ReimuB. Verify both against FUN_0043a290 / FUN_0043d2f0 before
-  looking anywhere else.
-  Worked example (st3): enemy pool slot 1 is a scripted straight descent at
-  x=40.0 exactly, so its position cannot be RNG-drift. We take it to 3 HP by
-  frame 537 and kill it at 546; the recording kills it at 537. Our hit
-  history on it is 510/514/517/522/533/537 — two conspicuous dry windows.
-  `--trace-damage 505,550` reproduces this in one command.
+- **Hard / ReimuB (st3 @ 3087, st4 @ 2360, st5 @ 2090, st6 @ 1727, st2 @ 7624,
+  st1 @ 5440).** The pool-starvation half of this lead is FIXED (see above): the
+  st3 worked example that used to sit at 537 — enemy pool slot 1, a scripted
+  straight descent at x=40.0 exactly, killed at 546 against the recording's 537
+  — now converges, and every Hard stage moved out except st1 and st4, which did
+  not budge at all and are therefore independent defects. What remains at st3 is
+  a *different* mismatch: the oracle kills on two consecutive frames 3086 AND
+  3087 while we kill at 3086 then not until 3096, after which our next five kills
+  run 1-2 frames EARLY (oracle 3099/3100/3109/3113/3117 vs ours
+  3098/3100/3108/3112/3115). A ReimuB bomb is live from 3086 through 3100+, but
+  its damage model is not the cause (refuted, see AGENTS.md). At 3087 no live
+  enemy sits inside either bomb strip in our sim, so work out what the original
+  killed there: an enemy we killed a frame early, one we left with leftover hp,
+  one we never spawned, or a slot-vacate (the AUX kill bit is also written when a
+  slot is released, and several enemies hover at y slightly negative right at
+  the top-edge cull boundary in that window, where the live ANM sprite rect —
+  not the spawn template — decides the exact cull frame).
   Note that the Hard st1 case (midboss spell captured 20f late) sits behind
   an RNG-positioned boss: ECL stage-1 Sub29 picks its move angle with
   `ins_52([10004], -π, π)`, so that boss's parked X is not a fixed target
   and cannot by itself prove or disprove a shot-side bug.
-- **Easy/Normal (four of the five first divergences are item collects).**
-  In every case the kill stream stays exact for hundreds to thousands of
-  frames past the first collect mismatch, which puts the fault in the item
-  pipeline rather than the enemy simulation. The mismatches are ±1 frame
-  inside dense auto-collect bursts (Easy st4: our stream is missing 4536 and
-  has an extra 4545 in an otherwise identical 4521..4547 run). Start from
-  `updateItems`' homing/AABB tail, which already carries one exe-derived
-  rounding fix keyed to this very replay.
+- **Easy/Normal collect bursts.** The framing that these are all item-pipeline
+  bugs is now known to be wrong for at least the post-respawn half: Normal st5
+  looked exactly like a ±1-frame auto-collect bug and was really the respawn
+  control lock, and the fix needed nothing in `updateItems` (its predicted
+  player track reproduced all three oracle collects AND the three non-events
+  immediately before them). Sort each remaining cell by the miss table above
+  before assuming anything.
+  Still open in this family: **Normal st6 @2727** (collect 3 frames late, 220
+  frames after the miss at 2507 — the 55-tick lock did not move it, so measure
+  the player's position track against the recorded inputs the way Normal st5 was
+  measured), **Easy st5 @7290** (39 frames late, far more than a respawn lock can
+  explain — a second cause), **Easy st4 @4536** (no death at all: one collect a
+  single frame late inside a homing `cherry` burst spawned at 4513 by a bomb's
+  bullet cancel, with power pinned at 128, no border, PoC inactive, and the
+  player stepping 2.2 px/frame; the surviving candidates are the burst's spawn
+  positions, i.e. whether our cancelled bullets were where the original's were,
+  and the homing recompute itself), and **Easy st6 @1628**, which is a *contact*
+  mismatch — a bullet reaching the player at the wrong frame, not an item
+  problem.
 - **Phantasm (st7 @ 51989).** Exact for 51989 of 57876 frames — 565 kills,
   2739 collects, 23 contacts, 7 bombs and every border event. Boss sub 127's
   HP reaches 0 two frames early, i.e. ~2 HP of accumulated excess over a long
