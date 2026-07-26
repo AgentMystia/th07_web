@@ -366,6 +366,50 @@ differs", not as "state is identical".
   whether a contact lands. Treat this cell as a member of the upstream-drift
   family below rather than as a hitbox or scheduling bug.
 
+### The "every Reimu cell fails" pattern — and three refutations (2026-07-26)
+
+Worth noticing, and worth not over-reading. Across the whole matrix no Reimu cell
+has ever passed (Hard/reimuB 6/6 diverge, Phantasm/reimuA 1/1) while sakuyaA
+passes all six Lunatic stages, marisaB passes Extra, and sakuyaB passes Easy
+st1-3. Because each stage is verified from its OWN recorded entry snapshot, the
+six Hard cells are six INDEPENDENT fresh-start divergences, all early
+(1727-7624) — which is what a systematic per-character bug looks like, not
+accumulated drift.
+
+Decoding all twelve SHT files makes ReimuB's shot data stand out sharply. Its
+option needles are the only player shots in the game with hitbox **12x40** at
+**speed 22**; every other character's shots are 12x12 or 12x24 at speed 10-12
+(MarisaB's beams are 10/15/20 x 0, height repurposed). A full-vs-half extent
+error would therefore cost ReimuB 20 px where it costs sakuyaA 6 — and the
+observed direction fits (kills land 2 frames EARLY, i.e. slightly too much DPS,
+which is what an oversized shot box produces). Three candidates were checked and
+all three are REFUTED — do not re-walk them:
+
+1. **Full-vs-half extents.** `collidePlayerShotsInBox` (stage-scene.ts:3211-3214)
+   already multiplies `hitboxW`/`hitboxH` by 0.5, matching the SHT header note
+   that these are FULL widths the exe halves at point of use. Correct as written.
+2. **Beam anchoring clobbering hitboxH.** `anchorBeamBullet` does overwrite
+   `hitboxH` with a Y coordinate (3342, 3363), which would be catastrophic for a
+   40 px box — but its only call site (3023-3024) is gated to
+   `shotType === 4 || shotType === 5`, and ReimuB's records are all shotType 0.
+   Not reachable.
+3. **Per-shot item constants.** ReimuB's `itemRadius` (20), `pocLineY` (128) and
+   `autocollectSpeed` (8) are identical to Sakuya's, which passes Lunatic 6/6, so
+   the collect-one-frame-early signature is not a per-character item table value.
+
+Also resist unifying the two characters. ReimuA's failing cell is homing
+(shotType 1/2, `steerHomingBullet`); ReimuB's shots are ordinary shotType 0
+needles. "All Reimu fails" is more likely two separate bugs than one shared
+cause, and treating it as one shared cause is how the above three dead ends got
+generated.
+
+The genuinely unexplained part of Hard st6 is worth restating precisely: at the
+earliest divergence (frame 1727, a collect one frame early) ALL 140 preceding
+kills are frame-exact, so the item spawned on the right frame from the right
+enemy. With spawn frame, spawn position, item constants and player position
+(pure recorded input) all exact, the surviving candidates are the state-1 homing
+recurrence and the PoC/border latch timing — not the collect AABB.
+
 ### The upstream-drift family (three cells, and why events cannot close them)
 
 Easy st4, Easy st6 and Normal st6 have all now been measured to the same
