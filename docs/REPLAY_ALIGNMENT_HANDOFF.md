@@ -653,11 +653,18 @@ small cause. Budget the search accordingly: integrate raw damage per frame over
 5400-5462 and look for a handful of absent contacts, not for a missing damage
 source.
 
-One thing to rule out first: the traced shots carry `damage` 24 and 15, and
-neither value appears in the UNFOCUSED ply00b table (main 9/16/17/20/22/27/28/30/
-32/48, options 7/10/12/14). The focused table ply00bs was never dumped, so 24/15
-are most likely its values and this is a non-issue — but confirm that before
-reading anything into the numbers.
+RESOLVED, and it kills the obvious first check. The traced shots carry `damage` 24
+and 15, absent from the UNFOCUSED ply00b table — but `ply00bs` (ReimuB FOCUSED)
+holds d24 x13 and d15 x1, so those are ordinary focused main shots and the values
+are a non-issue. The important part is what else that table shows: **ply00bs
+contains ONLY `orb=0` records — focused ReimuB fires no option needles at all.**
+
+So the player is FOCUSED through this midboss, and "check whether both option orbs
+register" (suggested by an earlier revision of this section) is moot here: there
+are no option shots in the window. The 12x40 needle geometry is likewise
+irrelevant to this cell. What remains in play is main-shot cadence and count —
+`firePlayerBullets` timing, the 96-slot pool, and the per-frame raw-damage
+integral against the /7 divisor.
 
 Concrete first checks, in order: whether BOTH ReimuB option orbs' needles register
 on that enemy (option shots are `orb=1`/`orb=2`, d7-d12, hitbox 12x40 at speed 22 —
