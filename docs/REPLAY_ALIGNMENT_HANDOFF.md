@@ -164,7 +164,23 @@ prefix as "no observed event differs", not as "state is identical".
   57 and 36, so it is an independent defect and not respawn timing at all), and
   **Easy st6 @1628**, which is a *contact*
   mismatch — a bullet reaching the player at the wrong frame, not an item
-  problem.
+  problem. First measurements (2026-07-26): the oracle registers a contact at
+  1628; ours does not arrive until 1710, 82 frames later. Through that whole
+  window the player is motionless at (171.51, 56.00) — up at the top of the
+  field in the auto-collect zone — with `hitboxHalf` 1.1, no invuln and no
+  border, while the live enemy-bullet count keeps climbing (126 → 148). Our
+  closest bullet at 1628 is 5.54 px away on the binding axis, so nothing is
+  marginal: whatever touched the original is somewhere else entirely in our run.
+  The most suspicious object in the window is bullet slot 197, which approaches
+  the player at speed 1.4316 on angle −3.0091 and then has its speed drop to
+  **exactly 0** at frame 1629, freezing at (177.05, 54.04) permanently. Check its
+  bullet-EX deceleration ramp (`exAccel`/`exAccelElapsed`, and the
+  one-promotion-per-tick rule in FUN_004229f0) before anything else — a ramp that
+  clamps to zero when native's keeps it moving would both explain the frozen
+  bullet and put a real bullet near the player at 1628. Also worth ruling out
+  first: whether the player is motionless because a dialogue freeze is active in
+  our run when it should not be, since 1628 sits early in stage 6 and an
+  82-frame offset is the right order of magnitude for a mis-scheduled MSG wait.
 - **Easy st4 @4536 is proven NOT to be an item-pipeline bug.** At frame 4513 a
   SakuyaB bomb's full-screen clear (region `{x:226.774, y:195.009, radius:800}`)
   converts 181 live enemy bullets into `cherry` items, all born `state:1`; from
