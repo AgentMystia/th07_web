@@ -477,12 +477,17 @@ dies two frames early, i.e. we are ~2 HP ahead over a long spellcard.
 
 Three structural facts to carry into any continuation:
 
-- **`wine`/`winedbg` is not installed in the current environment**, so the
-  native PRE-trace procedure below cannot be run here. The AUX streams are
-  the substitute oracle. They are dense and frame-exact, but they are not
-  complete: an RNG or position divergence that happens to produce no AUX
-  event stays invisible until it changes one. Do not read "exact through
-  frame N" as "identical through frame N".
+- **Wine + winedbg are obtainable here — the native PRE-trace procedure is no
+  longer blocked.** Verified 2026-07-26: Wine 9.0 with 32-bit support runs
+  `Th07.exe` under Xvfb and `winedbg --gdb` is available. The install order is
+  fiddly (and installing `wine32:i386` removes the amd64 `wine` binary, leaving
+  the loader at `/usr/lib/wine/wine`) — the exact recipe is at the top of
+  docs/REPLAY_ALIGNMENT_HANDOFF.md. Until a trace is acquired the AUX streams
+  remain the working oracle; they are dense and frame-exact but NOT complete, so
+  an RNG or position divergence producing no AUX event stays invisible until it
+  changes one. Do not read "exact through frame N" as "identical through
+  frame N" — and note the upstream-drift cells are provably not closable from
+  event streams at all, so they are what the traces are for.
 - **Every stage that currently PASSes records zero player misses.** Read that
   off the `--json` report's `alignment.misses.oracle` before touching anything
   in the death/respawn path: it means that whole path is unvalidated by the

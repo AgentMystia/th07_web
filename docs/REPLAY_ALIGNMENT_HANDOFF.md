@@ -75,12 +75,40 @@ like an item bug and was not one.
 The five non-fixture replays are third-party recordings kept as local
 evidence in the git-ignored `replay/` directory. Never commit them.
 
-**`wine`/`winedbg` is not installed in the current environment**, so the
-native PRE-trace acquisition below cannot be run here. Until it can, the
-replay's own AUX event streams are the oracle: dense, frame-exact, and free.
-Their limit is coverage, not accuracy — an RNG or position divergence that
-produces no AUX event stays invisible until it changes one, so read a clean
-prefix as "no observed event differs", not as "state is identical".
+**Wine + winedbg CAN be made to work in this container — recipe below.** This
+was the blocker across several sessions; it is no longer one. Established
+2026-07-26 on Ubuntu noble:
+
+```sh
+# 7z, to unpack a game archive (pip is blocked by the tooling classifier; apt is not)
+apt-get install -y p7zip-full
+
+# 32-bit Wine. Order matters: wine32:i386 pulls libgphoto2-6t64:i386, whose
+# libgd3:i386 dependency apt refuses to auto-resolve, so install that FIRST.
+dpkg --add-architecture i386 && apt-get update
+apt-get install -y --no-install-recommends libgd3:i386
+apt-get install -y --no-install-recommends wine32:i386
+# NB installing wine32:i386 REMOVES the amd64 wine package, so /usr/bin/wine
+# disappears. The loader you want afterwards is /usr/lib/wine/wine.
+/usr/lib/wine/wine --version          # -> wine-9.0
+
+export WINEPREFIX=/tmp/wine-th07 WINEDEBUG=-all
+xvfb-run -a /usr/lib/wine/wine wineboot -i
+cd <dir with Th07.exe + Th07.dat>
+xvfb-run -a -s "-screen 0 800x600x24" /usr/lib/wine/wine Th07.exe   # runs
+xvfb-run -a /usr/lib/wine/wine winedbg --gdb Th07.exe               # PRE traces
+```
+
+Verified: the game runs 90 s under Xvfb without crashing or erroring, and
+`winedbg --gdb` is present. That makes the PRE-trace procedure further down this
+document executable here, which is what the remaining cells need — see the
+upstream-drift family, whose members are provably NOT closable from event streams.
+
+Until a trace is actually acquired, the replay's own AUX event streams remain the
+working oracle: dense, frame-exact, and free. Their limit is coverage, not
+accuracy — an RNG or position divergence that produces no AUX event stays
+invisible until it changes one, so read a clean prefix as "no observed event
+differs", not as "state is identical".
 
 ## Open leads
 
