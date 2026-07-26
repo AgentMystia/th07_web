@@ -770,6 +770,11 @@ exactly at **0x43a8d5**, the shot-cycle constant §6 cites. `.text` is
 | ReimuA stage reduction | stage compare `ds:0x62583c` vs 5/6 then `sar 1` @ 0x41f9da-0x41fa07; vs 4 @ 0x41fa0c | matches the /2 and 11/16 arms |
 | state-2 (dying) clock | `player+0x16a08` vs `cmp 0x1e` @ 0x43e043 → `mov [+0x2408],0x1` @ 0x43e050 | ONE 30-tick clock from the HIT |
 | materialize clock | `cmp 0x1e` @ 0x43e24d → `mov [+0x2408],0x3` @ 0x43e256 | 30 ticks, not 25 |
+| bounds test | `IsInBounds` @ 0x42bdc7: `size / 2.0` (0x48eac0) vs `0.0` (0x48ea9c) and `384.0` (0x48eabc) | matches the `[0,384]` rect with HALF-extents |
+| ramp/spawn floats | `30.0` @ 0x48eb60, `64.0` @ 0x48eb68 | match the cited materialize divisor and spawn-Y offset |
+
+The bounds entry matters for the Hard group: the player-shot offscreen cull is
+confirmed correct, so it is not the residual ReimuB DPS suspect.
 
 The last two together are why the post-miss control lock is **61 − deathbombWindow**
 (Reimu 46, Marisa 53, Sakuya 55) rather than a flat 55 — the deathbomb window burns
