@@ -748,16 +748,17 @@ comparisons against real play).
   collects and leaves the kill stream broken, because `Player.fire()` also
   disarms the shot cycle while `materializeFrame >= 0`. The squish stays 30
   (all.c:28596 writes the miss bit 30 frames before the life counter drops).
-  See `MATERIALIZE_EXIT_FRAMES` and tests/th07-deathbomb.test.mjs.
-  **Open sub-question:** 30 squish + 25 materialize (what is implemented) and
-  25 squish + 30 materialize are observationally identical on both cells. They
-  differ only in the frame of the respawn TELEPORT, which drives the 60-frame
-  silent enemy-bullet clear (`respawnClearFrames`, stage-scene.ts) — so the two
-  variants open that window 5 frames apart. Settle it if a later divergence
-  lands in a post-respawn bullet field. The implemented split is the one the
-  exe comment supports: its cited materialize threshold reads 0x1d (29) with
-  divisor 30.0, and 0x19 (25) is one nibble away, which would make the handoff
-  threshold and the ramp divisor two different constants.
+  See `MATERIALIZE_FRAMES` / `DEATH_STATE_FRAMES` and
+  tests/th07-deathbomb.test.mjs.
+  **Settled 2026-07-26 — this sub-question is closed.** The old "30 squish + 25
+  materialize vs 25 + 30" framing was wrong on both counts: `MATERIALIZE_EXIT_FRAMES
+  = 25` was a Sakuya-fitted constant, not an exe value, and it no longer exists.
+  Both phases are 30 (`cmp 0x1e` @ 0x43e24d -> state 3 @ 0x43e256 for materialize;
+  player+0x16a08 vs `cmp 0x1e` @ 0x43e043 for the death state), and state 2 is a
+  SINGLE 30-tick clock started at the hit, so the post-miss lock is `61 −
+  deathbombWindow` rather than two stacked phases — which is why the per-character
+  windows (Reimu 15, Marisa 8, Sakuya 6) give 46/53/55. Verified on v1.00; see the
+  provenance note under the exe-constants table below.
 - `updateItems` is the last manager still walking the dense `this.items` array
   (`for (const it of this.items)`); enemies, player shots and enemy bullets all
   scan their fixed slot arrays the way the exe does. That difference is
@@ -765,10 +766,19 @@ comparisons against real play).
   pickup crossing 128, or `fullPower`, runs `cancelBulletsToItems`, one
   `spawnItem` per live bullet), and `insertByPoolSlot` splices into the array the
   `for…of` is walking, so an insert below the cursor re-visits the current entry
-  and ticks new low-slot items a native ascending scan would skip. It is NOT
-  currently known to cause any divergence (measured refuted at Easy st4, see the
-  baseline section), so it stays as-is rather than being "cleaned up" blind: the
-  fix is a fixed-slot scan, and it needs a converging witness before landing.
+  and ticks new low-slot items a native ascending scan would skip.
+  **Resolved 2026-07-26: `updateItems` now scans `itemSlots` ascending**, like the
+  other four managers, and calls `syncItemSlots()` at its head so the invariant
+  holds no matter which entry path reached it (focused unit harnesses call
+  `updateItems()` directly with only the dense array populated). Landed WITHOUT a
+  converging witness, which is the exception to §7's usual bar and is recorded as
+  such: the full matrix is byte-identical before and after (so the double-visit
+  provably never fires at any current divergence frame — consistent with the
+  earlier Easy st4 refutation), the suite stays green, and `update` p50/p95/p99
+  are unchanged (~1050 extra null checks/frame is microseconds; a first reading of
+  p99 1.5 ms was noise — repeats gave 0.9/1.1 ms against a 1.0 ms baseline). It is
+  a structural-fidelity fix, not a convergence fix: do not credit it with moving
+  any cell, and do not expect reverting it to move one either.
 
 ### Exe-verified damage/death constants (2026-07-26, Th07.exe **v1.00**)
 
