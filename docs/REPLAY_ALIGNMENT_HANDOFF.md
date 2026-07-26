@@ -562,6 +562,52 @@ publishes NO bullet-clear regions when unfocused (only the damage box, gated to
 `frame >= 32 && frame % 4 === 0`), so there is no early-clear mechanism there to
 find. Easy st6 needs a different explanation for the missing contact.
 
+### Attack-slot damage decoded (FUN_0043a980), and Hard st2's tally theory refuted
+
+Static reads against the v1.00 binary answer more than the earlier "blocked on
+v1.00b" framing implied. `FUN_0043a980` is the per-enemy consumer of both slot
+pools, and it decodes cleanly:
+
+- 96 player-shot slots first (`cmp [ebp-0x8],0x60`, stride 0x364), keyed on the
+  alive flag at `+0x34a`, with the `[+0x34c] == 3` exception — that is MarisaA's
+  missile repeat-hit case our `collidePlayerShotsInBox` already models.
+- then 112 attack slots (`cmp [ebp-0x8],0x70`, stride 0x20 via `shl 5`, base
+  `player+0x9dc`, dims at `+0x9e8`). Liveness is `dims.x > 0` (`fcomp` against
+  `0x48ea9c`), and the FULL widths are halved by a `const/const` load
+  (`0x48eaa4 / 0x48eac0`) before the AABB test. Both match our implementation.
+- damage: `+0x9f4` is the damage value, `+0x9f8` the hitTally. At 0x43af64 the
+  damage accumulates into the frame's running total, and at 0x43af8d-0x43afa0
+  `hitTally += damage` is stored back. **The consumer applies NO cap** — an
+  overlapping slot really does deal its damage every frame.
+
+The cap, where it exists at all, is checked by the individual bomb form. Scanning
+all twelve forms for `+0x9f8` references:
+
+| form | tally refs | thresholds seen |
+|---|---:|---|
+| reimuA unfocused | 1 | zeroes only |
+| reimuA focused | 2 | `cmp … 0x6` |
+| marisaA focused | 2 | `cmp … 0x5` |
+| sakuyaA unfocused | 4 | `cmp … 0x1`, `cmp … 0x3` |
+| sakuyaA focused | 4 | `cmp … 0x0`, `cmp … 0x3` |
+| **reimuB unfocused** | **0** | — |
+| **reimuB focused** | **0** | — |
+| marisaA unf, marisaB unf/foc, sakuyaB unf/foc | 0 | — |
+
+**Neither ReimuB form touches the tally**, so Hard st2's ~18 points of excess
+damage is NOT a per-slot tally cap. That hypothesis is refuted from the binary
+rather than left open — do not go looking for a FUN_004094e0 cap value, there
+isn't one.
+
+Two follow-ups this opens, both readable without v1.00b:
+
+1. `sakuyaAFocused`'s comment in player-bombs.ts says its slot runs "d12 until its
+   own tally reaches 80". The exe compares that form's tally against 0x0 and 0x3,
+   not 80. Either the 80 refers to a different field or the comment is wrong —
+   worth resolving, and sakuyaA is the character behind Normal st2-6.
+2. The four capped forms' thresholds above are concrete constants to check our
+   implementations against.
+
 ### The upstream-drift family (three cells, and why events cannot close them)
 
 Easy st4, Easy st6 and Normal st6 have all now been measured to the same
