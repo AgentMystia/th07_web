@@ -243,14 +243,33 @@ constant-verification questions.
   damage trace is the only quantitative handle. The two extra player contacts
   (56038, 56993) and the death at 57037 are downstream of this; re-measure
   rather than treating them as separate defects.
-- **Non-Lunatic ECL branches.** Every difficulty-gated branch in
-  `src/game/eclvm.ts` has only ever executed under Lunatic in a converged
-  replay: effect 8's `difficulty < 2` scale/base/state, the `difficulty >= 3`
-  and `difficulty === 3` gates, `difficulty < 3 ? 4 : 2` with its π/6-vs-π/2
-  pair, and effect 12/21's band plus `[10,18,22,25][difficulty]` child count.
-  Each child costs RNG draws, so a wrong count shifts every later draw in the
-  stage. Re-derive each from `all.c` / `spec-effects-misc.md` rather than
-  assuming the Lunatic-validated code is right.
+- **Non-Lunatic ECL branches — mostly RESOLVED, and the method matters.**
+  The old claim that these had "only ever executed under Lunatic" was wrong: a
+  converged *stage* validates a branch just as well as a converged replay, and
+  Easy st1-3 plus Normal st1 all PASS. Measured coverage (instrument the four
+  gated effect sites and count firings per stage, 2026-07-26):
+
+  | gate | fired in | verdict |
+  |---|---|---|
+  | effect 6, `difficulty < 3` arm | Easy st3, 32× — **stage PASSES** | validated at d0 |
+  | effect 6, `>= 3` arm | Lunatic st3, 96× — stage PASSES | validated at d3 |
+  | effect 1, `difficulty < 3` arm | Easy st2, 2× — **stage PASSES** | validated at d0 |
+  | effect 8 | fired in none of the sampled stages | still unexercised |
+  | effects 12/21 | fired in none of the sampled stages | still unexercised |
+
+  So effect 6's `difficulty < 3 ? 4 : 2` with its π/6-vs-π/2 pair is correct as
+  written, despite looking non-monotonic. That is confirmed twice over: a sweep of
+  six candidate (count, spread) pairs against Normal st3 made every alternative
+  worse — `(2, π/6)` → 8306, `(2, π/2)` → 8290, `(4, π/2)` → 7617, against the
+  current `(4, π/6)` → 11863. Note such a sweep is free of risk to the converged
+  rows: the fixture is d3 and Extra is d4, so both take the `>= 3` arm and cannot
+  be moved by editing the `< 3` arm at all.
+  Consequence for the open cells: **Normal st3 @11863 is not an ECL-gate problem.**
+  Effect 6 is the only gated site that fires at all before that frame, and it is
+  now validated. Don't re-chase the gates there.
+  Effect 8 and effects 12/21 remain genuinely unexercised — if a divergence ever
+  localizes to a window where one of them fires, that is worth pursuing; their
+  child counts cost RNG draws, so a wrong count shifts every later draw.
 
 ## Legacy Stage 1-6 Lunatic checkpoint
 

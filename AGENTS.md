@@ -527,6 +527,18 @@ without new evidence:
   spawn-mode-2 tween's lerp at elapsed 60 (so an item lands on its exact target
   rather than stopping at t=59/60) does not move Normal st6, the cell where death
   drops actually decide a collect.
+- *Effect 6's non-Lunatic ring values are wrong because they look
+  non-monotonic* (`difficulty < 3 ? 4 : 2` bullets at π/6 vs π/2 — easier ranks
+  getting MORE bullets). They are correct. A converged **stage** validates a
+  difficulty branch just as a converged replay does, and the passing Easy st3
+  fires that exact arm 32 times; the passing Lunatic st3 fires the `>= 3` arm 96
+  times. A sweep of six candidate (count, spread) pairs against Normal st3 also
+  made every alternative worse — `(2, π/6)` 8306, `(2, π/2)` 8290, `(4, π/2)`
+  7617, versus `(4, π/6)` 11863. Such sweeps are risk-free for the converged rows,
+  since the fixture (d3) and Extra (d4) both take the `>= 3` arm.
+  Corollary worth reusing: instrument the gated sites and count firings per stage
+  to build a coverage map before suspecting any difficulty branch — effect 8 and
+  effects 12/21 are the only ones still unexercised anywhere.
 
 ### Next-session fidelity workflow
 
