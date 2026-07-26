@@ -362,19 +362,27 @@ export class BombRunner {
   // 霊符「封魔陣」 unfocused — FUN_00408f10 (spec-bombs-reimu §5): a cross
   // through the cast point. Four slots reduce to two unique geometries —
   // a 62×448 vertical strip through cast X and a 384×62 horizontal strip
-  // through screen-center Y — at d16, active from bomb frame 1 onward under the
-  // exe's odd-frame write gating (see below; an earlier reading of this routine
-  // called that gating cosmetic, which was wrong).
+  // through screen-center Y — at d16, live every OTHER frame under the exe's
+  // odd-frame write gating (an earlier reading called that gating cosmetic,
+  // which was wrong).
   private reimuBUnfocused(ctx: BombContext): void {
-    // FUN_00408f10's writes are odd-frame gated, and that gating is NOT merely a
-    // cosmetic position refresh as this comment previously claimed: slots persist
-    // until cleared (cf. marisaAUnfocused, which gates the same way on frame % 3),
-    // so gating the writes leaves frame 0 with NO live slot and every frame from 1
-    // on active. That one-frame deferral is exactly what the trigger frame needs —
-    // th7_udFi03 Hard st6 bombs at 1726, and the oracle's first cancel-item
-    // collect is 1728 while an ungated write clears bullets at 1726 and collects
-    // at 1727. It is character-local by construction, which is why the global
-    // gates tried in prepareBombEffects regressed ReimuA's Phantasm bombs.
+    // FUN_00408f10's slot writes are odd-frame gated, and that gating is NOT a
+    // cosmetic position refresh: FUN_0043d8f0 zeroes dims.x on all 112 entries
+    // at the head of every player tick (see BombEngine.beginFrame), so a slot
+    // that is not REWRITTEN this frame is not live this frame. Gating the writes
+    // therefore gives the cross a 50% duty cycle — half the damage frames and
+    // half the bullet-clear frames — which is the same shape marisaAUnfocused
+    // already models on frame % 3 (it writes two frames in three and explicitly
+    // clears on the third).
+    //
+    // Witnessed by th7_udFi03 Hard st6 (1727 -> 1791) and st3 (3087 -> 3092)
+    // with every other cell byte-identical. NB the duty cycle, not a one-frame
+    // deferral, is the mechanism: an earlier version of this comment claimed
+    // slots persist until cleared, which beginFrame() contradicts. The gate is
+    // character-local, which is why the global deferrals tried in
+    // prepareBombEffects regressed ReimuA's Phantasm bombs, and it does NOT
+    // extend to the focused cast below (measured: gating that one, or merely
+    // skipping its frame 0, makes Hard st2 and st5 worse).
     if (ctx.frame % 2 !== 1) return;
     this.engine.set(0, this.castX, 224, 62, 448, 16);
     this.engine.set(1, 192, this.castY, 384, 62, 16);
