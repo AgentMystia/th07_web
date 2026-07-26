@@ -410,6 +410,65 @@ enemy. With spawn frame, spawn position, item constants and player position
 (pure recorded input) all exact, the surviving candidates are the state-1 homing
 recurrence and the PoC/border latch timing — not the collect AABB.
 
+### Hard st6 @1727 localized (2026-07-26) — start here, it is the cheapest cell
+
+Earliest divergence in the entire matrix, and the context is now pinned down.
+Reproduce with
+`--replay replay/th7_udFi03.rpy --stage 6 --trace 1715,1732 --dump-frame 1726`.
+
+Established facts:
+
+- The player is **completely stationary** at (315.3975830078125, 421.48236083984375)
+  for the whole window — bottom-right corner, `power` 128, alive, not
+  materializing. So no player-position error is possible here: position comes
+  straight from the recorded input.
+- Recorded input flips to `0x0002` (**bomb**) at frame 1726, and the oracle's AUX
+  stream records `bomb` at exactly 1726. Our bomb matches — the first bomb
+  mismatch is at 7694, so bombs #0/#1 agree.
+- `cherry` starts draining at 1727 (110650 → 110620 → 110570 → …), confirming the
+  bomb went off on both sides.
+- Oracle `itemCollect` frames: **1728**, 1729, 1730, 1732, 1733, … then near
+  continuous to 1800 (70 collects in 73 frames). Ours starts at **1727**.
+- All 140 kills preceding the divergence are frame-exact, so every item's spawn
+  frame and spawn enemy are right.
+
+The important negative result: **the 1727/1728 collect is NOT one of the bomb's
+cancel items.** The frame-1726 dump shows 184 items alive, all still at their
+spawn (bullet) positions with `state: 1`, and the NEAREST is 95.47 px from the
+player. At `autocollectSpeed` 8 the first cancel item cannot arrive before frame
+~1738, and the farthest (466 px) not before ~1784 — which matches the shape of
+the 1728-1800 burst but not its start. So both sides' first collect here is
+something else (most plausibly an ordinary falling drop from the 1716/1717 kills
+reaching a player parked at the bottom edge), and the one-frame gap lives in that
+item, not in the cancel conversion. Identify it before theorising: the `itemDump`
+in `--dump-frame` is capped at 12 of 184 entries, so this needs a scratch driver
+on the harness `onScene` hook logging every item's position and every
+`collectItem` call across 1720-1735.
+
+### Refuted: state-1 items skipping their first homing step
+
+Tempting and wrong. The dialogue-drop note next to `forceCollectAllItems()`
+("Native Phantasm PRE3966 pins slot 1002 at (169.960052,125.800003), state=1,
+age=1; pre-homing it at updateItems' head moved it 8 px too soon") reads like
+evidence that a freshly latched item does not move on its first pass. It is not:
+it describes an ORDERING bug (force-collect running before `updateItems` instead
+of after), not a first-pass rule.
+
+Gating the homing integration off for `state === 1 && age === 1` destroys the
+entire matrix — every cell, including all six Lunatic PASSes and Extra:
+
+| | st1 | st2 | st3 | st4 | st5 | st6 | st7 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Lunatic | 2673 | 1411 | 2096 | 3175 | 1157 | 1926 | |
+| Extra | | | | | | | 1153 |
+
+Useful in one way, and worth remembering before touching this code: item homing is
+exercised constantly and precisely in every replay, so the item pass is
+hair-trigger. Any change to homing timing that is not exactly right shows up
+within ~600-3000 frames of every stage. That cuts both ways — it means the current
+timing is strongly validated by the eight passing cells, and it means this is a
+bad place to guess.
+
 ### The upstream-drift family (three cells, and why events cannot close them)
 
 Easy st4, Easy st6 and Normal st6 have all now been measured to the same
