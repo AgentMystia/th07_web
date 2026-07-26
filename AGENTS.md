@@ -750,6 +750,32 @@ comparisons against real play).
   baseline section), so it stays as-is rather than being "cleaned up" blind: the
   fix is a fixed-slot scan, and it needs a converging witness before landing.
 
+### Exe-verified damage/death constants (2026-07-26, Th07.exe v1.00b)
+
+Verified directly with `objdump -d -M intel -b pei-i386 reference/Th07.exe` after
+the original was made available locally. The binary is confirmed to be the one
+every citation in this tree refers to: `cmp DWORD PTR [ebp-0x14],0x1e` sits
+exactly at **0x43a8d5**, the shot-cycle constant §6 cites. `.text` is
+0x401000..0x482638, so cited addresses map directly.
+
+| fact | site | verdict |
+|---|---|---|
+| damage cap 70 | `cmp [ebp-0x40],0x46` / `mov ...,0x46` @ 0x41f94f | matches `min(70, …)` |
+| spell divisor | `cmp [ebp-0x18],0x7` / `jle` @ 0x41fac6, `idiv 7` @ 0x41fad5, else `mov 1` @ 0x41fae2 | matches `dmg >= 8 ? trunc(dmg/7) : dmg > 0 ? 1 : 0` **including the min-1 floor** |
+| ReimuA stage reduction | stage compare `ds:0x62583c` vs 5/6 then `sar 1` @ 0x41f9da-0x41fa07; vs 4 @ 0x41fa0c | matches the /2 and 11/16 arms |
+| state-2 (dying) clock | `player+0x16a08` vs `cmp 0x1e` @ 0x43e043 → `mov [+0x2408],0x1` @ 0x43e050 | ONE 30-tick clock from the HIT |
+| materialize clock | `cmp 0x1e` @ 0x43e24d → `mov [+0x2408],0x3` @ 0x43e256 | 30 ticks, not 25 |
+
+The last two together are why the post-miss control lock is **61 − deathbombWindow**
+(Reimu 46, Marisa 53, Sakuya 55) rather than a flat 55 — the deathbomb window burns
+the front of the shared state-2 clock. An earlier revision fitted the Sakuya answer
+to every character because only Sakuya replays record a death.
+
+Consequence for the open cells: the Phantasm kill arithmetic is now *confirmed
+correct* (raw 88 → cap 70 → `trunc(70/7)` = 10, killing a 10-hp boss), so that
+divergence is upstream of the damage formula, not in it. Do not go looking for a
+cap or divisor bug there.
+
 ## 8. Pitfall catalog (check these FIRST when something looks wrong)
 
 - **Half the geometry missing / one-sided rendering** → anchor or extent
