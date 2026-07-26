@@ -6,6 +6,28 @@ before using it. Stage 1-6 Lunatic (`tests/replays/th7_udFe25.rpy`, SakuyaA)
 and Extra (`replay/th7_udHm54.rpy`, MarisaB) are converged; the open work is
 Hard, Normal, Easy and the last 10% of Phantasm.
 
+## Non-replay gates, and what is NOT measurable here (2026-07-26)
+
+The replay matrix is only one of the acceptance conditions. Status of the rest, so
+nobody has to re-derive it:
+
+- `npm run check` (tsc) clean; `npm test` 336 tests, 335 pass / 1 skipped / 0 fail.
+- `npm run build` clean — `dist/th07.js` 1.6 MB in ~70 ms.
+- `node scripts/dev-shot.mjs /tmp/shot.png 300` boots headless and reports a sane
+  frame-300 state with no page errors.
+- `node scripts/perf-probe.mjs --scenario dense-items` — `update` p50 0.2 ms,
+  p95 0.6 ms, p99 1.2 ms, dropRate **0**. Unchanged by this session's changes.
+  Beware the noise floor: a single 3-run sample read p99 1.5 ms and repeats gave
+  0.9/1.1 ms against a 1.0 ms baseline, so never conclude a regression from one run.
+- **`scripts/latency-probe.mjs` CANNOT run in this container.** Two separate
+  reasons, both pre-existing: it launches Chromium HEADED, so it needs
+  `xvfb-run -a node scripts/latency-probe.mjs` (bare `DISPLAY=` is not enough —
+  Playwright rejects it), and it then hard-fails on a browser pin,
+  `Chrome major 141 does not match required 148`. The pin is deliberate — latency
+  numbers are only comparable on a fixed build — so do NOT relax it to get a
+  number. **Input-lag was therefore NOT measured this session**; treat any claim
+  about it as unverified until the pinned browser is available.
+
 ## Where things stand (2026-07-26)
 
 `node scripts/replay-verify.mjs --all` prints this matrix. Cells are the
