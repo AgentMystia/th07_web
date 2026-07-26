@@ -56,8 +56,8 @@ frame-by-frame grind, and neither needs a simulation run:
 
 | cell | divergence | oracle miss before it | family |
 |---|---:|---|---|
-| Normal st2 | 9104 | 8578 | post-respawn (partly resolved) |
-| Normal st5 | 2320 | 2205 | post-respawn (partly resolved) |
+| Normal st2 | 9104 | 8578 | post-respawn, lock resolved; now 3f late (oracle 9104, ours 9107) |
+| Normal st5 | 2320 | 2205 | post-respawn, lock resolved; now 4f EARLY on a kill (oracle 2324, ours 2320) |
 | Normal st6 | 2727 | 2507 | post-respawn, unresolved (3f late collect) |
 | Easy st5 | 7290 | 7119 | post-respawn, unresolved (39f late — second cause) |
 | Easy st4 | 4536 | none | no-death family (1f late collect) |
@@ -115,15 +115,38 @@ prefix as "no observed event differs", not as "state is identical".
   Still open in this family: **Normal st6 @2727** (collect 3 frames late, 220
   frames after the miss at 2507 — the 55-tick lock did not move it, so measure
   the player's position track against the recorded inputs the way Normal st5 was
-  measured), **Easy st5 @7290** (39 frames late, far more than a respawn lock can
-  explain — a second cause), **Easy st4 @4536** (no death at all: one collect a
-  single frame late inside a homing `cherry` burst spawned at 4513 by a bomb's
-  bullet cancel, with power pinned at 128, no border, PoC inactive, and the
-  player stepping 2.2 px/frame; the surviving candidates are the burst's spawn
-  positions, i.e. whether our cancelled bullets were where the original's were,
-  and the homing recompute itself), and **Easy st6 @1628**, which is a *contact*
+  measured), **Easy st5 @7290** (measured insensitive to the lock length — its
+  first collect mismatch stays at index 191 and ~38 frames late for locks of 60,
+  57 and 36, so it is an independent defect and not respawn timing at all), and
+  **Easy st6 @1628**, which is a *contact*
   mismatch — a bullet reaching the player at the wrong frame, not an item
   problem.
+- **Easy st4 @4536 is proven NOT to be an item-pipeline bug.** At frame 4513 a
+  SakuyaB bomb's full-screen clear (region `{x:226.774, y:195.009, radius:800}`)
+  converts 181 live enemy bullets into `cherry` items, all born `state:1`; from
+  there each item is an independent pure-pursuit curve (recompute
+  `vx,vy = cos/sin(atan2(dy,dx))*8`, step 8 px/frame) whose collect frame is a
+  pure function of its spawn position and the player path. All 181 are collected
+  in 4521..4546. The player path was verified input-synchronous — input 0x0025
+  first appears at 4531 and y steps +2.2 that same frame, 0x0085 at 4545 and x
+  steps that same frame — so there is no off-by-one on the player side.
+  An offline pursuit simulator fed the captured spawn positions and player path
+  reproduces all 181 engine collect frames with zero mismatches, which makes the
+  arithmetic decisive: against a box half-extent of 22 (12 grab + itemRadius/2),
+  reproducing the oracle's pattern requires item #6999 to be ~2.3 px FARTHER,
+  #7000 ~0.13 px farther, and some 4537-group item ~0.9-1.7 px CLOSER. The
+  directions are mixed, so **no uniform change to autocollect speed, box size,
+  item radius, or player offset can produce it** — the individual spawn
+  positions must differ, i.e. our enemy bullets were not exactly where the
+  original's were when the bomb cancelled them.
+  That makes this cell an upstream enemy-bullet position divergence that emitted
+  no AUX event until it moved one collect — precisely the "exact prefix is not
+  identical state" case AGENTS.md warns about. It needs a position-level oracle
+  (a native trace of the bullet pool at 4513), not more event-stream bisection.
+  Two further candidates were measured and refuted while establishing this: the
+  mid-pass `this.items` splice (zero mid-pass spawns and zero double visits in
+  4515-4550) and the f32 narrowing of the homing angle (dropping it leaves the
+  fixture passing and this cell unchanged, so the exe-cited narrowing stays).
 - **Phantasm (st7 @ 51989).** Exact for 51989 of 57876 frames — 565 kills,
   2739 collects, 23 contacts, 7 bombs and every border event. Boss sub 127's
   HP reaches 0 two frames early, i.e. ~2 HP of accumulated excess over a long

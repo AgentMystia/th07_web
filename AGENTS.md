@@ -682,12 +682,26 @@ comparisons against real play).
   cited 30.0 divisor (so the ramp is still mid-flight when control returns).
   REPLAY-VALIDATED, exe recheck pending — `reference/` was unavailable when it
   was found, so it is pinned by th7_udYo01's stage-2 (miss 8578) and stage-5
-  (miss 2205) respawns rather than by the disassembly: 60 ticks lands both
-  post-respawn collect bursts late, 55 reproduces them exactly, and 56-58 fix
-  the collects but still miss the stage-5 kill stream because the unlock re-arms
-  firing as well as movement. The squish stays 30 (all.c:28596 writes the miss
-  bit 30 frames before the life counter drops). See
-  `MATERIALIZE_EXIT_FRAMES` and tests/th07-deathbomb.test.mjs.
+  (miss 2205) respawns rather than by the disassembly. 55 is unique from BOTH
+  sides: at 54 stage 5's kill stream goes EARLY (2279), at 56 it breaks late
+  (2282), and only 55 reproduces stage 5's kills at 2282/2283 together with
+  stage 2's collect at 9104 — two independent cells, one constant. The margin at
+  stage 5's decisive collect is 0.141 px with the preceding non-event at
+  −1.415 px, so the constraint is tight and one-sided. Note the unlock must
+  re-arm FIRING as well as movement: freeing only `controllable` fixes the
+  collects and leaves the kill stream broken, because `Player.fire()` also
+  disarms the shot cycle while `materializeFrame >= 0`. The squish stays 30
+  (all.c:28596 writes the miss bit 30 frames before the life counter drops).
+  See `MATERIALIZE_EXIT_FRAMES` and tests/th07-deathbomb.test.mjs.
+  **Open sub-question:** 30 squish + 25 materialize (what is implemented) and
+  25 squish + 30 materialize are observationally identical on both cells. They
+  differ only in the frame of the respawn TELEPORT, which drives the 60-frame
+  silent enemy-bullet clear (`respawnClearFrames`, stage-scene.ts) — so the two
+  variants open that window 5 frames apart. Settle it if a later divergence
+  lands in a post-respawn bullet field. The implemented split is the one the
+  exe comment supports: its cited materialize threshold reads 0x1d (29) with
+  divisor 30.0, and 0x19 (25) is one nibble away, which would make the handoff
+  threshold and the ramp divisor two different constants.
 - `updateItems` is the last manager still walking the dense `this.items` array
   (`for (const it of this.items)`); enemies, player shots and enemy bullets all
   scan their fixed slot arrays the way the exe does. That difference is
