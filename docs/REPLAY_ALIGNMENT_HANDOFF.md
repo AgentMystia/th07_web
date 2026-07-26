@@ -123,6 +123,14 @@ hour:
   attached to wpid 0x20 and read stage `0` (still in the menu). This is the whole
   mechanism the PRE trace needs; what is unfinished is only the key schedule that
   walks Replay -> file -> stage -> mode, and stage != 0 is the check that it worked.
+  Two details that cost attempts here: winedbg appends `print` output to its
+  `Wine-dbg>` prompt, so do NOT anchor a grep to line start (pipe through
+  `tr '>' '\n'`); and reading 0x495e00 before a run has started gives 0, so use
+  stage (0x62583c) as the "am I in gameplay yet" probe, not the seed.
+  Measured state as of this session: `Down Down Down z` then `z z z` from the title
+  leaves stage at 0 — the schedule is NOT yet right. Iterate it against the stage
+  read (cheap: one launch, one attach) before spending a long trace run on it, and
+  check whether Z is even reaching the game as a confirm key under Wine.
 - **PCB only lists replays in its numbered slots**, so a third-party filename like
   `th7_udMt01.rpy` never appears in the Replay menu. Copy it to a slot name
   (`replay/th7_01.rpy`) BEFORE launching, or the list is empty and injected keys
