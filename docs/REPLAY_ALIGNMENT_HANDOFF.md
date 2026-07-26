@@ -699,11 +699,26 @@ enemy takes 96 net HP in that window, which at /7 is roughly 670 raw, against th
 ~780 the observed cadence supplies — the slack being `trunc` losses, and the
 numbers are self-consistent.
 
-So the surviving candidate is narrow: the shot INTERVAL or the shot COUNT per
-cycle differs slightly from native at this power level. Check the `interval` field
-of the relevant ply00bs level record against the observed 5-frame cycle, and the
-number of simultaneous contacts (2×d24 + 1×d15) against that level's record count.
-Both are data-side and readable without a native trace; neither has been checked.
+Checked, and the shot table is CORRECT — do not re-open this. Power at frame 5400
+is 36. `Sht.shotsForPower` selects with `power < level.power`, i.e. it treats each
+stored u32 as an EXCLUSIVE UPPER BOUND, so the nine thresholds
+8/16/32/48/64/80/96/128/999 give bands 0-7, 8-15, 16-31, **32-47**, 48-63, 64-79,
+80-95, 96-127, 128+ — exactly TH07's nine power bands, with 999 catching 128+.
+Power 36 falls in [32,48), whose ply00bs records are `iv5×d24, iv5×d24, iv5×d15`.
+That is precisely the observed cadence, interval and count.
+
+(A first pass here mislabelled the dump as `pw>=` minimums, which made power 36
+look like it should be firing the [32,48) row's neighbour — `iv5×d24, iv5×d24,
+iv6×d12` — and briefly looked like an off-by-one in level selection. It is not:
+the upper-bound reading is also what the eight passing cells validate, since power
+varies constantly across all of them.)
+
+So for Hard st1 the shot table, cadence, count, pool headroom, focus state, and
+the /7 settlement arithmetic are ALL confirmed correct, and the ~14-21 raw damage
+deficit over 5400-5462 is not explained by any of them. The remaining candidates
+are the ones a native per-frame trace exists to settle: enemy hitbox/position drift
+putting a marginal contact in or out, or an extra native damage source in this
+window that our sim never produces. Both need the v1.00b build.
 
 Concrete first checks, in order: whether BOTH ReimuB option orbs' needles register
 on that enemy (option shots are `orb=1`/`orb=2`, d7-d12, hitbox 12x40 at speed 22 —
