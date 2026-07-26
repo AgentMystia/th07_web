@@ -636,12 +636,28 @@ is pure player-shot damage.
 - RNG residue diverges (Δ29100), consistent with a long shot-count difference
   rather than a single mis-timed event.
 
-Twenty frames is one to two orders of magnitude above the noise floor of the
-1-frame cells (Hard st2, Easy st4/st6, Normal st6), which makes it far easier to
-attribute: it is a SUSTAINED damage deficit against ONE enemy, not a rounding or
-ordering boundary. If that enemy is the RNG-positioned midboss this stage is known
-for, twenty frames on a long HP pool is roughly a 10% DPS shortfall — the kind of
-gap a whole missing damage source produces, not a float epsilon.
+`--trace-damage 5400,5462` identifies the target precisely: **enemy slot 2, sub 20,
+`boss: true`, hitbox 32x48**, taking 38 hits across the window with HP 98 -> 2. It
+is in a SPELLCARD, so every settlement runs the /7 spell divisor, and the
+arithmetic reproduces exactly — raw 48 (two d24 main shots) -> `trunc(48/7)` = 6,
+so 98 -> 92; raw 15 -> `trunc(15/7)` = 2, so 92 -> 90; raw 48 -> 6, so 90 -> 84.
+The damage pipeline itself is confirmed working on this enemy.
+
+That divisor rescales the problem, and CORRECTS the "roughly a 10% DPS shortfall"
+estimate an earlier revision of this section gave. Under /7, twenty frames at this
+cadence is only about 2-3 points of NET HP, i.e. roughly 14-21 points of RAW
+damage across the whole window — one missing option-shot contact every few frames,
+not a systemic deficit. Small raw differences are amplified into whole frames by
+the division, which is exactly why this cell reads as a large gap while being a
+small cause. Budget the search accordingly: integrate raw damage per frame over
+5400-5462 and look for a handful of absent contacts, not for a missing damage
+source.
+
+One thing to rule out first: the traced shots carry `damage` 24 and 15, and
+neither value appears in the UNFOCUSED ply00b table (main 9/16/17/20/22/27/28/30/
+32/48, options 7/10/12/14). The focused table ply00bs was never dumped, so 24/15
+are most likely its values and this is a non-issue — but confirm that before
+reading anything into the numbers.
 
 Concrete first checks, in order: whether BOTH ReimuB option orbs' needles register
 on that enemy (option shots are `orb=1`/`orb=2`, d7-d12, hitbox 12x40 at speed 22 —
