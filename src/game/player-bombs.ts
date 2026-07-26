@@ -362,9 +362,20 @@ export class BombRunner {
   // 霊符「封魔陣」 unfocused — FUN_00408f10 (spec-bombs-reimu §5): a cross
   // through the cast point. Four slots reduce to two unique geometries —
   // a 62×448 vertical strip through cast X and a 384×62 horizontal strip
-  // through screen-center Y — continuously active at d16 (the exe's odd-
-  // frame write gating only halves the cosmetic position refresh).
+  // through screen-center Y — at d16, active from bomb frame 1 onward under the
+  // exe's odd-frame write gating (see below; an earlier reading of this routine
+  // called that gating cosmetic, which was wrong).
   private reimuBUnfocused(ctx: BombContext): void {
+    // FUN_00408f10's writes are odd-frame gated, and that gating is NOT merely a
+    // cosmetic position refresh as this comment previously claimed: slots persist
+    // until cleared (cf. marisaAUnfocused, which gates the same way on frame % 3),
+    // so gating the writes leaves frame 0 with NO live slot and every frame from 1
+    // on active. That one-frame deferral is exactly what the trigger frame needs —
+    // th7_udFi03 Hard st6 bombs at 1726, and the oracle's first cancel-item
+    // collect is 1728 while an ungated write clears bullets at 1726 and collects
+    // at 1727. It is character-local by construction, which is why the global
+    // gates tried in prepareBombEffects regressed ReimuA's Phantasm bombs.
+    if (ctx.frame % 2 !== 1) return;
     this.engine.set(0, this.castX, 224, 62, 448, 16);
     this.engine.set(1, 192, this.castY, 384, 62, 16);
     this.engine.set(2, this.castX, 224, 62, 448, 16);
