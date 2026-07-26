@@ -771,6 +771,7 @@ exactly at **0x43a8d5**, the shot-cycle constant §6 cites. `.text` is
 | state-2 (dying) clock | `player+0x16a08` vs `cmp 0x1e` @ 0x43e043 → `mov [+0x2408],0x1` @ 0x43e050 | ONE 30-tick clock from the HIT |
 | materialize clock | `cmp 0x1e` @ 0x43e24d → `mov [+0x2408],0x3` @ 0x43e256 | 30 ticks, not 25 |
 | bounds test | `IsInBounds` @ 0x42bdc7: `size / 2.0` (0x48eac0) vs `0.0` (0x48ea9c) and `384.0` (0x48eabc) | matches the `[0,384]` rect with HALF-extents |
+| enemy offscreen cull | calls the SAME `IsInBounds` @ 0x42bdc7 from 0x41f32a, plus the op138 trail-history check @ 0x41f39e | matches `updateEnemyCull`, so slot-vacate timing is right |
 | death-drop tween targets | `call 0x42ffc0` → `fmul 288.0` → `fadd 48.0` → `[+0x264]` @ 0x430adf, then `call 0x42ffc0` → `fmul 192.0` → `fsub 64.0` → `[+0x268]` @ 0x430afe | matches `spawnDeathDrop` exactly: X first, Y second, **exactly two draws per drop, no hidden third** |
 | ramp/spawn floats | `30.0` @ 0x48eb60, `64.0` @ 0x48eb68 | match the cited materialize divisor and spawn-Y offset |
 
