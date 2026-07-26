@@ -192,10 +192,37 @@ Find the pid by **`comm`**, never by cmdline: `[ -f /proc/$p/comm ] &&
 shell whose command line contains the string — `pkill -f Th07.exe` kills your own
 tool call (observed: exit 144 mid-script).
 
-`0x62583c` is NOT confirmed to be the stage variable. It read `4` while the game
-was demonstrably still on the title screen and did not track the menu cursor; the
-earlier identification in this document was never validated against a running
-game. Re-derive it by value-scan before relying on it.
+**Validated probe set** (read live from an Easy/ReimuA stage 1 started from the
+title — no replay needed, so this is re-verifiable today):
+
+| address | meaning | evidence |
+|---|---|---|
+| `0x625838` | per-stage FRAME counter | +61 per 1.0 s wall clock while playing; freezes on the continue prompt |
+| `0x62583c` | stage number | reads `1` in stage 1 |
+| `0x495e00` | live RNG state | `43986` → `59576`, non-monotonic |
+| `0x56ba80` | app uptime | keeps advancing even when the stage clock is frozen |
+
+Use `0x625838` as the "is gameplay advancing" probe and `0x56ba80` as the "is the
+app alive" probe — the pair distinguishes a hung game from a paused/continue-prompt
+one, which no single counter can. `0x62583c` really is the stage, but it is NOT a
+valid "am I in gameplay yet" test: it held `4` on the title screen, so a nonzero
+read does not imply a run has started. Test `0x625838` advancing instead. Two
+corrections to earlier notes here: `0x495e04` is not a per-frame draw counter (it
+went `0` → `22` across a whole run), and `0x4afe28` is a pointer
+(`61571112`), matching the `DAT_004afe28` recorder-context reading in
+`src/formats/rpy.ts`, not a frame counter.
+
+Locating an unknown counter is a two-snapshot delta scan: snapshot, `sleep 1`,
+snapshot, and keep dwords whose delta is 50..70. That returns ~12 candidates out
+of 2.5 MB, which is small enough to identify by neighbourhood (`0x625838` sits
+immediately before the stage number, so the stage-scene globals block starts
+there).
+
+Note the game plays fine with no input at all — the player just dies out and lands
+on the continue prompt after ~2600 frames. That is enough to exercise stage 1
+natively for free, but it is NOT a substitute for replay playback: a v1.00-recorded
+run tells you nothing about the drift cells, which live thousands of frames deep in
+stages 4-7.
 
 ### Driving the menus
 
