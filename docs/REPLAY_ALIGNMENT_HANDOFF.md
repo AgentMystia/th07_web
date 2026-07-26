@@ -116,6 +116,13 @@ hour:
   | /usr/lib/wine/wine winedbg` lists every Windows pid, which is how you get the
   handle to read `0x62583c` (stage), `0x4afe28` (frame), `0x495e00/04` (RNG) without
   launching under the debugger and slowing the game to a crawl.
+- **Native memory reads are verified working end to end.** With the game alive on
+  its own Xvfb display: get the wpid from `info proc`, then
+  `printf "attach 0x<pid>\nprint *(int*)0x62583c\ndetach\nquit\n" |
+  /usr/lib/wine/wine winedbg` prints the stage variable. Confirmed 2026-07-26 —
+  attached to wpid 0x20 and read stage `0` (still in the menu). This is the whole
+  mechanism the PRE trace needs; what is unfinished is only the key schedule that
+  walks Replay -> file -> stage -> mode, and stage != 0 is the check that it worked.
 - **PCB only lists replays in its numbered slots**, so a third-party filename like
   `th7_udMt01.rpy` never appears in the Replay menu. Copy it to a slot name
   (`replay/th7_01.rpy`) BEFORE launching, or the list is empty and injected keys
