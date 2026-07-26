@@ -504,6 +504,64 @@ within ~600-3000 frames of every stage. That cuts both ways — it means the cur
 timing is strongly validated by the eight passing cells, and it means this is a
 bad place to guess.
 
+### Bombs precede half the divergences — proximity map (2026-07-26)
+
+Built with `auxEventFrames(stage, RPY_AUX_BITS.bomb, 1)` against each cell's
+earliest diverging frame. **Bombs precede 7 of the 14 diverging cells**, several
+of them very closely, which is why the bomb forms are the highest-yield place to
+look right now. Focus state is read from bit `0x4` of the input word at the bomb
+frame and decides WHICH form ran.
+
+| cell | divergence | last bomb ≤ div | gap | cast |
+|---|---:|---:|---:|---|
+| Hard st2 | 7624 | 7621 | **3** | focused |
+| Hard st3 | 3092 | 3086 | **6** | unfocused |
+| Hard st5 | 2090 | 2076 | **14** | focused |
+| Hard st6 | 1791 | 1726 | 65 | unfocused |
+| Easy st6 | 1628 | 1569 | 59 | unfocused |
+| Normal st3 | 11863 | 11804 | 59 | focused |
+| Normal st4 | 18596 | 18532 | 64 | focused |
+| Hard st1 | 5440 | — (no bomb in stage) | | |
+| Hard st4 | 2360 | — (5 bombs, all later) | | |
+| Easy st5 | 7290 | — | | |
+| Normal st2 | 9104 | — (no bomb in stage) | | |
+| Normal st5 | 2320 | — (6 bombs, all later) | | |
+| Normal st6 | 2727 | — (16 bombs, all later) | | |
+| Phantasm st7 | 51989 | (7 bombs; first 10405) | | |
+
+The six cells with no preceding bomb cannot be bomb-timing bugs at all — do not
+spend bomb effort on Hard st1/st4, Easy st5, Normal st2/st5/st6.
+
+### ReimuB's two casts do NOT share the write cadence
+
+The odd-frame gate that fixed `reimuBUnfocused` (Hard st6 1727→1791, st3
+3087→3092, zero regressions) does **not** extend to `reimuBFocused`, even though
+FUN_004094e0 sits beside FUN_00408f10 and the two casts share the opening 2→6
+shake. Applying the same gate to the focused cast makes both focused-bomb cells
+WORSE — Hard st2 7624→7622 and Hard st5 2090→2077, everything else unchanged —
+so FUN_004094e0 really does publish its r256/d18 box every frame including frame
+0, as currently implemented. Both directions are now pinned by measurement:
+unfocused gated, focused ungated. Leave the focused cast alone.
+
+Corollary for Hard st2: with the focused box confirmed correct, whatever diverges
+3 frames after that bomb is NOT the bomb's attack-slot timing. Look at what else
+a cast does on its first frames (the `start()` path, the screen shake, the cherry
+drain deferral, `spawnBombEffects`' flagged approximations).
+
+### Refuted: SakuyaB unfocused freeze-pulse timing
+
+Easy st6's divergence at 1628 is a MISSING player contact (oracle has one, we do
+not; ours first appears at 1710) 59 frames into an unfocused SakuyaB Private
+Square cast at 1569. Since the AUX contact bit is set before the
+invulnerability gate, a bordered or invulnerable player still records it, so the
+natural theory is that we cleared or froze the contacting bullet early. Shifting
+`sakuyaBUnfocused`'s freeze pulses from bomb frames 0/60/120 to 1/61/121 leaves
+the matrix **byte-identical** — those pulses have no observable effect on any
+cell, so the path is ruled out rather than merely unhelpful. Note the routine also
+publishes NO bullet-clear regions when unfocused (only the damage box, gated to
+`frame >= 32 && frame % 4 === 0`), so there is no early-clear mechanism there to
+find. Easy st6 needs a different explanation for the missing contact.
+
 ### The upstream-drift family (three cells, and why events cannot close them)
 
 Easy st4, Easy st6 and Normal st6 have all now been measured to the same
