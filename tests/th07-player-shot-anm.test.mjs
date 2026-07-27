@@ -5,8 +5,18 @@
 // bullet slot is freed when its script ends (FUN_0043a290: FUN_0044aa20
 // nonzero → +0x34a = 0). These tests pin the data-side invariants the port
 // relies on: every shipped shooter record resolves to a real flight script,
-// every non-laser record has an impact script, and the impact scripts
-// self-remove (flight scripts never do).
+// every non-laser record has an impact script, and every impact script ENDS
+// on a short schedule while flight scripts never do.
+//
+// "Ends" has two authored spellings and the engine must honor both: op1
+// `remove` (Reimu/Sakuya impacts, 20-30f) and op2 `static` (ReimuB's orb
+// impacts 98-101 and MarisaA's missile impacts 97-104, 20-45f, authored at
+// the exact tick their fade reaches alpha 0). Flight scripts also end in
+// static, but at t=10000/20000 — unreachable, so a flying shot only ever
+// dies by bounds. Honoring remove alone left the static-ending impacts
+// squatting the fixed 96-slot pool for hundreds of frames, starving new
+// spawns (th7_udFi03 Hard stage 3: pool full at 96/96 across the dry
+// windows of a scripted x=40 descent, killing it 9 frames late).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
@@ -47,7 +57,7 @@ test('every shipped shooter record resolves to a real flight ANM script', () => 
   }
 });
 
-test('flight scripts persist; impact scripts self-remove on schedule', () => {
+test('flight scripts persist; remove-ending impact scripts self-remove on schedule', () => {
   // Flight scripts end in `static` — a bullet is culled by bounds, never by
   // its own script. 300 frames ≫ any on-screen flight time.
   const flight = new AnmRunner(ANMS.ply02, 64);
@@ -83,6 +93,72 @@ test('player-shot impact re-arm frees a t20 script after exactly 20 following ti
   assert.equal(impact.removed, false);
   impact.update();
   assert.equal(impact.removed, true);
+});
+
+test('static-ending impact scripts end on schedule without ever setting removed', () => {
+  // ReimuB's orb impacts (player00 98-101) and MarisaA's missile impacts
+  // (player01 97-104) close on op2 `static`, not op1 `remove`. Seeded like the
+  // production re-arm (StageScene sets runner.frame = 1 after FUN_004486e0
+  // consumed t=0), each must report script-over on its authored tick.
+  const cases = [
+    ['ply00', 98, 20], ['ply00', 99, 20], ['ply00', 100, 20], ['ply00', 101, 20],
+    ['ply01', 97, 20], ['ply01', 98, 20], ['ply01', 99, 20], ['ply01', 100, 20],
+    ['ply01', 101, 30], ['ply01', 102, 30], ['ply01', 103, 35], ['ply01', 104, 45]
+  ];
+  for (const [anmName, script, ticks] of cases) {
+    const impact = new AnmRunner(ANMS[anmName], script);
+    impact.frame = 1;
+    for (let i = 0; i < ticks - 1; i++) impact.update();
+    assert.equal(impact.stopped, false, `${anmName}/${script} ended before tick ${ticks}`);
+    impact.update();
+    assert.equal(impact.stopped, true, `${anmName}/${script} did not end on tick ${ticks}`);
+    // `static` never raises removed — the engine must treat both spellings of
+    // "script over" as the slot-release signal, or these squat the pool.
+    assert.equal(impact.removed, false, `${anmName}/${script} ends static, not remove`);
+  }
+});
+
+test('every shipped non-beam impact script ends within 64 ticks', () => {
+  // The 96-slot pool only recycles when a script ends, so an impact that
+  // neither removes nor goes static is an unbounded slot leak. This covers
+  // every character, including MarisaA, whose forms no replay exercises yet.
+  for (const name of SHT_FILES) {
+    const anm = ANMS[name.slice(0, 5)];
+    const sht = new Sht(TH07_DATA.sht[name]);
+    for (const power of POWERS) {
+      for (const shot of sht.shotsForPower(power)) {
+        if (shot.shotType === 4 || shot.shotType === 5) continue;
+        const script = shot.sprite - PLAYER_SPRITE_BASE + 0x20;
+        const runner = new AnmRunner(anm, script);
+        runner.frame = 1;
+        let ticks = 0;
+        while (!runner.removed && !runner.stopped && ticks < 64) {
+          runner.update();
+          ticks++;
+        }
+        assert.ok(runner.removed || runner.stopped,
+          `${name} p${power}: impact ${script} never ended in 64 ticks`);
+      }
+    }
+  }
+});
+
+test('flight scripts never end on their own within a full screen crossing', () => {
+  // Their authored `static` sits at t=10000/20000 — a flying shot is culled by
+  // bounds, never by its script. If one of these ever ended, the bounds cull
+  // would stop being the only exit and every shot lifetime would shorten.
+  for (const name of SHT_FILES) {
+    const anm = ANMS[name.slice(0, 5)];
+    const sht = new Sht(TH07_DATA.sht[name]);
+    for (const power of POWERS) {
+      for (const shot of sht.shotsForPower(power)) {
+        const runner = new AnmRunner(anm, shot.sprite - PLAYER_SPRITE_BASE);
+        for (let i = 0; i < 400; i++) runner.update();
+        assert.equal(runner.removed, false, `${name} p${power}: flight script removed itself`);
+        assert.equal(runner.stopped, false, `${name} p${power}: flight script ended itself`);
+      }
+    }
+  }
 });
 
 test('sakuya knife flight scripts carry the vanilla auto-rotate/alpha state', () => {

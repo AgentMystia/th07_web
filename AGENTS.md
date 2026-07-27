@@ -27,7 +27,15 @@ When sources conflict, higher wins:
 2. Approved modernizations (§3).
 3. Original data and executable in `reference/`: readable disassemblies in
    `reference/ECL7|DSTD7|MSG7|ANM7`, raw unpacked files in
-   `reference/th07-original/`, `reference/Th07.exe` (v1.00b) for Ghidra.
+   `reference/th07-original/`, `reference/Th07.exe` for Ghidra. **The binary
+   present is v1.00, not v1.00b** — build tag `"0100_"` at `.rdata` `0x48D230`,
+   title string `ver 1.00`, 607744 bytes, sha256 `1251458d…`. Every replay in
+   this tree was recorded on **v1.00b** (tag `"0100b"`, exe size 650752,
+   checksum `0xAEC5445C`, stored at image `+0xE0/+0xD8/+0xDC`). Cited decompile
+   addresses do resolve against the v1.00 binary, so static reads stay usable —
+   but it cannot play the replays (see docs/REPLAY_ALIGNMENT_HANDOFF.md) and a
+   build difference is an open, unfalsifiable-from-v1.00 hypothesis for residual
+   drift. Label new findings with the build actually inspected.
 4. Existing project implementation.
 5. External docs (thtk source, PyTouhou, priw8's sht-webedit docs, wikis) —
    cross-validation only, never sole authority. TH06 semantics are NOT
@@ -91,7 +99,8 @@ Every commit must satisfy ALL of:
    a build breaker.
 6. Nothing from `reference/` committed — no bytes, no long decompiled
    listings. Recovered *constants* with a provenance comment
-   (`// Th07.exe (v1.00b) @ 0x43cb30`) are fine and encouraged.
+   (`// Th07.exe (v1.00) @ 0x43cb30` — name the build you actually read; the
+   binary in `reference/` is v1.00, see §2) are fine and encouraged.
 7. `index.html` keeps working as a static page (esbuild IIFE bundle, no
    ESM imports at runtime, no dev-server-only paths).
 
@@ -202,6 +211,18 @@ Chromium at `/opt/pw-browsers/chromium-*/chrome-linux/chrome`; run
   fields, never from the CLI flags. `--chrome-major` pins the expected
   browser (148); `--allow-invalid-refresh` for non-144Hz rigs/Xvfb.
   `npm run perf:smoke -- desync=0` is the matching throughput control arm.
+  **Under Xvfb neither probe can adjudicate the desync default.** Measured
+  2026-07-26 on Playwright Chromium 141 under Xvfb: the granted-desync arm
+  reports steady p50 17.93 ms event-to-displayed while the `--no-desync`
+  control reports 9.54 ms — i.e. the control looks *better*. That is the same
+  accounting artifact as the draw-cost pitfall in §8: with the backbuffer,
+  `present()` flushes the batched raster inside the timed window, and Xvfb has
+  no real scanout (`refreshValid` null, hence the flag). Do not "fix" the
+  default from a headless number; the presentation default needs a real
+  desktop Chrome eyeball, per §3. `perf:smoke`'s cadence gate also fails on
+  BOTH this tree and pristine `314bdfb` here (p99 33-50 ms, ~120-130 vsync gaps
+  >25 ms) for the same reason — A/B against the merge-base before believing a
+  cadence regression, and prefer the cost rings, which are stable.
 
 Standard stage checkpoints (dev-shot frame → machine-checkable criteria):
 
@@ -440,7 +461,7 @@ Easy/Normal/Hard convergence. Lower ranks select different ECL instructions,
 formulas, bullet counts, and pool-pressure paths. Each difficulty still needs
 its own native replay PRE trace plus full event/end-state verification.
 
-### All-difficulty baseline (2026-07-25)
+### All-difficulty baseline (2026-07-26)
 
 Five further native replays cover every remaining difficulty. They are
 third-party recordings and stay **local evidence** under the git-ignored
@@ -455,31 +476,89 @@ matrix of PASS / earliest-diverging-frame:
 | th7_udHm54 | marisaB | **Extra** | — | — | — | — | — | — | **PASS** |
 | th7_udSg10 | reimuA | Phantasm | — | — | — | — | — | — | 51989 |
 | th7_udMt01 | sakuyaB | Easy | PASS | PASS | PASS | 4536 | 7290 | 1628 |— |
-| th7_udYo01 | sakuyaA | Normal | PASS | 8747 | 11863 | 18596 | 2280 | 2727 | — |
-| th7_udFi03 | reimuB | Hard | 5440 | 2165 | 537 | 2360 | 617 | 1330 | — |
+| th7_udYo01 | sakuyaA | Normal | PASS | 9104 | 11863 | 18596 | 2320 | 2727 | — |
+| th7_udFi03 | reimuB | Hard | 5440 | 7624 | 3087 | 2360 | 2090 | 1727 | — |
 
 Extra is fully converged (467 kills, 2064 collects, 4 contacts, 2 bombs,
 20 border starts, 2 border breaks — all frame-exact — plus an exact final
 score). Phantasm is exact for 51989 of 57876 frames; its boss spell (sub 127)
 dies two frames early, i.e. we are ~2 HP ahead over a long spellcard.
 
-Two structural facts to carry into any continuation:
+Three structural facts to carry into any continuation:
 
-- **`wine`/`winedbg` is not installed in the current environment**, so the
-  native PRE-trace procedure below cannot be run here. The AUX streams are
-  the substitute oracle. They are dense and frame-exact, but they are not
-  complete: an RNG or position divergence that happens to produce no AUX
-  event stays invisible until it changes one. Do not read "exact through
-  frame N" as "identical through frame N".
-- **ReimuB is the only shot type with no passing stage in any replay**, and
-  it is the only one that saturates the 96-slot player-shot pool: measured
-  at Hard stage 3, the pool is full on 28 of 140 sampled frames with 12-33
-  slots held by spent (post-impact) sprites. Every ReimuB divergence
-  measured so far is a kill landing a few frames LATE, never early, i.e. we
-  deal slightly less damage. Under saturation the impact-sprite lifetime and
-  the offscreen cull directly set live-shot count and therefore DPS, so an
-  error there that is invisible for Sakuya/Marisa/ReimuA becomes a DPS error
-  for ReimuB. Investigate that before anything else on Hard.
+- **Wine runs the game here; the native PRE trace is blocked on the BINARY, not
+  the tooling.** Verified 2026-07-26: Wine 9.0 + i386 Mesa GL runs `Th07.exe`
+  under Xvfb at a steady 60 fps, `xdotool` drives the menus, and native globals
+  read straight out of `/proc/<pid>/mem` (the PE maps at 0x400000 — no debugger
+  needed, and this supersedes the old winedbg recipe). What blocks the trace is
+  that `reference/Th07.exe` is **v1.00** while every replay records **v1.00b**;
+  the loader's build-fingerprint gate rejects all six, so the Replay list comes
+  up empty. Needed: a Th07.exe of exactly **650752 bytes**, tag `"0100b"`. Do
+  not patch the gate out — a v1.00 trace measures neither the build that
+  recorded the replays nor the build the port targets. Full recipe, gotchas
+  (held keypresses, PointerRoot focus, locked-entry skipping) and the failure
+  signatures are in docs/REPLAY_ALIGNMENT_HANDOFF.md. Until a trace is acquired the AUX streams
+  remain the working oracle; they are dense and frame-exact but NOT complete, so
+  an RNG or position divergence producing no AUX event stays invisible until it
+  changes one. Do not read "exact through frame N" as "identical through
+  frame N" — and note the upstream-drift cells are provably not closable from
+  event streams at all, so they are what the traces are for.
+- **Every stage that currently PASSes records zero player misses.** Read that
+  off the `--json` report's `alignment.misses.oracle` before touching anything
+  in the death/respawn path: it means that whole path is unvalidated by the
+  converged replays, so a change there cannot regress them — and equally, that
+  it was free to be wrong for a long time. The 55-tick post-miss control lock
+  (§7) was found exactly there.
+- **Divergence families, as measured on 2026-07-26.** The cells split by
+  whether an oracle miss precedes the divergence (`auxEventFrames(stage,
+  RPY_AUX_BITS.playerMiss)` needs no simulation to check). Post-respawn cells
+  showed one shared signature — the first collect after a respawn landing LATE
+  — which the 55-tick lock resolved for Normal st2/st5 and did not for Normal
+  st6 or Easy st5 (Easy st5 is 39 frames late, far more than the lock can
+  explain, so it carries a second cause). Cells with no preceding miss
+  (Hard st1/st2, Easy st4, Normal st3/st4, Phantasm) are a separate family and
+  must not be attributed to respawn timing.
+
+Hypotheses measured and **refuted** on 2026-07-26 — do not re-derive these
+without new evidence:
+
+- *ReimuB's unfocused bomb publishing four attack slots for two unique
+  geometries doubles its damage.* Publishing one pair per frame (16 dmg/frame
+  instead of 32) left Hard st2 7624, st3 3087, st5 2090 and st6 1727 completely
+  unchanged, and the oracle's own stage-3 kill at 3086 is what 32 dmg/frame
+  reproduces (enemy hp 26 → −6). The four-slot model stands.
+- *The item collect test should use the player's precomputed (pre-move) grab
+  corners.* That broke the committed fixture at stage-1 frame 796 and moved
+  Easy st4 from 4536 to 638. The live post-move centre is correct; native's
+  corner cache must be written after its own movement integration.
+- *A mid-pass `this.items` splice is what shifts the Easy/Normal collect
+  bursts.* Instrumenting the pass over Easy st4 frames 4515-4550 found zero
+  spawns during the item pass and zero items visited twice. The hazard is real
+  in principle (see §7) but is not the cause of those divergences.
+- *The item homing angle should not be narrowed to f32.* Dropping the
+  `Math.fround` around its `atan2` left the fixture passing and Easy st4
+  unchanged — no evidence either way, so the exe-cited narrowing stays.
+- *The enemy offscreen cull should test the pre-integration position* (proposed
+  to explain the oracle's two consecutive stage-3 kill bits at 3086/3087 as two
+  slot-vacates one frame apart). Culling on the previous position broke the
+  fixture at stage-1 frame 1775 and moved Hard st3 backwards to 2649. The
+  post-integration order in `updateEnemies` is correct.
+- *The Easy st4 collect burst is a lerp-completion problem.* Running the
+  spawn-mode-2 tween's lerp at elapsed 60 (so an item lands on its exact target
+  rather than stopping at t=59/60) does not move Normal st6, the cell where death
+  drops actually decide a collect.
+- *Effect 6's non-Lunatic ring values are wrong because they look
+  non-monotonic* (`difficulty < 3 ? 4 : 2` bullets at π/6 vs π/2 — easier ranks
+  getting MORE bullets). They are correct. A converged **stage** validates a
+  difficulty branch just as a converged replay does, and the passing Easy st3
+  fires that exact arm 32 times; the passing Lunatic st3 fires the `>= 3` arm 96
+  times. A sweep of six candidate (count, spread) pairs against Normal st3 also
+  made every alternative worse — `(2, π/6)` 8306, `(2, π/2)` 8290, `(4, π/2)`
+  7617, versus `(4, π/6)` 11863. Such sweeps are risk-free for the converged rows,
+  since the fixture (d3) and Extra (d4) both take the `>= 3` arm.
+  Corollary worth reusing: instrument the gated sites and count firings per stage
+  to build a coverage map before suspecting any difficulty branch — effect 8 and
+  effects 12/21 are the only ones still unexercised anywhere.
 
 ### Next-session fidelity workflow
 
@@ -524,6 +603,22 @@ Each also has an inline comment at its code site. Do not silently "fix"
 gameplay to taste — improve these only with better evidence (Ghidra, frame
 comparisons against real play).
 
+- **ReimuB unfocused bomb runs at a 50% duty cycle — empirical fit, exe grounding
+  UNCONFIRMED** (`reimuBUnfocused`, src/game/player-bombs.ts). `if (ctx.frame % 2
+  !== 1) return;` before the four slot writes. Replay-validated: th7_udFi03 Hard
+  st6 1727 → 1791 and st3 3087 → 3092 with all 22 cells otherwise byte-identical,
+  336 tests green, perf unchanged. But the "odd-frame write gating" the previous
+  comment attributed to the exe could NOT be located: FUN_00408f10
+  (0x408f10-0x4093c0) has the frame-0 init, a frame-60 shake, four unconditional
+  `call 0x43e730` clear-region allocations with exactly our geometries, and the
+  attack-slot loop — no parity test anywhere. ZunTimer::HasTicked, the one
+  documented per-tick gate, is always true at rate 1 and cannot produce it.
+  Re-derive or delete this the moment FUN_00408f10 can be read against a v1.00b
+  build; do not build further inference on it. Verified correct alongside it and
+  needing no change: all twelve forms call FUN_00431d10 (force-collect) on bomb
+  frame 0, matching our unconditional `forceCollectAllItems()`; and every readable
+  per-form duration at +0x16a28 matches `BOMB_PARAMS` exactly (reimuB 140/190,
+  marisaA 200/260, marisaB 300/340, sakuyaA 160/250, sakuyaB 160/300).
 - Frame tiling positions (exact-fit math, engine placement not literal).
 - HUD star icon x positions; spell-timer and fps exact placement.
 - Cherry+ banner interrupt→state mapping (dim=charging, bright=border).
@@ -537,7 +632,16 @@ comparisons against real play).
   exact VM spawns. Per-form spawn cadence/orb motion are from specs
   spec-bombs-{shared,reimu,marisa,sakuya}.md.
 - Player shots run per-shot ANM VMs (SHT `sprite` = global script id; impact
-  re-arms `sprite+0x20`; bullet dies when its script ends). MarisaB's two
+  re-arms `sprite+0x20`; bullet dies when its script ends — **both spellings of
+  "ends" count**: op1 `remove` and op2 `static`/running off the end. ReimuB's
+  orb impacts (player00 98-101) and MarisaA's missile impacts (player01 97-104)
+  close on `static` at 20-45f, exactly where their fade reaches alpha 0; honoring
+  only `remove` left those invisible slots squatting the fixed 96-slot pool, and
+  `firePlayerBullets` drops new spawns when the pool is full. Flight scripts also
+  end `static`, but at t=10000/20000 — unreachable, so a flying shot still dies
+  only by bounds. MarisaA's forms are exercised by no replay: the shape is pinned
+  data-side by tests/th07-player-shot-anm.test.mjs, not by a converged run.)
+  MarisaB's two
   persistent-laser forms (3-slot tracker, beam-history ring, helper boxes)
   and MarisaA's repeat-hit missile explosion are implemented. See
   spec-marisab-beams.md / exe-player-funcs1.md.
@@ -645,6 +749,102 @@ comparisons against real play).
 - Ghost runs remain diagnostic-only. Dialogue, death consequences and manager
   lifetime can change how long ambient generators run, so only a no-ghost
   original replay establishes acceptance. `replay:verify` enforces this.
+- Post-miss control lock: 55 ticks, as 30 squish + a materialize that hands off
+  to the invuln window after **25** ticks while its scale/alpha ramp keeps the
+  cited 30.0 divisor (so the ramp is still mid-flight when control returns).
+  REPLAY-VALIDATED, exe recheck pending — `reference/` was unavailable when it
+  was found, so it is pinned by th7_udYo01's stage-2 (miss 8578) and stage-5
+  (miss 2205) respawns rather than by the disassembly. 55 is unique from BOTH
+  sides: at 54 stage 5's kill stream goes EARLY (2279), at 56 it breaks late
+  (2282), and only 55 reproduces stage 5's kills at 2282/2283 together with
+  stage 2's collect at 9104 — two independent cells, one constant. The margin at
+  stage 5's decisive collect is 0.141 px with the preceding non-event at
+  −1.415 px, so the constraint is tight and one-sided. Note the unlock must
+  re-arm FIRING as well as movement: freeing only `controllable` fixes the
+  collects and leaves the kill stream broken, because `Player.fire()` also
+  disarms the shot cycle while `materializeFrame >= 0`. The squish stays 30
+  (all.c:28596 writes the miss bit 30 frames before the life counter drops).
+  See `MATERIALIZE_FRAMES` / `DEATH_STATE_FRAMES` and
+  tests/th07-deathbomb.test.mjs.
+  **Settled 2026-07-26 — this sub-question is closed.** The old "30 squish + 25
+  materialize vs 25 + 30" framing was wrong on both counts: `MATERIALIZE_EXIT_FRAMES
+  = 25` was a Sakuya-fitted constant, not an exe value, and it no longer exists.
+  Both phases are 30 (`cmp 0x1e` @ 0x43e24d -> state 3 @ 0x43e256 for materialize;
+  player+0x16a08 vs `cmp 0x1e` @ 0x43e043 for the death state), and state 2 is a
+  SINGLE 30-tick clock started at the hit, so the post-miss lock is `61 −
+  deathbombWindow` rather than two stacked phases — which is why the per-character
+  windows (Reimu 15, Marisa 8, Sakuya 6) give 46/53/55. Verified on v1.00; see the
+  provenance note under the exe-constants table below.
+- `updateItems` is the last manager still walking the dense `this.items` array
+  (`for (const it of this.items)`); enemies, player shots and enemy bullets all
+  scan their fixed slot arrays the way the exe does. That difference is
+  observable in principle — `collectItem` can spawn items mid-pass (a power
+  pickup crossing 128, or `fullPower`, runs `cancelBulletsToItems`, one
+  `spawnItem` per live bullet), and `insertByPoolSlot` splices into the array the
+  `for…of` is walking, so an insert below the cursor re-visits the current entry
+  and ticks new low-slot items a native ascending scan would skip.
+  **Resolved 2026-07-26: `updateItems` now scans `itemSlots` ascending**, like the
+  other four managers, and calls `syncItemSlots()` at its head so the invariant
+  holds no matter which entry path reached it (focused unit harnesses call
+  `updateItems()` directly with only the dense array populated). Landed WITHOUT a
+  converging witness, which is the exception to §7's usual bar and is recorded as
+  such: the full matrix is byte-identical before and after (so the double-visit
+  provably never fires at any current divergence frame — consistent with the
+  earlier Easy st4 refutation), the suite stays green, and `update` p50/p95/p99
+  are unchanged (~1050 extra null checks/frame is microseconds; a first reading of
+  p99 1.5 ms was noise — repeats gave 0.9/1.1 ms against a 1.0 ms baseline). It is
+  a structural-fidelity fix, not a convergence fix: do not credit it with moving
+  any cell, and do not expect reverting it to move one either.
+
+### Exe-verified damage/death constants (2026-07-26, Th07.exe **v1.00**)
+
+Verified directly with `objdump -d -M intel -b pei-i386 reference/Th07.exe` after
+the original was made available locally. Cited addresses map directly: `.text` is
+0x401000..0x482638, `cmp DWORD PTR [ebp-0x14],0x1e` sits exactly at **0x43a8d5**
+(the shot-cycle constant §6 cites), and `FUN_0043a820 / 0043a290 / 0044aa20 /
+004402d0 / 0043e890 / 0043eb00` are all exact prologues — so the layout agrees
+with the decompile this tree was built from.
+
+Provenance correction: this binary is **v1.00** (tag `"0100_"`), not the v1.00b
+originally recorded here, while all six replays were recorded on v1.00b. The
+table below is therefore v1.00-verified with a v1.00b recheck pending. The
+findings it drove were independently corroborated by the replay matrix (6 cells
+improved, zero regressions, full suite green), so they stand on two legs, not
+one — but do not re-cite them as v1.00b.
+
+| fact | site | verdict |
+|---|---|---|
+| damage cap 70 | `cmp [ebp-0x40],0x46` / `mov ...,0x46` @ 0x41f94f | matches `min(70, …)` |
+| spell divisor | `cmp [ebp-0x18],0x7` / `jle` @ 0x41fac6, `idiv 7` @ 0x41fad5, else `mov 1` @ 0x41fae2 | matches `dmg >= 8 ? trunc(dmg/7) : dmg > 0 ? 1 : 0` **including the min-1 floor** |
+| ReimuA stage reduction | stage compare `ds:0x62583c` vs 5/6 then `sar 1` @ 0x41f9da-0x41fa07; vs 4 @ 0x41fa0c | matches the /2 and 11/16 arms |
+| state-2 (dying) clock | `player+0x16a08` vs `cmp 0x1e` @ 0x43e043 → `mov [+0x2408],0x1` @ 0x43e050 | ONE 30-tick clock from the HIT |
+| materialize clock | `cmp 0x1e` @ 0x43e24d → `mov [+0x2408],0x3` @ 0x43e256 | 30 ticks, not 25 |
+| bounds test | `IsInBounds` @ 0x42bdc7: `size / 2.0` (0x48eac0) vs `0.0` (0x48ea9c) and `384.0` (0x48eabc) | matches the `[0,384]` rect with HALF-extents |
+| enemy offscreen cull | calls the SAME `IsInBounds` @ 0x42bdc7 from 0x41f32a, plus the op138 trail-history check @ 0x41f39e | matches `updateEnemyCull`, so slot-vacate timing is right |
+| death-drop tween targets | `call 0x42ffc0` → `fmul 288.0` → `fadd 48.0` → `[+0x264]` @ 0x430adf, then `call 0x42ffc0` → `fmul 192.0` → `fsub 64.0` → `[+0x268]` @ 0x430afe | matches `spawnDeathDrop` exactly: X first, Y second, **exactly two draws per drop, no hidden third** |
+| ramp/spawn floats | `30.0` @ 0x48eb60, `64.0` @ 0x48eb68 | match the cited materialize divisor and spawn-Y offset |
+
+The bounds entry matters for the Hard group: the player-shot offscreen cull is
+confirmed correct, so it is not the residual ReimuB DPS suspect.
+
+**Taken together these verifications localize what is left.** The damage pipeline
+(cap, spell divisor with its min-1 floor, ReimuA stage reductions), the shot
+bounds cull, the death/respawn clocks and the death-drop target draws are now all
+confirmed to match the executable. None of the open cells is an arithmetic or
+constant bug. What remains is accumulated state divergence — the wrong RNG
+position or a slightly wrong entity position at the moment a formula is applied —
+which is invisible to the AUX streams until it moves an event. That is what the
+Wine PRE traces are for; see the upstream-drift section of the handoff doc.
+
+The last two together are why the post-miss control lock is **61 − deathbombWindow**
+(Reimu 46, Marisa 53, Sakuya 55) rather than a flat 55 — the deathbomb window burns
+the front of the shared state-2 clock. An earlier revision fitted the Sakuya answer
+to every character because only Sakuya replays record a death.
+
+Consequence for the open cells: the Phantasm kill arithmetic is now *confirmed
+correct* (raw 88 → cap 70 → `trunc(70/7)` = 10, killing a 10-hp boss), so that
+divergence is upstream of the damage formula, not in it. Do not go looking for a
+cap or divisor bug there.
 
 ## 8. Pitfall catalog (check these FIRST when something looks wrong)
 
@@ -757,7 +957,7 @@ acceptance criteria, or when two of them share a file.
 
 ### Ghidra RE workflow (repeatable)
 
-1. `reference/Th07.exe` (PE32, v1.00b). Install headless Ghidra (JDK 17+,
+1. `reference/Th07.exe` (PE32; the copy present is v1.00 — see §2). Install headless Ghidra (JDK 17+,
    `analyzeHeadless <proj> th07 -import Th07.exe`), or radare2 as
    fallback.
 2. Anchor by immediates (e.g. 0xC350=50000, 0x21C=540) or IEEE-754 float

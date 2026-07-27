@@ -3028,8 +3028,14 @@ export class StageScene implements GameHost {
       }
       // Th07.exe FUN_0043a290: both fired and collided slots keep integrating
       // velocity (× the global rate) every frame; the per-shot ANM VM ticks
-      // alongside and the bullet dies when its script removes itself (impact
-      // scripts end in remove(); flight scripts end in static and never do).
+      // alongside and the bullet dies when its script ENDS (FUN_0044aa20
+      // returns nonzero → +0x34a = 0). A script ends by op1 remove OR by
+      // running out — op2 static / the 0xffff sentinel. ReimuB's impact
+      // scripts 98-101 and MarisaA's 97-104 end static (alpha already faded
+      // to 0), NOT remove; treating only remove() as death left those spent
+      // impacts squatting the 96-slot pool for hundreds of frames
+      // (th7_udFi03 Hard: 12-33 spent slots, spawns dropped, kills late).
+      // Flight scripts end static at t=10000/20000 — unreachable on screen.
       // FUN_0043a290 @ all.c:27472-27475 stores each rate-scaled add back
       // into the slot's float32 position fields. Per-tick f32 rounding is
       // observable at long-window id5 collision boundaries (Stages 2/3).
@@ -3043,7 +3049,7 @@ export class StageScene implements GameHost {
         b.fadePending = false;
       }
       b.runner.update(rate);
-      if (b.runner.removed) {
+      if (b.runner.removed || b.runner.stopped) {
         b.dead = true;
       } else if (b.shotType !== 4 && b.shotType !== 5) {
         // Player::UpdateShots (0x0043d2f0) culls with the shot VM's LIVE
@@ -4526,7 +4532,28 @@ export class StageScene implements GameHost {
       (p.power >= 128 || this.difficulty > 3)
       && p.y < sht.pocLineY;
     const rate = Math.fround(this.slowRate);
-    for (const it of this.items) {
+    // ItemManager::OnUpdate scans its FIXED slot array ascending (FUN_00430c10
+    // walks all ITEM_POOL_CAP physical slots and tests each one's +0x27d
+    // occupancy byte); it never walks a compacted list. Walking the dense array
+    // here let a mid-pass spawn — collectItem -> power crossing 128 or a border
+    // latch -> cancelBulletsToItems -> spawnItem -> insertByPoolSlot — splice()
+    // into this.items at an index at or below the live iterator position, and
+    // for...of then hands back the CURRENT item a second time: it integrates
+    // twice and gets a second collect test within one frame, so a marginal
+    // pickup lands one frame early. The slot scan reproduces all three native
+    // properties instead: every slot is visited at most once per pass, a spawn
+    // into a LOWER slot waits for the next frame, and a spawn into a HIGHER
+    // slot — including one reusing a slot vacated earlier in this same pass by
+    // the y>=464 cull below — is still ticked now.
+    // The pass is driven off the slot array, so establish the invariant here
+    // rather than relying on the caller: syncFixedPools() does it once per tick
+    // for the live scene, but focused unit harnesses call updateItems() directly
+    // with only the dense array populated. slotsConsistent() is allocation-free
+    // and early-returns, so the steady-state cost is one walk of the live items.
+    this.syncItemSlots();
+    for (let slot = 0; slot < ITEM_POOL_CAP; slot++) {
+      const it = this.itemSlots[slot];
+      if (it === null || it === undefined) continue;
       it.age++;
       if (it.state === 2 && it.tween) {
         // Spawn-mode-2 positional tween (death drops): pos = lerp(origin,

@@ -179,15 +179,29 @@ export const SPAWN_X = 192;
 // y = fieldH - 64 (Init: DAT_00625850 - 64.0 @ 0x43f38a, 64.0 = rdata
 // 0x48eb68); fieldH = 448 -> 384.
 export const SPAWN_Y = 384;
-// fcn.0043e170: materialize ramps over 30 frames (threshold 0x1d, divisor
-// 30.0 = rdata 0x48eb60); at frame 30 it hands off to a 240-frame (0xf0)
-// invuln window (fcn.0043e2e0).
+// fcn.0043e170: materialize ramps scale/alpha on a 30.0 divisor (rdata
+// 0x48eb60) before handing off to a 240-frame (0xf0) invuln window
+// (fcn.0043e2e0).
+// The handoff to the invuln window is at 30 too, confirmed in Th07.exe v1.00b:
+// `cmp DWORD PTR [ebp-0x10],0x1e` / `jl` at 0x43e24d, then
+// `mov BYTE PTR [eax+0x2408],0x3` — state 1 -> state 3 once the timer reaches 30.
 const MATERIALIZE_FRAMES = 30;
 const SPAWN_INVULN_FRAMES = 240;
-// fcn.0043dca0 (+0x23f8==0 branch): after the deathbomb window lapses, a
-// 30-frame in-place death squish (scaleX 1->0, scaleY 1->4) plays BEFORE the
-// respawn teleport + materialize.
-const DEATH_SQUISH_FRAMES = 30;
+// fcn.0043dca0: state 2 (dying) runs on ONE 30-tick clock started at the HIT,
+// not a deathbomb window followed by a separate 30-frame squish. Th07.exe v1.00b
+// reads that clock from player+0x16a08 and exits at
+// `cmp DWORD PTR [ebp-0x14],0x1e` / `jl` @ 0x43e043, writing
+// `mov BYTE PTR [eax+0x2408],0x1` (state 1, materialize) @ 0x43e050.
+//
+// The consequence is the part a fixed constant gets wrong: the deathbomb window
+// burns the FRONT of this clock, so the squish that follows the miss is
+// 31 - deathbombWindow and the whole post-miss control lock is 61 - window —
+// Reimu 46, Marisa 53, Sakuya 55. An earlier revision here hard-coded the
+// Sakuya answer (55) for every character because only Sakuya replays exercised
+// it; th7_udYo01's stage-2 (miss 8578) and stage-5 (miss 2205) respawns still
+// pin that 55, and this rule reproduces them while deriving the other two
+// characters from the executable instead of from a fit.
+const DEATH_STATE_FRAMES = 30;
 
 export class Player {
   x = SPAWN_X;
@@ -251,10 +265,15 @@ export class Player {
   // Exe player state 2 while the meter is still nonzero: hit taken, the
   // deathbomb window is running. A hit never reloads the meter.
   hitState = false;
-  // -1 when idle; 0..DEATH_SQUISH_FRAMES during the post-death squish (exe
+  // -1 when idle; 0..DEATH_STATE_FRAMES during the post-death squish (exe
   // state 2 with meter==0, fcn.0043dca0): scaleX=1-t, scaleY=1+3t, in place
   // at the death loc. Advances on the global split counter (FUN_00436acc).
   dyingFrame = -1;
+  // exe player+0x16a08: ONE state-2 clock, started at the hit and handing off to
+  // the materialize at >= 30 (`cmp DWORD PTR [ebp-0x14],0x1e` @ 0x43e043). The
+  // deathbomb window burns the FRONT of it, so the post-miss squish is
+  // 31 - deathbombWindow, not a fixed 30.
+  deathStateFrame = 0;
   // -1 when idle; 0..MATERIALIZE_FRAMES during the respawn materialize (exe
   // state 1, fcn.0043e170): scaleX=t, scaleY=3-2t, alpha=t, t=frame/30.
   // Advances on the global split counter like the squish.
@@ -327,7 +346,7 @@ export class Player {
   // otherwise scaleX=1-t, scaleY=1+3t (fcn.0043dca0), t=frame/30.
   dyingTransform(): { scaleX: number; scaleY: number } | null {
     if (this.dyingFrame < 0) return null;
-    const t = this.dyingFrame / DEATH_SQUISH_FRAMES;
+    const t = this.dyingFrame / DEATH_STATE_FRAMES;
     return { scaleX: 1 - t, scaleY: 1 + 3 * t };
   }
 
@@ -375,10 +394,11 @@ export class Player {
     }
     if (this.materializeFrame >= 0) {
       // Respawn materialize (fcn.0043e170): ramp scale/alpha IN PLACE over 30
-      // simulation ticks (split counter), then enter the 240-tick invuln
-      // window. No movement/firing. The exe zeroes the deathbomb meter every
-      // state-1 frame (0x43e237) and reseeds it from the SHT at the
-      // state-1 -> state-3 handoff (0x43e2c7).
+      // ticks (split counter), then hand off to the 240-tick invuln window —
+      // `cmp 0x1e` @ 0x43e24d writing state 3 @ 0x43e256. No movement or firing
+      // until that handoff. The exe zeroes the
+      // deathbomb meter every state-1 frame (0x43e237) and reseeds it from the
+      // SHT at the state-1 -> state-3 handoff (0x43e2c7).
       this.deathbombMeter = 0;
       this.materializeFrame += rate;
       if (this.materializeFrame >= MATERIALIZE_FRAMES) {
@@ -689,6 +709,7 @@ export class Player {
     // window length is whatever the persistent meter currently holds (a
     // recent late deathbomb leaves a shortened window).
     this.hitState = true;
+    this.deathStateFrame = 0;
     return 'deathbomb-window';
   }
 
@@ -699,25 +720,30 @@ export class Player {
   // when it finishes, returns 'respawn' once. 'none' when idle. A
   // successful bomb (tryBomb) leaves the hit state and cancels the miss.
   tickDeath(rate = 1): 'effects' | 'respawn' | 'pending' | 'none' {
+    if (!this.hitState && this.dyingFrame < 0) return 'none';
+    // All of state 2 rides ONE clock (exe player+0x16a08 against the 0x1e
+    // compare at 0x43e043): test the threshold on the value this frame started
+    // with, then advance. Reaching 30 hands off to the materialize no matter how
+    // much of the window the deathbomb meter consumed, which is why the squish
+    // that FOLLOWS the miss is 31 - deathbombWindow (Reimu 16, Marisa 23,
+    // Sakuya 25) rather than a flat 30.
+    if (this.deathStateFrame >= DEATH_STATE_FRAMES) {
+      this.dyingFrame = -1;
+      this.hitState = false;
+      return 'respawn';
+    }
+    let result: 'effects' | 'pending' = 'pending';
     if (this.hitState) {
       this.deathbombMeter--;
       if (this.deathbombMeter <= 0) {
         this.deathbombMeter = 0;
         this.hitState = false;
-        this.dyingFrame = 0; // begin the death squish
-        return 'effects';
+        this.dyingFrame = 0; // the squish is the remainder of this same clock
+        result = 'effects';
       }
-      return 'pending';
     }
-    if (this.dyingFrame >= 0) {
-      this.dyingFrame += rate;
-      if (this.dyingFrame >= DEATH_SQUISH_FRAMES) {
-        this.dyingFrame = -1;
-        return 'respawn';
-      }
-      return 'pending';
-    }
-    return 'none';
+    this.deathStateFrame += rate;
+    return result;
   }
 
   tryBomb(): boolean {

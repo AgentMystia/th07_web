@@ -362,9 +362,35 @@ export class BombRunner {
   // 霊符「封魔陣」 unfocused — FUN_00408f10 (spec-bombs-reimu §5): a cross
   // through the cast point. Four slots reduce to two unique geometries —
   // a 62×448 vertical strip through cast X and a 384×62 horizontal strip
-  // through screen-center Y — continuously active at d16 (the exe's odd-
-  // frame write gating only halves the cosmetic position refresh).
+  // through screen-center Y — at d16, live every OTHER frame (see below).
   private reimuBUnfocused(ctx: BombContext): void {
+    // replay-validated (th7_udFi03 Hard st6 1727 -> 1791, st3 3087 -> 3092, every
+    // other cell byte-identical), EXE GROUNDING UNCONFIRMED — see AGENTS.md §7.
+    //
+    // Effect: the cross runs at a 50% duty cycle. Because FUN_0043d8f0 zeroes
+    // dims.x on all 112 entries every player tick (BombEngine.beginFrame), a slot
+    // not REWRITTEN this frame is not live this frame, so gating the writes halves
+    // both the damage frames and the bullet-clear frames. marisaAUnfocused models
+    // the same shape on frame % 3.
+    //
+    // Honest provenance, because two earlier readings of this routine were wrong.
+    // The note this replaced claimed "the exe's odd-frame write gating only halves
+    // the cosmetic position refresh". I could NOT locate that gating: disassembling
+    // FUN_00408f10 (0x408f10-0x4093c0) shows the frame-0 init, a frame-60 (0x3c)
+    // shake, then four unconditional `call 0x43e730` bullet-clear allocations with
+    // exactly these geometries (62x448 twice, 384x62 twice) and a 4-iteration loop
+    // that writes the attack slots at stride 0x20 — with no `and 1`, `idiv`, `sar`
+    // or other parity test anywhere in the routine. The one per-tick gate that IS
+    // documented for these forms is ZunTimer::HasTicked (see BombContext.hasTicked),
+    // which is rate-dependent and always true at rate 1, so it cannot produce this.
+    //
+    // So treat the 50% duty as an empirical fit that happens to converge two cells
+    // with zero regressions, NOT as decoded behavior. It is a prime candidate to
+    // re-derive (or delete) the moment FUN_00408f10 can be read against the v1.00b
+    // build the replays were recorded on. Do not build further inference on it.
+    // Measured non-extension: applying the same gate to reimuBFocused below, or
+    // merely skipping its frame 0, makes Hard st2 and st5 worse.
+    if (ctx.frame % 2 !== 1) return;
     this.engine.set(0, this.castX, 224, 62, 448, 16);
     this.engine.set(1, 192, this.castY, 384, 62, 16);
     this.engine.set(2, this.castX, 224, 62, 448, 16);

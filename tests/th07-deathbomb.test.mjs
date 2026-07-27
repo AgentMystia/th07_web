@@ -143,14 +143,18 @@ test('meter is wall-clock under slowmo; squish and materialize ride the split co
     if (frame(p, { rate: 0.5 }).death === 'effects') effects++;
   }
   assert.equal(effects, 1, 'window length unaffected by slowRate');
-  // Squish: 30 simulation ticks -> 60 wall frames at rate 0.5.
+  // The two clocks scale differently, and that is the point of this test: the
+  // meter is wall-clock, so the 15-call window consumes only 15*0.5 = 7.5 of the
+  // shared 30-tick state-2 clock. The remaining 22.5 ticks therefore take 45
+  // calls, and the call that observes the clock at 30 is the 46th.
   let respawnAt = -1;
-  for (let k = 1; k <= 61; k++) {
+  for (let k = 1; k <= 80; k++) {
     if (p.tickDeath(0.5) === 'respawn') { respawnAt = k; break; }
   }
-  assert.equal(respawnAt, 60, '30-tick squish takes 60 wall frames at rate 0.5');
+  assert.equal(respawnAt, 46, 'the rate-scaled remainder of the clock is 45 more calls');
   // Materialize: die() teleports + starts materialize; meter pinned at 0
-  // until the handoff, then reseeds to N with the 240-tick invuln.
+  // until the handoff, then reseeds to N with the 240-tick invuln. 30 ticks on
+  // the split counter is 60 half-tick calls.
   p.die();
   assert.equal(p.deathbombMeter, 0);
   const held = new Set();
@@ -161,9 +165,51 @@ test('meter is wall-clock under slowmo; squish and materialize ride the split co
     assert.equal(p.tryBomb(), false, 'meter gate blocks bombing while materializing');
   }
   p.update(input, 0.5); // 60th half-tick -> 30 ticks: handoff
-  assert.equal(p.materializeFrame, -1, 'materialize completed');
+  assert.equal(p.materializeFrame, -1, 'materialize handed off at 30 ticks');
   assert.equal(p.deathbombMeter, 15, 'meter reseeded at the state-1 -> state-3 handoff');
   assert.equal(p.invulnFrames, 240, '240-tick invuln window armed');
+});
+
+test('state 2 is one 30-tick clock from the hit, so the post-miss lock is 61 - window', () => {
+  // Th07.exe v1.00b: state 2 rides player+0x16a08 and exits at `cmp 0x1e` @
+  // 0x43e043; the materialize then exits at its own `cmp 0x1e` @ 0x43e24d. The
+  // deathbomb window burns the FRONT of the first clock, so the squish after the
+  // miss is 31 - window and the whole control lock is 61 - window: Reimu 46,
+  // Marisa 53, Sakuya 55. th7_udYo01's stage-2 (miss 8578) and stage-5 (miss
+  // 2205) respawns pin the Sakuya value; the other two come from the exe.
+  const EXPECTED = { 15: 46, 8: 53, 6: 55 };
+  for (const { shots, n } of FAMILIES) {
+    const p = new Player(shots[0], anms);
+    p.invulnFrames = 0;
+    p.hit();
+    // Burn the deathbomb window; the miss commits on the tick the meter hits 0.
+    let commit = -1;
+    for (let k = 1; k <= n; k++) if (frame(p).death === 'effects') commit = k;
+    assert.equal(commit, n, `${shots[0]}: miss commits as the meter empties`);
+    assert.equal(p.controllable, false, 'not controllable during the squish');
+
+    // Squish: the REMAINDER of the same 30-tick clock, i.e. 31 - window ticks
+    // after the commit, then die() runs (life lost, respawn armed).
+    let respawn = -1;
+    for (let k = 1; k <= 60 && respawn < 0; k++) {
+      if (p.tickDeath(1) === 'respawn') respawn = k;
+    }
+    assert.equal(respawn, 31 - n, `${shots[0]}: squish is 31 - window (${31 - n})`);
+    p.die();
+
+    // Materialize: a full 30 ticks, per its own 0x1e compare.
+    const input = { held: new Set(), pressed: new Set() };
+    let unlock = -1;
+    for (let k = 1; k <= 60 && unlock < 0; k++) {
+      p.update(input, 1);
+      if (p.controllable) unlock = k;
+    }
+    assert.equal(unlock, 30, `${shots[0]}: 30-tick materialize`);
+    assert.equal(respawn + unlock, EXPECTED[n],
+      `${shots[0]}: post-miss lock is 61 - window (${EXPECTED[n]})`);
+    assert.equal(p.invulnFrames, 240, 'the 240-tick invuln window arms at the handoff');
+    assert.equal(p.deathbombMeter, n, 'the meter reseeds from the SHT at the handoff');
+  }
 });
 
 test('failure path bookkeeping: life-- and bomb reset land at the respawn, drops at the commit', () => {
